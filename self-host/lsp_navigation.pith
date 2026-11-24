@@ -124,15 +124,10 @@ fn binding_decl_site(path: String, text: String, node: Node, name: String) -> Si
             return Site(path, node.line, col, name.len())
     return Site(path, 0, 0, 0)
 
-# where a declaration lands for the editor: named declarations scan
-# their file for the declaring line, bindings and parameters scan
-# their declaring line for their identifier, and everything else
-# (loop variables, pattern bindings) uses the node position itself,
-# spanning the token found there.
-fn decl_site(decl_idx: Int) -> Site:
-    path := file_for_node(decl_idx)
+# where a declaration lands for the editor, using already-loaded file text so
+# callers scanning declarations in one file never re-read from disk.
+fn decl_site_with_text(decl_idx: Int, path: String, text: String) -> Site:
     node := get_node(decl_idx)
-    text := file_text(path)
     if is_named_decl(node.kind):
         name := bare_symbol_name(node.value)
         at := find_decl_position(text, node.kind, name)
@@ -144,6 +139,15 @@ fn decl_site(decl_idx: Int) -> Site:
             return site
     span := token_length_at(text_line(text, node.line - 1), node.col)
     return Site(path, node.line, node.col, span)
+
+# where a declaration lands for the editor: named declarations scan
+# their file for the declaring line, bindings and parameters scan
+# their declaring line for their identifier, and everything else
+# (loop variables, pattern bindings) uses the node position itself,
+# spanning the token found there.
+fn decl_site(decl_idx: Int) -> Site:
+    path := file_for_node(decl_idx)
+    return decl_site_with_text(decl_idx, path, file_text(path))
 
 # the definition_of key under the cursor: the use node on the cursor's
 # line, in the cursor's file, whose column is nearest at or before the
@@ -222,12 +226,41 @@ pub fn definition_location(uri: String, line0: Int, character: Int) -> Int:
 # references
 # ---------------------------------------------------------------
 
+# cached file-text reader for a single request so multi-match reference walks
+# read each touched file at most once.
+fn cached_file_text(cache: Map[String, String], path: String) -> String:
+    if cache.contains_key(path):
+        return cache[path]
+    text := file_text(path)
+    cache.insert(path, text)
+    return text
+
+fn range_json_with_text(site: Site, text: String) -> Int:
+    mode := get_position_encoding()
+    start := line_col_to_lsp_pos(text, site.line, site.col, mode)
+    end := line_col_to_lsp_pos(text, site.line, site.col + site.len, mode)
+    start_obj := json.make_object()
+    json.object_set(start_obj, "line", json.make_int(start.line))
+    json.object_set(start_obj, "character", json.make_int(start.character))
+    end_obj := json.make_object()
+    json.object_set(end_obj, "line", json.make_int(end.line))
+    json.object_set(end_obj, "character", json.make_int(end.character))
+    range := json.make_object()
+    json.object_set(range, "start", start_obj)
+    json.object_set(range, "end", end_obj)
+    return range
+
+fn location_json_with_text(site: Site, text: String) -> Int:
+    location := json.make_object()
+    json.object_set(location, "uri", json.make_string(path_to_uri(site.path)))
+    json.object_set(location, "range", range_json_with_text(site, text))
+    return location
+
 # the declaration node the cursor refers to: through a use under the
-# cursor when there is one, otherwise a declaration whose scanned
-# identifier spans the cursor (so a function name and its parameters
-# on the same header line resolve independently). -1 when neither
-# matches.
-fn decl_node_at(path: String, pos: PithPos, word: String) -> Int:
+# cursor when there is one, otherwise a declaration in the cursor's file whose
+# scanned identifier spans the cursor (so a function name and its parameters
+# on the same header line resolve independently). -1 when neither matches.
+fn decl_node_at(path: String, text: String, pos: PithPos, word: String) -> Int:
     use_idx := use_node_at(path, pos, word)
     defs := get_definition_of()
     if use_idx >= 0:
@@ -239,7 +272,16 @@ fn decl_node_at(path: String, pos: PithPos, word: String) -> Int:
         if seen.contains_key(decl_idx):
             continue
         seen.insert(decl_idx, true)
-        site := decl_site(decl_idx)
+        # skip declarations outside the cursor's file before any text scan
+        if file_for_node(decl_idx) != path:
+            continue
+        dnode := get_node(decl_idx)
+        if word != "":
+            if is_named_decl(dnode.kind) and bare_symbol_name(dnode.value) != word:
+                continue
+            elif (dnode.kind == "binding" or dnode.kind == "param") and extract_binding_name(dnode.value) != word:
+                continue
+        site := decl_site_with_text(decl_idx, path, text)
         if site.path == path and site.line == pos.line and site.len > 0:
             if pos.col >= site.col and pos.col < site.col + site.len:
                 if best < 0 or decl_idx < best:
@@ -274,20 +316,24 @@ pub fn references_locations(uri: String, line0: Int, character: Int, include_dec
     text := document_text(uri)
     pos := lsp_pos_to_line_col(text, line0, character, get_position_encoding())
     word := cursor_word(text_line(text, pos.line - 1), pos.col)
-    decl_idx := decl_node_at(path, pos, word)
+    decl_idx := decl_node_at(path, text, pos, word)
     if decl_idx < 0:
         return arr
     defs := get_definition_of()
+    mut text_cache: Map[String, String] := {}
+    text_cache.insert(path, text)
     mut sites: List[Site] := []
     for use_idx in defs.keys():
         if defs[use_idx] != decl_idx:
             continue
         node := get_node(use_idx)
         use_path := file_for_node(use_idx)
-        span := token_length_at(text_line(file_text(use_path), node.line - 1), node.col)
+        use_text := cached_file_text(text_cache, use_path)
+        span := token_length_at(text_line(use_text, node.line - 1), node.col)
         sites.push(Site(use_path, node.line, node.col, span))
     if include_decl:
-        d := decl_site(decl_idx)
+        decl_path := file_for_node(decl_idx)
+        d := decl_site_with_text(decl_idx, decl_path, cached_file_text(text_cache, decl_path))
         if d.line > 0:
             sites.push(d)
     mut last_key := ""
@@ -296,7 +342,7 @@ pub fn references_locations(uri: String, line0: Int, character: Int, include_dec
         if key == last_key:
             continue
         last_key = key
-        json.array_push(arr, location_json(s))
+        json.array_push(arr, location_json_with_text(s, cached_file_text(text_cache, s.path)))
     return arr
 
 # ---------------------------------------------------------------
@@ -382,7 +428,7 @@ pub fn prepare_rename_range(uri: String, line0: Int, character: Int) -> Int:
     word := cursor_word(line_text, pos.col)
     if word == "":
         return 0 - 1
-    decl_idx := decl_node_at(path, pos, word)
+    decl_idx := decl_node_at(path, text, pos, word)
     if decl_idx < 0:
         return 0 - 1
     if rename_sites(decl_idx, word).len() == 0:
@@ -390,7 +436,7 @@ pub fn prepare_rename_range(uri: String, line0: Int, character: Int) -> Int:
     mut start_col := pos.col
     while start_col > 1 and is_ident_byte(ord(line_text[start_col - 2])):
         start_col = start_col - 1
-    return range_json(Site(path, pos.line, start_col, word.len()))
+    return range_json_with_text(Site(path, pos.line, start_col, word.len()), text)
 
 ## the WorkspaceEdit renaming the symbol at a position to new_name, as
 ## a json handle {"changes": {uri: [TextEdit...]}} with edits grouped
@@ -408,7 +454,7 @@ pub fn rename_workspace_edit(uri: String, line0: Int, character: Int, new_name: 
     word := cursor_word(text_line(text, pos.line - 1), pos.col)
     if word == "":
         return 0 - 1
-    decl_idx := decl_node_at(path, pos, word)
+    decl_idx := decl_node_at(path, text, pos, word)
     if decl_idx < 0:
         return 0 - 1
     sites := rename_sites(decl_idx, word)

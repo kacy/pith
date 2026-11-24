@@ -8861,7 +8861,12 @@ fn check_spawn_expression(node: Node, scope_id: Int) -> Int:
     if inner_node.kind != "call" and inner_node.kind != "method_call":
         report_error("E232", "spawn requires a function call")
         return TID_ERR
+    # a spawned call and its arguments run on the new task, not while holding
+    # the spawner's locks, so clear `locked_paths` just as a lambda body does.
+    saved_locked := locked_paths
+    locked_paths = []
     inner := c_check_expr(node.children[0], scope_id)
+    locked_paths = saved_locked
     if is_error_type(inner):
         return TID_ERR
     # the callee of a plain call is child 0, and a method call's receiver is
@@ -9868,6 +9873,18 @@ pub fn c_diagnostics_to_json(diags: List[Diagnostic]) -> String:
 # the modules it delegates to is listed, transients included, so the
 # restored state is the checked-imports state exactly.
 
+fn copy_nested_string_map(src: Map[String, Map[String, String]]) -> Map[String, Map[String, String]]:
+    mut out: Map[String, Map[String, String]] := {}
+    for k in src:
+        out.insert(k, copy_map(src[k]))
+    return out
+
+fn copy_int_list_map(src: Map[Int, List[Int]]) -> Map[Int, List[Int]]:
+    mut out: Map[Int, List[Int]] := {}
+    for k in src:
+        out.insert(k, copy_list(src[k]))
+    return out
+
 # the checker's whole state at one moment. tables are copied one level
 # down: the records they hold (TypeInfo, ScopeEntry, Diagnostic) are
 # never mutated in place, so sharing them is safe.
@@ -9885,6 +9902,7 @@ pub struct CheckerSnapshot:
     pub checked_module_paths: Map[String, Bool]
     pub generic_inference_subst: Map[String, Int]
     pub last_branch_value_expr: Int
+    pub variant_binding_rejected: Bool
     pub active_subst_params: List[String]
     pub active_subst_args: List[Int]
     pub generic_call_subst: Map[Int, String]
@@ -9896,6 +9914,8 @@ pub struct CheckerSnapshot:
     pub generic_drop_walked: Map[Int, Bool]
     pub struct_instance_decl_idx: Map[Int, Int]
     pub impl_method_modules: Map[Int, String]
+    pub struct_decl_modules: Map[Int, String]
+    pub signature_alias_tables: Map[String, Map[String, String]]
     pub checker_module_roots: Map[String, Int]
     pub checker_module_files: Map[String, String]
     pub checker_module_alias_lists: Map[String, String]
@@ -9904,6 +9924,7 @@ pub struct CheckerSnapshot:
     pub method_type_map: Map[String, Int]
     pub method_declared_kinds: Map[String, Bool]
     pub function_visibility_map: Map[String, Bool]
+    pub predeclared_type_ids: Map[Int, Int]
     pub struct_field_default_nodes: Map[String, Int]
     pub generic_declaration_map: Map[String, Int]
     pub generic_base_first_module: Map[String, String]
@@ -9926,13 +9947,24 @@ pub struct CheckerSnapshot:
     pub suppress_unknown_type_for: Map[String, Int]
     pub expression_type_cache: Map[Int, Int]
     pub definition_of: Map[Int, Int]
+    pub locked_paths: List[String]
+    pub guarded_aliases: Map[Int, String]
+    pub returns_parameter_cache: Map[Int, Bool]
+    pub generic_node_tids: Map[Int, List[Int]]
+    pub recording_generic_types: Bool
     pub optional_widened_arguments: Map[Int, Bool]
     pub result_widened_arguments: Map[Int, Int]
     pub interface_coercions: Map[Int, Int]
+    pub literal_targets: Map[Int, Int]
     pub open_empty_literal_bindings: Map[Int, Int]
+    pub caught_error_type: Int
     pub type_resolve_depth: Int
+    pub resolving_type_node: Int
     pub c_module_global_names: List[String]
     pub c_shadow_seen_names: List[String]
+    pub drop_escape_reason: String
+    pub drop_escape_memo: Map[String, Int]
+    pub drop_escape_memo_reason: Map[String, String]
     pub fn_bound_names: List[String]
     pub fn_weak_names: List[String]
     pub checker_lambda_depth: Int
@@ -9962,6 +9994,7 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         checked_module_paths: copy_map(checked_module_paths),
         generic_inference_subst: copy_map(generic_inference_subst),
         last_branch_value_expr: last_branch_value_expr,
+        variant_binding_rejected: variant_binding_rejected,
         active_subst_params: copy_list(active_subst_params),
         active_subst_args: copy_list(active_subst_args),
         generic_call_subst: copy_map(generic_call_subst),
@@ -9973,6 +10006,8 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         generic_drop_walked: copy_map(generic_drop_walked),
         struct_instance_decl_idx: copy_map(struct_instance_decl_idx),
         impl_method_modules: copy_map(impl_method_modules),
+        struct_decl_modules: copy_map(struct_decl_modules),
+        signature_alias_tables: copy_nested_string_map(signature_alias_tables),
         checker_module_roots: copy_map(checker_module_roots),
         checker_module_files: copy_map(checker_module_files),
         checker_module_alias_lists: copy_map(checker_module_alias_lists),
@@ -9981,6 +10016,7 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         method_type_map: copy_map(method_type_map),
         method_declared_kinds: copy_map(method_declared_kinds),
         function_visibility_map: copy_map(function_visibility_map),
+        predeclared_type_ids: copy_map(predeclared_type_ids),
         struct_field_default_nodes: copy_map(struct_field_default_nodes),
         generic_declaration_map: copy_map(generic_declaration_map),
         generic_base_first_module: copy_map(generic_base_first_module),
@@ -10003,13 +10039,24 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         suppress_unknown_type_for: copy_map(suppress_unknown_type_for),
         expression_type_cache: copy_map(expression_type_cache),
         definition_of: copy_map(definition_of),
+        locked_paths: copy_list(locked_paths),
+        guarded_aliases: copy_map(guarded_aliases),
+        returns_parameter_cache: copy_map(returns_parameter_cache),
+        generic_node_tids: copy_int_list_map(generic_node_tids),
+        recording_generic_types: recording_generic_types,
         optional_widened_arguments: copy_map(optional_widened_arguments),
         result_widened_arguments: copy_map(result_widened_arguments),
         interface_coercions: copy_map(interface_coercions),
+        literal_targets: copy_map(literal_targets),
         open_empty_literal_bindings: copy_map(open_empty_literal_bindings),
+        caught_error_type: caught_error_type,
         type_resolve_depth: type_resolve_depth,
+        resolving_type_node: resolving_type_node,
         c_module_global_names: copy_list(c_module_global_names),
         c_shadow_seen_names: copy_list(c_shadow_seen_names),
+        drop_escape_reason: drop_escape_reason,
+        drop_escape_memo: copy_map(drop_escape_memo),
+        drop_escape_memo_reason: copy_map(drop_escape_memo_reason),
         fn_bound_names: copy_list(fn_bound_names),
         fn_weak_names: copy_list(fn_weak_names),
         checker_lambda_depth: checker_lambda_depth,
@@ -10039,6 +10086,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     checked_module_paths = copy_map(s.checked_module_paths)
     generic_inference_subst = copy_map(s.generic_inference_subst)
     last_branch_value_expr = s.last_branch_value_expr
+    variant_binding_rejected = s.variant_binding_rejected
     active_subst_params = copy_list(s.active_subst_params)
     active_subst_args = copy_list(s.active_subst_args)
     generic_call_subst = copy_map(s.generic_call_subst)
@@ -10050,6 +10098,8 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     generic_drop_walked = copy_map(s.generic_drop_walked)
     struct_instance_decl_idx = copy_map(s.struct_instance_decl_idx)
     impl_method_modules = copy_map(s.impl_method_modules)
+    struct_decl_modules = copy_map(s.struct_decl_modules)
+    signature_alias_tables = copy_nested_string_map(s.signature_alias_tables)
     checker_module_roots = copy_map(s.checker_module_roots)
     checker_module_files = copy_map(s.checker_module_files)
     checker_module_alias_lists = copy_map(s.checker_module_alias_lists)
@@ -10058,6 +10108,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     method_type_map = copy_map(s.method_type_map)
     method_declared_kinds = copy_map(s.method_declared_kinds)
     function_visibility_map = copy_map(s.function_visibility_map)
+    predeclared_type_ids = copy_map(s.predeclared_type_ids)
     struct_field_default_nodes = copy_map(s.struct_field_default_nodes)
     generic_declaration_map = copy_map(s.generic_declaration_map)
     generic_base_first_module = copy_map(s.generic_base_first_module)
@@ -10080,13 +10131,24 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     suppress_unknown_type_for = copy_map(s.suppress_unknown_type_for)
     expression_type_cache = copy_map(s.expression_type_cache)
     definition_of = copy_map(s.definition_of)
+    locked_paths = copy_list(s.locked_paths)
+    guarded_aliases = copy_map(s.guarded_aliases)
+    returns_parameter_cache = copy_map(s.returns_parameter_cache)
+    generic_node_tids = copy_int_list_map(s.generic_node_tids)
+    recording_generic_types = s.recording_generic_types
     optional_widened_arguments = copy_map(s.optional_widened_arguments)
     result_widened_arguments = copy_map(s.result_widened_arguments)
     interface_coercions = copy_map(s.interface_coercions)
+    literal_targets = copy_map(s.literal_targets)
     open_empty_literal_bindings = copy_map(s.open_empty_literal_bindings)
+    caught_error_type = s.caught_error_type
     type_resolve_depth = s.type_resolve_depth
+    resolving_type_node = s.resolving_type_node
     c_module_global_names = copy_list(s.c_module_global_names)
     c_shadow_seen_names = copy_list(s.c_shadow_seen_names)
+    drop_escape_reason = s.drop_escape_reason
+    drop_escape_memo = copy_map(s.drop_escape_memo)
+    drop_escape_memo_reason = copy_map(s.drop_escape_memo_reason)
     fn_bound_names = copy_list(s.fn_bound_names)
     fn_weak_names = copy_list(s.fn_weak_names)
     checker_lambda_depth = s.checker_lambda_depth
@@ -10125,7 +10187,17 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
 # both checks run after a body is checked, when every expression has a type.
 
 # the methods that change a list, a map or a set in place
-pub COLLECTION_MUTATORS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
+pub COLLECTION_MUTATORS := ",push,pop,insert,remove,take,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
+BYTE_BUFFER_MUTATORS := ",write,write_byte,write_bytes,write_string_utf8,write_range,write_word,copy_within,take_bytes,clear,free,"
+
+fn is_frozen_mutator_call(node: Node) -> Bool:
+    if COLLECTION_MUTATORS.contains("," + node.value + ","):
+        return true
+    if BYTE_BUFFER_MUTATORS.contains("," + node.value + ","):
+        recv_tid := c_get_expr_type(node.children[0])
+        if not is_error_type(recv_tid) and get_type_info(recv_tid).name == "ByteBuffer":
+            return true
+    return false
 
 fn check_guard_rules(body_idx: Int):
     check_frozen_writes(body_idx)
@@ -10149,7 +10221,7 @@ fn check_frozen_writes(idx: Int):
         frozen := frozen_field_on_path(node.children[0])
         if frozen != "":
             report_error_with_fix_at(node.children[0], "E275", "'" + frozen + "' is frozen, so it cannot be changed after its struct is built", "build a new value with the change, or drop `frozen` and keep the field in a guard block")
-    if node.kind == "method_call" and node.children.len() >= 1 and COLLECTION_MUTATORS.contains("," + node.value + ","):
+    if node.kind == "method_call" and node.children.len() >= 1 and is_frozen_mutator_call(node):
         frozen := frozen_field_on_path(node.children[0])
         if frozen != "":
             report_error_with_fix_at(node.children[0], "E275", "'" + frozen + "' is frozen, so it cannot be changed in place", "build a new value with the change, or drop `frozen` and keep the field in a guard block")
@@ -10338,43 +10410,117 @@ fn check_escape_sites(idx: Int, inner: Map[String, Bool], locked_idx: Int, fn_bo
     for child in node.children:
         check_escape_sites(child, inner, locked_idx, fn_body, block)
 
-## whether a `locked` block takes the value read at `read_idx` out of its
-## guard: it assigns the path a new value, or removes the element read
-## (`v = xs[k]` then `xs.remove(k)`)
+## whether a `locked` block unconditionally takes the value read at `read_idx`
+## out of its guard *after* the read: assigning the path a new value, or
+## removing the element read (`v = xs[k]` then `xs.remove(k)`). an assignment
+## before the read or inside a conditional branch does not replace it.
 pub fn block_replaces(block: Int, read_idx: Int) -> Bool:
     path := locked_path_text(read_idx)
     if path == "":
         return false
-    if assigns_path(block, path, read_idx):
-        return true
+    mut remove_base := ""
+    mut remove_key := ""
     node := get_node(read_idx)
     if node.kind == "index" and node.children.len() == 2:
-        return removes_element(block, locked_path_text(node.children[0]), get_node(node.children[1]).value)
+        remove_base = locked_path_text(node.children[0])
+        remove_key = get_node(node.children[1]).value
+    return block_replaces_after_read(block, path, read_idx, remove_base, remove_key)
+
+fn ast_subtree_contains(idx: Int, target: Int) -> Bool:
+    if idx == target:
+        return true
+    for child in get_node(idx).children:
+        if ast_subtree_contains(child, target):
+            return true
     return false
 
-# whether a subtree calls `remove(key)` on the list at `path`
-fn removes_element(idx: Int, path: String, key: String) -> Bool:
+fn stmt_may_exit_early(idx: Int) -> Bool:
     node := get_node(idx)
-    if node.kind == "method_call" and node.value == "remove" and node.children.len() == 2 and locked_path_text(node.children[0]) == path:
+    if node.kind == "return" or node.kind == "fail" or node.kind == "break" or node.kind == "continue":
+        return true
+    if node.kind == "lambda":
+        return false
+    for child in node.children:
+        if stmt_may_exit_early(child):
+            return true
+    return false
+
+fn stmt_is_remove_call(idx: Int, base: String, key: String) -> Bool:
+    if base == "":
+        return false
+    mut cur := idx
+    if get_node(cur).kind == "expr_stmt" and get_node(cur).children.len() == 1:
+        cur = get_node(cur).children[0]
+    node := get_node(cur)
+    if node.kind == "method_call" and node.value == "remove" and node.children.len() == 2 and locked_path_text(node.children[0]) == base:
         arg_idx := node.children[1]
         mut arg := get_node(arg_idx)
         if arg.kind == "arg" and arg.children.len() > 0:
             arg = get_node(arg.children[0])
         if (arg.kind == "ident" or arg.kind == "int_lit") and arg.value == key:
             return true
-    for child in node.children:
-        if removes_element(child, path, key):
-            return true
     return false
 
-fn assigns_path(idx: Int, path: String, read_idx: Int) -> Bool:
+fn stmt_replaces_unconditionally(idx: Int, path: String, read_idx: Int, remove_base: String, remove_key: String) -> Bool:
     node := get_node(idx)
     if node.kind == "assignment" and node.children.len() >= 2 and node.children[1] != read_idx:
-        if locked_path_text(node.children[0]) == path:
+        if locked_path_text(node.children[0]) == path and locked_path_text(node.children[1]) != path:
             return true
-    for child in node.children:
-        if assigns_path(child, path, read_idx):
+    if stmt_is_remove_call(idx, remove_base, remove_key):
+        return true
+    if node.kind == "block" or node.kind == "body" or node.kind == "then" or node.kind == "else":
+        for child in node.children:
+            if stmt_replaces_unconditionally(child, path, read_idx, remove_base, remove_key):
+                return true
+            if stmt_may_exit_early(child):
+                return false
+        return false
+    if node.kind == "if_stmt" and node.children.len() >= 3:
+        last_child := get_node(node.children[node.children.len() - 1])
+        if last_child.kind != "else":
+            return false
+        mut ci := 1
+        while ci < node.children.len():
+            branch := get_node(node.children[ci])
+            if branch.kind == "then" or branch.kind == "else":
+                if not stmt_replaces_unconditionally(node.children[ci], path, read_idx, remove_base, remove_key):
+                    return false
+            elif branch.kind == "elif" and branch.children.len() >= 2:
+                if not stmt_replaces_unconditionally(branch.children[1], path, read_idx, remove_base, remove_key):
+                    return false
+            else:
+                return false
+            ci = ci + 1
+        return true
+    return false
+
+fn block_replaces_after_read(idx: Int, path: String, read_idx: Int, remove_base: String, remove_key: String) -> Bool:
+    node := get_node(idx)
+    if node.kind == "block" or node.kind == "body":
+        mut found := 0 - 1
+        for child, i in node.children:
+            if ast_subtree_contains(child, read_idx):
+                found = i
+                break
+        if found < 0:
+            return false
+        if block_replaces_after_read(node.children[found], path, read_idx, remove_base, remove_key):
             return true
+        if stmt_may_exit_early(node.children[found]):
+            return false
+        mut j := found + 1
+        while j < node.children.len():
+            stmt := node.children[j]
+            if stmt_replaces_unconditionally(stmt, path, read_idx, remove_base, remove_key):
+                return true
+            if stmt_may_exit_early(stmt):
+                return false
+            j = j + 1
+        return false
+    if node.kind == "if_stmt" or node.kind == "then" or node.kind == "elif" or node.kind == "else" or node.kind == "if_let" or node.kind == "while_stmt" or node.kind == "while_let" or node.kind == "for_stmt" or node.kind == "locked_stmt" or node.kind == "match_expr" or node.kind == "arm":
+        for child in node.children:
+            if ast_subtree_contains(child, read_idx):
+                return block_replaces_after_read(child, path, read_idx, remove_base, remove_key)
     return false
 
 # a guarded read leaving its block whose value holds no collection may still

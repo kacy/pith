@@ -1,0 +1,16 @@
+# frozen fields cannot be mutated through Map.take or ByteBuffer mutators (E275)
+import std.bytes as bytes
+from std.bytes import ByteBuffer
+
+struct Holder:
+    frozen items: Map[String, Int]
+    frozen buf: ByteBuffer
+
+fn main() -> Int!:
+    mut m: Map[String, Int] := {}
+    m.insert("a", 1)
+    h := Holder(items: m, buf: bytes.buffer())
+    v := h.items.take("a")
+    h.buf.write_string_utf8("hi")!
+    print("{v}")
+    return 0

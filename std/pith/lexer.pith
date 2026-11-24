@@ -1171,3 +1171,105 @@ fn is_format_spec(spec: String) -> Bool:
     if dot and frac_digits == 0:
         return false
     return digits > 0 or frac_digits > 0
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+# "kind value" for each token, joined with commas
+fn kinds_and_values(tokens: List[Token]) -> String:
+    mut parts: List[String] := []
+    for tok in tokens:
+        parts.push(tok.kind + " " + tok.value)
+    return parts.join(",")
+
+fn joined(values: List[Int]) -> String:
+    mut parts: List[String] := []
+    for v in values:
+        parts.push(v.to_string())
+    return parts.join(",")
+
+# the tokens of `src` as kind_and_values() renders them, lexed `rounds` times
+fn lex_rounds(src: String, rounds: Int) -> String:
+    mut last := ""
+    mut r := 0
+    while r < rounds:
+        last = kinds_and_values(lex(src))
+        r = r + 1
+    return last
+
+test "lex gives each token its kind, value and span":
+    toks := lex("x := 1\n")
+    assert_eq(kinds_and_values(toks), "identifier x,colon_eq :=,int_lit 1,newline ,eof ")
+    assert_eq(toks[1].line, 1)
+    assert_eq(toks[1].column, 3)
+    assert_eq(toks[1].offset, 2)
+    assert_eq(toks[1].len, 2)
+    assert_eq(toks[4].line, 2)
+    assert_eq(toks[4].len, 0)
+
+test "indentation becomes indent and dedent tokens":
+    assert_eq(kinds_and_values(lex("if a:\n    b\nc\n")), "kw_if if,identifier a,colon :,newline ,indent ,identifier b,newline ,dedent ,identifier c,newline ,eof ")
+    # inside brackets a line break is not layout
+    assert_eq(kinds_and_values(lex("f(a,\n    b)\n")), "identifier f,lparen (,identifier a,comma ,,identifier b,rparen ),newline ,eof ")
+
+test "lex_with_comments keeps a comment that is alone on its line":
+    src := "x := 1\n    # alone\ny := 2 # after\n"
+    assert_eq(kinds_and_values(lex(src)), "identifier x,colon_eq :=,int_lit 1,newline ,identifier y,colon_eq :=,int_lit 2,comment # after,newline ,eof ")
+    with := lex_with_comments(src)
+    assert_eq(kinds_and_values(with), "identifier x,colon_eq :=,int_lit 1,newline ,comment # alone,identifier y,colon_eq :=,int_lit 2,comment # after,newline ,eof ")
+    assert_eq(with[4].offset, 11)
+    assert_eq(with[4].len, 7)
+    assert_eq(with[4].line, 2)
+    assert_eq(with[4].column, 5)
+
+test "an interpolated string comes back as a start and its pieces":
+    toks := lex("\"a {{b}} c\"")
+    assert_eq(kinds_and_values(toks), "string_start \"a ,interpolation_expr b,string_end  c,eof ")
+    assert_eq(toks[0].len, 9)
+    assert_eq(toks[1].offset, 4)
+    assert_eq(toks[2].offset, 6)
+    assert_eq(kinds_and_values(lex("\"{{{{x}}}}\"")), "string_lit \"{{{{x}}}}\",eof ")
+
+test "numbers drop their separators and a tuple index stays whole":
+    assert_eq(kinds_and_values(lex("1_000 0x_ff 2.5e-3 t.0.1")), "int_lit 1000,int_lit 0xff,float_lit 2.5e-3,identifier t,dot .,int_lit 0,dot .,int_lit 1,eof ")
+
+test "bad input becomes err tokens and lexing carries on":
+    assert_eq(kinds_and_values(lex("a $ b")), "identifier a,err $,identifier b,eof ")
+    assert_eq(kinds_and_values(lex("\"open\nx")), "err newline in string literal,newline ,identifier x,eof ")
+    assert_eq(kinds_and_values(lex("0x")), "err the integer literal '0x' has no digits after its prefix,eof ")
+    toks := lex("é")
+    assert_eq(toks.len(), 3)
+    assert_eq(toks[0].kind, "err")
+    assert_eq(toks[1].kind, "err")
+    assert_eq(toks[1].offset, 1)
+
+test "unescaping an interpolation and mapping it back":
+    # the expression text f(\"x\") unescapes to f("x")
+    raw := "f(\\\"x\\\")"
+    assert_eq(unescape_interp_expr(raw), "f(\"x\")")
+    assert_eq(joined(interp_raw_offsets(raw)), "0,1,2,4,5,7,8")
+    # inside a bare-quoted literal the escapes stay
+    bare := "s.find(\"\\\"\")"
+    assert_eq(unescape_interp_expr(bare), bare)
+    assert_eq(interp_raw_offsets(bare).len(), bare.len() + 1)
+    assert_eq(unescape_interp_expr("plain"), "plain")
+
+test "split_format_spec splits only at a format spec":
+    assert_eq(split_format_spec("x:>8").0, "x")
+    assert_eq(split_format_spec("x:>8").1, ">8")
+    assert_eq(split_format_spec("v:.2").1, ".2")
+    assert_eq(split_format_spec("x:y").0, "x:y")
+    assert_eq(split_format_spec("x:y").1, "")
+    assert_eq(split_format_spec("f(a:1)").1, "")
+    assert_eq(split_format_spec("m[\"a:1\"]").1, "")
+
+test "tasks lex at the same time without sharing state":
+    a := "fn f(x: Int) -> Int:\n    return x + 1\n"
+    b := "s := \"n = {{n}}\" # note\n"
+    want_a := lex_rounds(a, 1)
+    want_b := lex_rounds(b, 1)
+    ta := spawn lex_rounds(a, 200)
+    tb := spawn lex_rounds(b, 200)
+    assert_eq(await ta, want_a)
+    assert_eq(await tb, want_b)

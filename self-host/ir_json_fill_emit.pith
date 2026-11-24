@@ -48,12 +48,17 @@
 # test_json_fill_generated pin the shapes and the messages.
 
 from ir_builder import ir_emit, ir_reg, ir_label, ir_new_temp_name, ir_var_types, ir_str
-from ir_call_emit import ir_emit_call_text, ir_emit_call1, ir_emit_label
+from ir_call_emit import ir_emit_call_text, ir_emit_call1, ir_emit_label, ir_emit_cold_label
 from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_err_result_tuple_raw
 
 # the bit pattern pith_json_float_bits answers for a span that is not a
 # finite number (JSON_FLOAT_REFUSED in cranelift/runtime/src/json.rs).
 JSON_FILL_FLOAT_REFUSED := 9221120237041090561
+
+# while a decoder is emitted: its malformed exit, and the stubs the branches
+# to it go through (see ir_jf_target)
+mut ir_jf_bad_label := ""
+mut ir_jf_bad_stubs: List[String] := []
 
 # the variables one generated decoder works in.
 struct JsonFillVars:
@@ -100,7 +105,20 @@ fn ir_jf_store_const(var: String, value: Int):
     ir_emit("store " + var + " " + ir_jf_const(value).to_string())
 
 fn ir_jf_brif(cond: Int, then_l: String, else_l: String):
-    ir_emit("brif " + cond.to_string() + " " + then_l + " " + else_l)
+    ir_emit("brif " + cond.to_string() + " " + ir_jf_target(then_l) + " " + ir_jf_target(else_l))
+
+# a branch to the malformed exit goes through a stub of its own, which
+# leaves the position the decoder stopped at in a word in the frame for the
+# exit to read. if the exit read the position variable instead, it would
+# take the position from every branch as a block parameter, and the register
+# allocator spills the position across the whole decoder to feed that: the
+# twenty-field decode ran 10% slower that way (#1431).
+fn ir_jf_target(l: String) -> String:
+    if l != ir_jf_bad_label:
+        return l
+    stub := ir_label()
+    ir_jf_bad_stubs.push(stub)
+    return stub
 
 fn ir_jf_jmp(l: String):
     ir_emit("jmp " + l)
@@ -494,7 +512,13 @@ pub fn ir_emit_json_fill_flat(input_r: Int, struct_r: Int, fields: List[JsonFill
     bad_l := ir_label()
     end_l := ir_label()
     start_l := ir_label()
+    ir_jf_bad_label = bad_l
+    ir_jf_bad_stubs = []
 
+    # the frame word the stubs leave the position in: a one-slot struct on
+    # the stack, never released
+    stop_r := ir_reg()
+    ir_emit("tuple_stack " + stop_r.to_string() + " 1")
     ir_emit("store " + v.input + " " + input_r.to_string())
     ir_emit("store " + v.obj + " " + struct_r.to_string())
     ptr_r := ir_reg()
@@ -620,10 +644,23 @@ pub fn ir_emit_json_fill_flat(input_r: Int, struct_r: Int, fields: List[JsonFill
     ir_emit("store " + result_var + " " + ir_emit_ok_result_tuple_raw(ir_jf_load(v.obj)).to_string())
     ir_jf_jmp(end_l)
 
-    ir_emit_label(bad_l)
+    # a malformed document: each stub leaves the position in the frame word,
+    # and the exit releases the struct and has std.json say what is wrong
+    # from the input and that position. none of it is on the path a
+    # well-formed document takes, so the labels are cold and the back end
+    # lays these blocks out after the decoder.
+    ir_jf_bad_label = ""
+    for stub in ir_jf_bad_stubs:
+        ir_emit_cold_label(stub)
+        zero_r := ir_jf_const(0)
+        ir_emit_call_text(ir_reg(), "pith_store_u64", "void", 3, " " + stop_r.to_string() + " " + zero_r.to_string() + " " + ir_jf_load(v.pos).to_string())
+        ir_jf_jmp(bad_l)
+    ir_emit_cold_label(bad_l)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", ir_jf_load(v.obj))
+    stop_pos := ir_reg()
+    ir_emit_call_text(stop_pos, "pith_load_u64", "int", 2, " " + stop_r.to_string() + " " + ir_jf_const(0).to_string())
     bad_err := ir_reg()
-    ir_emit_call_text(bad_err, malformed_fn, "struct", 2, " " + ir_jf_load(v.input).to_string() + " " + ir_jf_load(v.pos).to_string())
+    ir_emit_call_text(bad_err, malformed_fn, "struct", 2, " " + ir_jf_load(v.input).to_string() + " " + stop_pos.to_string())
     ir_emit("store " + result_var + " " + ir_emit_err_result_tuple_raw(bad_err).to_string())
     ir_jf_jmp(end_l)
 

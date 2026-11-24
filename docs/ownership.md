@@ -887,6 +887,18 @@ that loaded the old pointer has its strong count. a separate load and
 upgrade let a store free the header between the two, and the upgrade then
 read freed memory (`tests/cases/test_weak_field_store_across_tasks`).
 
+the lock is needed only when another task can reach the holder. every
+route to another task marks a struct shared before the other task can see
+it (a spawn's captures, a send, a global, a task's result, a store into a
+shared value; see `cranelift/runtime/src/share.rs`), and nothing clears the
+mark. a read and a store in two different tasks therefore both find their
+holder marked, and both take the lock. an unmarked holder is reachable only
+from the running task, so compiled code tests the mark inline and reads or
+swaps the field of an unmarked holder without the lock or any locked
+instruction. `tests/cases/test_weak_field_lock_after_crossing` races a store
+and a read after each route. with the lock on every store,
+`bench/cyclic_graph` ran 27% slower.
+
 every consumer treats the read as that fresh optional. a local, a field, a
 struct construction, a list or map store and a return keep the count for as
 long as they hold the optional. a test against `none`, an extraction

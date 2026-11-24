@@ -1512,6 +1512,46 @@ mod tests {
         }
     }
 
+    // a weak field store or read on a holder nothing has marked shared skips
+    // the field lock, since only the task that built the holder can reach it.
+    // on a shared holder both wait for the lock, which is what keeps a store
+    // in another task from freeing the old target's header between a read's
+    // load and its upgrade.
+    #[test]
+    fn weak_field_calls_lock_only_a_shared_holder() {
+        unsafe {
+            let holder = pith_struct_alloc(1);
+            let target = pith_struct_alloc(1);
+            for shared in [false, true] {
+                if shared {
+                    struct_mark_shared(holder);
+                }
+                let guard = WeakFieldGuard::lock(holder);
+                let (done, finished) = std::sync::mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    pith_struct_weak_retain(target);
+                    pith_struct_weak_store_field(holder, 0, target);
+                    done.send(pith_struct_weak_load_field(holder, 0)).expect("send");
+                });
+                let wait = std::time::Duration::from_millis(if shared { 50 } else { 10_000 });
+                let early = finished.recv_timeout(wait);
+                assert_eq!(early.is_ok(), !shared, "shared: {shared}");
+                drop(guard);
+                let read = early.or_else(|_| finished.recv()).expect("worker result");
+                worker.join().expect("worker panicked");
+                assert_eq!(read, target);
+                // the upgrade's count, and the field's weak count on the
+                // target stored before
+                assert_eq!(struct_counts(target), (2, 2));
+                pith_struct_release(read);
+            }
+            pith_struct_weak_store_field(holder, 0, 0);
+            assert_eq!(struct_counts(target), (1, 1));
+            pith_struct_release(target);
+            pith_struct_release(holder);
+        }
+    }
+
     /// a compiled literal's header gives its length, and retain and release
     /// leave it alone.
     #[test]
@@ -4884,7 +4924,8 @@ pub unsafe extern "C" fn pith_struct_weak_upgrade(ptr: i64) -> i64 {
 /// that keeps a dead target's header allocated. A reader that loaded the
 /// pointer and a store in another task that dropped the field's weak count
 /// before the reader's upgrade left the upgrade reading a freed header. Under
-/// the lock the store waits until the reader has its strong count.
+/// the lock the store waits until the reader has its strong count. Only a
+/// holder another task can reach takes it (see `weak_holder_is_local`).
 static WEAK_FIELD_LOCKS: [AtomicBool; 64] = [const { AtomicBool::new(false) }; 64];
 
 struct WeakFieldGuard(&'static AtomicBool);
@@ -4914,6 +4955,28 @@ impl Drop for WeakFieldGuard {
     }
 }
 
+/// Whether a weak field of the struct at `holder` can skip
+/// `WEAK_FIELD_LOCKS`. It can when nothing has marked the holder shared: only
+/// the running task can reach such a holder, so no other task reads or
+/// stores its fields. Every route to another task marks a struct, and
+/// everything it reaches, before the other task can see it (see `share.rs`),
+/// whatever the count switches are set to, and nothing clears the mark. A
+/// task that reads the mark clear therefore holds the only path to the
+/// holder, and any other task that reaches it reads the mark set and takes
+/// the lock. Codegen makes the same test inline (`struct_shared_mark`); this
+/// function is the path for a build without fast paths. A pointer that is
+/// not a live struct header takes the lock.
+#[inline(always)]
+unsafe fn weak_holder_is_local(holder: i64, op: &str) -> bool {
+    // SAFETY: Caller guarantees `holder` is a live struct.
+    let local = unsafe { with_struct_header(holder, |h| h.flags.load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0) }
+        .unwrap_or(false);
+    if local {
+        crate::share::check_local(crate::switches::get(), holder, op);
+    }
+    local
+}
+
 /// Read a weak field of the struct at `holder`, `offset` bytes into it, and
 /// upgrade it: the target with one new strong count, or 0. See
 /// `WEAK_FIELD_LOCKS` for why the load and the upgrade are one step.
@@ -4923,9 +4986,17 @@ impl Drop for WeakFieldGuard {
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_weak_load_field(holder: i64, offset: i64) -> i64 {
     let slot = holder + offset;
-    let _guard = WeakFieldGuard::lock(slot);
     // SAFETY: Caller guarantees `holder + offset` points to an aligned `AtomicI64` weak field.
-    let target = unsafe { (*(slot as *const AtomicI64)).load(Ordering::Acquire) };
+    let field = unsafe { &*(slot as *const AtomicI64) };
+    // SAFETY: Caller guarantees `holder` is a live struct.
+    if unsafe { weak_holder_is_local(holder, "weak field read") } {
+        // no other task can store into the field, so the field's weak count
+        // keeps the target's header allocated through the upgrade
+        // SAFETY: The field's weak count keeps `target`'s header allocated.
+        return unsafe { pith_struct_weak_upgrade(field.load(Ordering::Relaxed)) };
+    }
+    let _guard = WeakFieldGuard::lock(slot);
+    let target = field.load(Ordering::Acquire);
     // SAFETY: Guard keeps the field's weak count alive while upgrading `target`.
     unsafe { pith_struct_weak_upgrade(target) }
 }
@@ -4940,10 +5011,19 @@ pub unsafe extern "C" fn pith_struct_weak_load_field(holder: i64, offset: i64) -
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_weak_store_field(holder: i64, offset: i64, target: i64) {
     let slot = holder + offset;
-    let old = {
+    // SAFETY: Caller guarantees `holder + offset` points to an aligned `AtomicI64` weak field.
+    let field = unsafe { &*(slot as *const AtomicI64) };
+    // SAFETY: Caller guarantees `holder` is a live struct.
+    let old = if unsafe { weak_holder_is_local(holder, "weak field store") } {
+        // no reader in another task can sit between its load and its
+        // upgrade, so the swap needs neither the lock nor a locked
+        // instruction
+        let old = field.load(Ordering::Relaxed);
+        field.store(target, Ordering::Relaxed);
+        old
+    } else {
         let _guard = WeakFieldGuard::lock(slot);
-        // SAFETY: Caller guarantees `holder + offset` points to an aligned `AtomicI64` weak field.
-        unsafe { (*(slot as *const AtomicI64)).swap(target, Ordering::AcqRel) }
+        field.swap(target, Ordering::AcqRel)
     };
     // SAFETY: The field previously owned one weak count on `old`.
     unsafe { pith_struct_weak_release(old) };

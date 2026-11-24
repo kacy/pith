@@ -185,6 +185,7 @@ cases=(
   tests/leaks/leak_weak_read_off_temp
   tests/leaks/leak_weak_local
   tests/leaks/leak_weak_read_binding
+  tests/leaks/leak_weak_field_reassign
   tests/leaks/leak_weak_read_consumers
   tests/leaks/leak_match_view_pin
   tests/leaks/leak_getter_shell_consumers

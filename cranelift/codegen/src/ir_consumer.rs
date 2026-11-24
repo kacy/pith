@@ -1776,12 +1776,13 @@ fn emit_runtime_error_value(
 /// since the runtime reads the faulting instruction rather than the code.
 const OVERFLOW_TRAP_CODE: u8 = 7;
 
-/// The plain opcode behind a checked one (`addc` -> `add`, `uaddc` -> `add`),
-/// or the opcode itself. A checked op on a string or float operand lowers as
-/// its plain form, which concatenates or promotes the way `add` always has.
+/// The plain opcode behind a checked or exact one (`addc` -> `add`, `uaddc`
+/// -> `add`, `addnsw` -> `add`), or the opcode itself. A checked op on a
+/// string or float operand lowers as its plain form, which concatenates or
+/// promotes the way `add` always has.
 fn plain_arith_op(op: &str) -> &str {
     match op {
-        "addc" | "uaddc" => "add",
+        "addc" | "uaddc" | "addnsw" => "add",
         "subc" | "usubc" => "sub",
         "mulc" | "umulc" => "mul",
         _ => op,
@@ -1849,18 +1850,37 @@ fn checked_operand_range(op: &str, c: i64, const_on_left: bool) -> Option<(i128,
 /// plain add or multiply. The overflow forms make x64 materialize the flag and
 /// test it, and a constant multiply in that form takes the slow one-operand
 /// `imul`; the compare fuses with its branch and leaves the arithmetic alone.
+///
+/// `a_nonneg` and `b_nonneg` say an operand is never negative (see
+/// nonneg.rs). For the signed ops such an operand leaves one way out of the
+/// range, or none, and the check covers only that:
+///
+/// - `x op c`: the range check drops the end below zero, so `i * 3` on a
+///   counter compares against the top alone.
+/// - `a + b` with `b >= 0` can only overflow upward, and then the wrapped sum
+///   comes out below `a`, so the check is `sum < a`; with both operands at
+///   least zero it is `sum < 0`. Either compare fuses with its branch.
+/// - `a - b` with both operands at least zero lies within -MAX..MAX and
+///   needs no check. With `b >= 0` alone it can only overflow downward, and
+///   then the wrapped difference comes out above `a`.
+///
+/// Two unsigned words need no flag either: `a + b` is an add whose carry
+/// traps directly, and `a - b` leaves the range exactly when `a < b`.
 fn emit_checked_int_arith(
     builder: &mut FunctionBuilder<'_>,
     op: &str,
     a: Value,
     b: Value,
+    a_nonneg: bool,
+    b_nonneg: bool,
 ) -> Result<Value, CompileError> {
     let unsigned = op.starts_with('u');
+    let (a_nonneg, b_nonneg) = (a_nonneg && !unsigned, b_nonneg && !unsigned);
     let commutes = !matches!(op, "subc" | "usubc");
     let constant = match (iconst_of(builder.func, a), iconst_of(builder.func, b)) {
-        (_, Some(c)) => Some((b, c, a, false)),
-        (Some(c), None) if commutes => Some((a, c, b, false)),
-        (Some(c), None) => Some((a, c, b, true)),
+        (_, Some(c)) => Some((c, a, a_nonneg, false)),
+        (Some(c), None) if commutes => Some((c, b, b_nonneg, false)),
+        (Some(c), None) => Some((c, b, b_nonneg, true)),
         _ => None,
     };
     let plain = |builder: &mut FunctionBuilder<'_>| match plain_arith_op(op) {
@@ -1868,53 +1888,67 @@ fn emit_checked_int_arith(
         "sub" => builder.ins().isub(a, b),
         _ => builder.ins().imul(a, b),
     };
-    let mut computed = None;
-    let overflowed = if let Some((_, c, x, const_on_left)) = constant {
-        let Some((lo, hi)) = checked_operand_range(op, c, const_on_left) else {
-            return Ok(plain(builder));
-        };
-        let (min, max) = if unsigned { (0i128, u64::MAX as i128) } else { (i64::MIN as i128, i64::MAX as i128) };
-        let (below, above) = if unsigned {
-            (IntCC::UnsignedLessThan, IntCC::UnsignedGreaterThan)
-        } else {
-            (IntCC::SignedLessThan, IntCC::SignedGreaterThan)
-        };
-        if lo == min {
-            builder.ins().icmp_imm(above, x, hi as i64)
-        } else if hi == max {
-            builder.ins().icmp_imm(below, x, lo as i64)
-        } else {
-            // both ends: one unsigned compare of the distance from lo
-            let shifted = builder.ins().iadd_imm(x, (lo as i64).wrapping_neg());
-            builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, shifted, (hi - lo) as i64)
-        }
-    } else {
-        let (value, overflowed) = match op {
-            "addc" => builder.ins().sadd_overflow(a, b),
-            "subc" => builder.ins().ssub_overflow(a, b),
-            "mulc" => builder.ins().smul_overflow(a, b),
-            "uaddc" => builder.ins().uadd_overflow(a, b),
-            "usubc" => builder.ins().usub_overflow(a, b),
-            "umulc" => builder.ins().umul_overflow(a, b),
-            _ => {
-                return Err(CompileError::ModuleError(format!(
-                    "IR consumer: unsupported checked integer op '{op}'"
-                )))
-            }
-        };
-        computed = Some(value);
-        overflowed
-    };
     // a trap, not a call to the runtime error: a call on the cold path makes
     // every value live across the check survive a call, which costs spills
     // in the hot loop around it (twice the instructions in a merge loop).
     // the runtime turns the trap into the integer-overflow error
     // (overflow_trap.rs).
-    builder.ins().trapnz(overflowed, cranelift::codegen::ir::TrapCode::unwrap_user(OVERFLOW_TRAP_CODE));
-    Ok(match computed {
-        Some(value) => value,
-        None => plain(builder),
-    })
+    let code = cranelift::codegen::ir::TrapCode::unwrap_user(OVERFLOW_TRAP_CODE);
+    if let Some((c, x, x_nonneg, const_on_left)) = constant {
+        let Some((lo, hi)) = checked_operand_range(op, c, const_on_left) else {
+            return Ok(plain(builder));
+        };
+        let (min, max) = if unsigned { (0i128, u64::MAX as i128) } else { (i64::MIN as i128, i64::MAX as i128) };
+        let least = if x_nonneg { 0 } else { min };
+        let (below, above) = if unsigned {
+            (IntCC::UnsignedLessThan, IntCC::UnsignedGreaterThan)
+        } else {
+            (IntCC::SignedLessThan, IntCC::SignedGreaterThan)
+        };
+        let overflowed = match (lo > least, hi < max) {
+            (false, false) => return Ok(plain(builder)),
+            (false, true) => builder.ins().icmp_imm(above, x, hi as i64),
+            (true, false) => builder.ins().icmp_imm(below, x, lo as i64),
+            (true, true) => {
+                // both ends: one unsigned compare of the distance from lo
+                let shifted = builder.ins().iadd_imm(x, (lo as i64).wrapping_neg());
+                builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, shifted, (hi - lo) as i64)
+            }
+        };
+        builder.ins().trapnz(overflowed, code);
+        return Ok(plain(builder));
+    }
+    let (value, overflowed) = match op {
+        "addc" if a_nonneg || b_nonneg => {
+            let sum = builder.ins().iadd(a, b);
+            let overflowed = if a_nonneg && b_nonneg {
+                builder.ins().icmp_imm(IntCC::SignedLessThan, sum, 0)
+            } else if b_nonneg {
+                builder.ins().icmp(IntCC::SignedLessThan, sum, a)
+            } else {
+                builder.ins().icmp(IntCC::SignedLessThan, sum, b)
+            };
+            (sum, overflowed)
+        }
+        "subc" if a_nonneg && b_nonneg => return Ok(plain(builder)),
+        "subc" if b_nonneg => {
+            let diff = builder.ins().isub(a, b);
+            (diff, builder.ins().icmp(IntCC::SignedGreaterThan, diff, a))
+        }
+        "uaddc" => return Ok(builder.ins().uadd_overflow_trap(a, b, code)),
+        "usubc" => (builder.ins().isub(a, b), builder.ins().icmp(IntCC::UnsignedLessThan, a, b)),
+        "addc" => builder.ins().sadd_overflow(a, b),
+        "subc" => builder.ins().ssub_overflow(a, b),
+        "mulc" => builder.ins().smul_overflow(a, b),
+        "umulc" => builder.ins().umul_overflow(a, b),
+        _ => {
+            return Err(CompileError::ModuleError(format!(
+                "IR consumer: unsupported checked integer op '{op}'"
+            )))
+        }
+    };
+    builder.ins().trapnz(overflowed, code);
+    Ok(value)
 }
 
 fn emit_checked_int_div_or_mod(
@@ -3356,12 +3390,61 @@ fn compile_ir_function(
     let inline_opt_regs = if fast_paths { scan_unpackable_opt_regs(body_lines) } else { HashSet::new() };
     let mut virtual_opts: HashMap<usize, (Value, Value)> = HashMap::new();
 
+    // the values known never to be negative, which make a checked op's test
+    // cheaper (emit_checked_int_arith). a load of a variable that never holds
+    // a negative value is one (nonneg.rs), and so is a length, a constant of
+    // at least zero, and a checked or exact sum or product of two of them. a
+    // line whose result is one names its register in `pending_nonneg`, with
+    // the value the register held before, and the new value is recorded at
+    // the top of the next line, where no `continue` in the arms below can
+    // skip it. a line that left the register alone records nothing.
+    let nonneg_names = crate::nonneg::nonneg_vars(
+        body_lines,
+        param_names,
+        |name| global_data.contains_key(name),
+        |name| declared_funcs.contains_key(name),
+    );
+    let mut nonneg_values: HashSet<Value> = HashSet::new();
+    let mut pending_nonneg: Option<(usize, Option<Value>)> = None;
+
     // Compile instructions
     let mut terminated = false;
     for (line_idx, line) in body_lines.iter().enumerate() {
+        if let Some((reg, before)) = pending_nonneg.take() {
+            if let Some(&v) = regs.get(&reg) {
+                if Some(v) != before && !kinds.floats.contains(&reg) && !kinds.strings.contains(&reg) {
+                    nonneg_values.insert(v);
+                }
+            }
+        }
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.is_empty() || parts[0].starts_with(';') {
             continue;
+        }
+        let value_nonneg = |token: &str| {
+            token.parse::<usize>().ok().and_then(|r| regs.get(&r)).is_some_and(|&v| {
+                nonneg_values.contains(&v) || iconst_of(builder.func, v).is_some_and(|c| c >= 0)
+            })
+        };
+        let result_nonneg = match parts[0] {
+            "iconst" => parts.get(2).and_then(|v| v.parse::<i64>().ok()).is_some_and(|v| v >= 0),
+            "load" => parts.get(2).is_some_and(|name| {
+                nonneg_names.contains(*name) && !float_vars.contains(*name) && !string_vars.contains(*name)
+            }),
+            "call" => parts
+                .get(2)
+                .is_some_and(|f| crate::nonneg::LENGTH_CALLS.contains(f) && !declared_funcs.contains_key(*f)),
+            op if crate::nonneg::keeps_nonneg(op) && parts.len() >= 4 => {
+                value_nonneg(parts[2]) && value_nonneg(parts[3])
+            }
+            _ => false,
+        };
+        let operands_nonneg = (
+            parts.get(2).is_some_and(|t| value_nonneg(t)),
+            parts.get(3).is_some_and(|t| value_nonneg(t)),
+        );
+        if result_nonneg {
+            pending_nonneg = parts[1].parse::<usize>().ok().map(|r| (r, regs.get(&r).copied()));
         }
 
         // Record a label as "defined" the moment we reach it in the stream, in
@@ -3496,6 +3579,7 @@ fn compile_ir_function(
             }
 
             "add" | "sub" | "mul" | "div" | "mod" | "addc" | "subc" | "mulc" | "uaddc" | "usubc" | "umulc"
+            | "addnsw"
                 if parts.len() >= 4 =>
             {
                 let reg = parse_reg(parts[1], line, func_name)?;
@@ -3550,8 +3634,10 @@ fn compile_ir_function(
                             checked,
                             a,
                             b,
+                            operands_nonneg.0,
+                            operands_nonneg.1,
                         )?,
-                        "add" => builder.ins().iadd(a, b),
+                        "add" | "addnsw" => builder.ins().iadd(a, b),
                         "sub" => builder.ins().isub(a, b),
                         "mul" => builder.ins().imul(a, b),
                         "div" | "mod" => emit_checked_int_div_or_mod(

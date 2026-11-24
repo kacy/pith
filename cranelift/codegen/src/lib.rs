@@ -10,6 +10,7 @@ pub mod count_check;
 pub mod ir_consumer;
 pub mod linker;
 mod loop_hoist;
+mod nonneg;
 pub mod runtime_imports;
 pub mod runtime_ownership;
 

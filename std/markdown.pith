@@ -874,22 +874,46 @@ struct BlockParser:
     # and it is closed before any other block opens, so one buffer serves.
     lines: List[String]
 
+# where the line starting at `position` ends: its newline or carriage return,
+# or the end of the text.
+fn find_line_end(source: String, position: Int) -> Int:
+    length := source.len()
+    mut i := position
+    while i < length:
+        c := ord(source[i])
+        if c == 10 or c == 13:
+            return i
+        i += 1
+    return length
+
+# the first position at or after `start` whose byte `table` marks with a '1',
+# or the end of `content`. the hot scans of text runs and of text to escape go
+# through here: a small function whose state is all parameters compiles to a
+# tighter loop than the same scan inlined into a larger one.
+fn skip_unmarked(content: String, table: String, start: Int) -> Int:
+    length := content.len()
+    mut i := start
+    while i < length and ord(table[ord(content[i])]) == 48:
+        i += 1
+    return i
+
+# the input with each NUL replaced by U+FFFD, as the spec asks.
+fn without_nul(input: String) -> String:
+    if input.contains(chr(0)):
+        return input.replace(chr(0), encode_utf8(65533))
+    return input
+
 fn parse_blocks(input: String) -> Document:
-    mut source := input
-    if source.contains(chr(0)):
-        source = source.replace(chr(0), encode_utf8(65533))
+    # bound once rather than reassigned: indexing an immutable string local
+    # in the line loop below is about three times faster than a `mut` one.
+    source := without_nul(input)
     mut blocks: List[Block] := []
     blocks.push(Block(kind: BlockKind.Document, parent: -1, start_line: 1))
     parser := BlockParser(source: source, blocks: blocks, references: {}, tip: 0, old_tip: 0, last_matched: 0, all_closed: true, line_start: 0, line_end: 0, line_number: 0, offset: 0, column: 0, next_nonspace: 0, next_nonspace_column: 0, indent: 0, indented: false, blank: false, partially_consumed_tab: false, lines: [])
     length := source.len()
     mut position := 0
     while position < length:
-        mut line_end := position
-        while line_end < length:
-            c := ord(source[line_end])
-            if c == 10 or c == 13:
-                break
-            line_end += 1
+        line_end := find_line_end(source, position)
         parser.incorporate_line(position, line_end)
         if line_end >= length:
             position = length
@@ -1786,12 +1810,9 @@ impl InlineParser:
 
     fn parse_text_run():
         subject := self.subject
-        special := self.document.inline_special
         length := subject.len()
         start := self.position
-        mut end := start + 1
-        while end < length and ord(special[ord(subject[end])]) == 48:
-            end += 1
+        end := skip_unmarked(subject, self.document.inline_special, start + 1)
         self.position = end
         mut kept := end
         if end < length and ord(subject[end]) == 10:
@@ -2531,21 +2552,21 @@ impl HtmlRenderer:
 
     fn write_escaped(content: String):
         special := self.html_special
-        mut copied := 0
-        for i in 0..content.len():
-            c := ord(content[i])
-            if ord(special[c]) == 48:
-                continue
-            if i > copied:
-                self.parts.push(content.substring(copied, i))
-            self.parts.push(html_entity(c))
-            copied = i + 1
-        if copied == 0:
+        length := content.len()
+        mut i := skip_unmarked(content, special, 0)
+        if i == length:
             self.write(content)
             return
-        if copied < content.len():
-            self.parts.push(content.substring(copied, content.len()))
-        self.at_line_start = ord(content[content.len() - 1]) == 10
+        mut copied := 0
+        while i < length:
+            if i > copied:
+                self.parts.push(content.substring(copied, i))
+            self.parts.push(html_entity(ord(content[i])))
+            copied = i + 1
+            i = skip_unmarked(content, special, copied)
+        if copied < length:
+            self.parts.push(content.substring(copied, length))
+        self.at_line_start = ord(content[length - 1]) == 10
 
     fn write_url(url: String):
         safe := self.href_safe

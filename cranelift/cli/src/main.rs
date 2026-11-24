@@ -234,7 +234,7 @@ fn print_usage() {
     println!("  help               Show this help message");
     println!();
     println!("Environment:");
-    println!("  PITH_HOME         Installed toolchain root (default: the directory above bin/pith)");
+    println!("  PITH_HOME         Toolchain root holding std (default: the directory above bin/pith, or the checkout this pith was built in)");
     println!("  PITH_SELF_HOST    Path to self-hosted compiler (default: self-host/pith_main in this checkout)");
     println!("  PITH_IR_DRIVER    Path to the IR driver (default: self-host/ir_driver in this checkout)");
     println!("  PITH_DUMP_IR      Path to dump combined IR text (for debugging)");

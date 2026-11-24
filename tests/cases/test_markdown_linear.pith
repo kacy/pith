@@ -1,0 +1,124 @@
+# std.markdown on the inputs that make a naive commonmark parser quadratic.
+#
+# most of these are cmark's pathological tests, at 50k to 160k repetitions.
+# each is rendered under a time bound that a linear parser meets with a wide
+# margin and a quadratic one misses by orders of magnitude, and a fact about
+# the output is printed so a run that is fast because it went wrong fails too.
+
+import std.markdown as markdown
+import std.strings as strings
+import std.time as time
+
+fn count(page: String, needle: String) -> Int:
+    return strings.count(page, needle)
+
+fn timed(name: String, source: String) -> String:
+    started := time.now()
+    page := markdown.render(source, markdown.options().allow_html(true))
+    elapsed := time.now() - started
+    print("{name}: within bound {elapsed < 3000}")
+    return page
+
+fn numbered_lines(template: String, rounds: Int) -> String:
+    mut parts: List[String] := []
+    for i in 0..rounds:
+        parts.push(template.replace("N", i.to_string()))
+    return parts.join("")
+
+fn main():
+    nested := timed("nested strong emphasis", "*a **a ".repeat(50000) + "b" + " a** a*".repeat(50000))
+    print("  em {count(nested, "<em>")} strong {count(nested, "<strong>")}")
+
+    closers := timed("emphasis closers without openers", "a_ ".repeat(65000))
+    print("  em {count(closers, "<em>")}")
+
+    openers := timed("emphasis openers without closers", "_a ".repeat(65000))
+    print("  em {count(openers, "<em>")}")
+
+    link_closers := timed("link closers without openers", "a]".repeat(65000))
+    print("  links {count(link_closers, "<a ")}")
+
+    link_openers := timed("link openers without closers", "[a".repeat(65000))
+    print("  links {count(link_openers, "<a ")}")
+
+    mismatched := timed("mismatched openers and closers", "*a_ ".repeat(50000))
+    print("  em {count(mismatched, "<em>")}")
+
+    threes := timed("openers and closers multiple of 3", "a**b" + "c* ".repeat(50000))
+    print("  em {count(threes, "<em>")}")
+
+    link_emphasis := timed("link openers and emphasis closers", "[ a_".repeat(50000))
+    print("  em {count(link_emphasis, "<em>")}")
+
+    paren_brackets := timed("pattern [ (]( repeated", "[ (](".repeat(80000))
+    print("  links {count(paren_brackets, "<a ")}")
+
+    images := timed("pattern ![[]() repeated", "![[]()".repeat(160000))
+    print("  links {count(images, "<a href")}")
+
+    brackets := timed("nested brackets", "[".repeat(50000) + "a" + "]".repeat(50000))
+    print("  links {count(brackets, "<a ")}")
+
+    quotes := timed("nested block quotes", "> ".repeat(50000) + "a")
+    print("  block quotes {count(quotes, "<blockquote>")}, capped at {markdown.MAX_NESTING}")
+
+    mut list_lines: List[String] := []
+    for depth in 0..1000:
+        list_lines.push("  ".repeat(depth) + "* a\n")
+    lists := timed("deeply nested lists", list_lines.join(""))
+    print("  lists {count(lists, "<ul>")}")
+
+    blank_lines := timed("blank lines under a deep list", "- ".repeat(40) + "a\n" + "\n".repeat(100000) + "b")
+    print("  items {count(blank_lines, "<li>")}")
+
+    mut ticks: List[String] := []
+    for run in 1..5000:
+        ticks.push("e" + "`".repeat(run))
+    backticks := timed("backtick runs of every length", ticks.join(""))
+    print("  code spans {count(backticks, "<code>")}")
+
+    unclosed_pointy := timed("unclosed links with angle brackets", "[a](<b".repeat(30000))
+    print("  links {count(unclosed_pointy, "<a ")}")
+
+    unclosed_plain := timed("unclosed links", "[a](b".repeat(30000))
+    print("  links {count(unclosed_plain, "<a ")}")
+
+    balanced := timed("unclosed links with balanced parens", "[a](b()".repeat(30000))
+    print("  links {count(balanced, "<a ")}")
+
+    titles := timed("unclosed link titles", "[a](b \"".repeat(30000))
+    print("  links {count(titles, "<a ")}")
+
+    comments := timed("unclosed comments", "</" + "<!--".repeat(100000))
+    print("  comments kept as text {count(comments, "&lt;!--")}")
+
+    instructions := timed("unclosed processing instructions", "x " + "<?".repeat(100000))
+    print("  kept as text {count(instructions, "&lt;?")}")
+
+    declarations := timed("unclosed declarations", "x " + "<!A".repeat(100000))
+    print("  kept as text {count(declarations, "&lt;!A")}")
+
+    cdata := timed("unclosed cdata", "x " + "<![CDATA[".repeat(50000))
+    print("  kept as text {count(cdata, "&lt;![CDATA[")}")
+
+    attributes := timed("unclosed attribute values", "<a x=\"".repeat(50000))
+    print("  kept as text {count(attributes, "&lt;a x=")}")
+
+    angles := timed("runs of angle brackets", "<".repeat(100000) + "a")
+    print("  escaped {count(angles, "&lt;")}")
+
+    references := timed("many references", numbered_lines("[N]: /url\n", 50000) + numbered_lines("[N] ", 50000))
+    print("  links {count(references, "<a ")}")
+
+    big_definition := "[x]: /" + "u".repeat(200000) + "\n\n"
+    budget := timed("reference expansion budget", big_definition + "[x] ".repeat(10000))
+    print("  expanded {count(budget, "<a ")} of 10000, output under 2 MB {budget.len() < 2000000}")
+
+    setext := timed("references before a setext underline", numbered_lines("[N]: /u\n", 50000) + "===\n")
+    print("  headings {count(setext, "<h1>")}, paragraphs {count(setext, "<p>")}")
+
+    long_label := timed("labels near the length limit", "[y]: /u\n\n" + ("[" + "x".repeat(990) + "]").repeat(200))
+    print("  links {count(long_label, "<a ")}")
+
+    entities := timed("entities", "&amp;&#x41;&copy;&bogus;".repeat(40000))
+    print("  decoded {count(entities, "©")}, kept {count(entities, "&amp;bogus;")}")

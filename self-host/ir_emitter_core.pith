@@ -12524,6 +12524,8 @@ fn ir_emit_if_branch(branch: IrIfBranch, then_label: String, next_label: String,
     if branch.cond_idx >= 0:
         cr := ir_expr(branch.cond_idx)
         ir_emit("brif " + cr.to_string() + " " + then_label + " " + next_label)
+        if branch.body_idx >= 0:
+            ir_mark_guarded_steps(branch.cond_idx, branch.body_idx)
     ir_emit_label(then_label)
     ir_last_was_ret = false
     if branch.body_idx >= 0:
@@ -13085,7 +13087,8 @@ fn ir_is_length_bound(idx: Int) -> Bool:
 
 # the Int locals a while condition bounds: "i+" for one bounded above
 # (`i < e`, `e > i`, or `i <= n` for a length n) and "i-" for one bounded
-# below (`i > e`, `e < i`), looking through `and`.
+# below (`i > e`, `e < i`), looking through `and`. `a < b` bounds both
+# sides when both are locals: a is below b, and b above a.
 fn ir_counter_candidates(cond_idx: Int, out: List[String]):
     n := get_node(cond_idx)
     if n.kind != "binary" or n.children.len() != 2:
@@ -13096,18 +13099,29 @@ fn ir_counter_candidates(cond_idx: Int, out: List[String]):
         return
     left := n.children[0]
     right := n.children[1]
-    if n.value == "lt" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int":
-        out.push(node_value(left) + "+")
-    elif n.value == "gt" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int":
-        out.push(node_value(right) + "+")
-    elif n.value == "gt" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int":
-        out.push(node_value(left) + "-")
-    elif n.value == "lt" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int":
-        out.push(node_value(right) + "-")
+    if n.value == "lt" or n.value == "gt":
+        mut below := left
+        mut above := right
+        if n.value == "gt":
+            below = right
+            above = left
+        if node_kind(below) == "ident" and get_type_name(c_get_expr_type(below)) == "Int":
+            out.push(node_value(below) + "+")
+        if node_kind(above) == "ident" and get_type_name(c_get_expr_type(above)) == "Int":
+            out.push(node_value(above) + "-")
     elif n.value == "lte" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int" and ir_is_length_bound(right):
         out.push(node_value(left) + "+")
     elif n.value == "gte" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int" and ir_is_length_bound(left):
         out.push(node_value(right) + "+")
+
+# whether `n` is `name + 1` (dir "+") or `name - 1` (dir "-")
+fn ir_is_counter_step_sum(n: Node, name: String, dir: String) -> Bool:
+    mut op := "add"
+    if dir == "-":
+        op = "sub"
+    if n.kind != "binary" or n.value != op or n.children.len() != 2:
+        return false
+    return node_kind(n.children[0]) == "ident" and node_value(n.children[0]) == name and node_kind(n.children[1]) == "int_lit" and node_value(n.children[1]) == "1"
 
 # the node to mark when assignment `idx` steps `name` by one in direction
 # `dir` ("+" or "-"): the binary of `i = i + 1`, or the `i += 1` itself.
@@ -13117,13 +13131,76 @@ fn ir_counter_step_node(idx: Int, name: String, dir: String) -> Int:
     rhs := get_node(n.children[1])
     if (n.value == dir + "=") and rhs.kind == "int_lit" and rhs.value == "1":
         return idx
-    mut op := "add"
-    if dir == "-":
-        op = "sub"
-    if n.value == "=" and rhs.kind == "binary" and rhs.value == op and rhs.children.len() == 2:
-        if node_kind(rhs.children[0]) == "ident" and node_value(rhs.children[0]) == name and node_kind(rhs.children[1]) == "int_lit" and node_value(rhs.children[1]) == "1":
-            return n.children[1]
+    if n.value == "=" and ir_is_counter_step_sum(rhs, name, dir):
+        return n.children[1]
     return 0 - 1
+
+# the statements of a block, or the node alone when it is one statement. an
+# `if` branch is a `then` holding one `block`, which runs the same
+# statements in the same order, so a block that holds only a block is read
+# through.
+fn ir_block_statements(idx: Int) -> List[Int]:
+    kind := node_kind(idx)
+    if kind == "block" or kind == "then" or kind == "else" or kind == "body":
+        children := get_node(idx).children
+        if children.len() == 1:
+            inner := node_kind(children[0])
+            if inner == "block" or inner == "then" or inner == "else" or inner == "body":
+                return ir_block_statements(children[0])
+        return children
+    return [idx]
+
+# mark the `name + 1` (or `name - 1`) sums in the subtree at idx. a deferred
+# statement runs at the end of its block, and a lambda or a spawned task may
+# run later still, so their subtrees are left alone.
+fn ir_mark_counter_sums(idx: Int, name: String, dir: String):
+    n := get_node(idx)
+    if n.kind == "defer" or n.kind == "errdefer" or n.kind == "lambda" or n.kind == "spawn":
+        return
+    if ir_is_counter_step_sum(n, name, dir):
+        ir_counter_steps.insert(idx, true)
+    for child in n.children:
+        ir_mark_counter_sums(child, name, dir)
+
+# mark the sums of a while counter in the statements of the body before its
+# step, when the step `step` marks is one of the body's own statements. the
+# condition was tested on the way in, and nothing before the step writes the
+# counter, so it is still within the bound there and `i + 1` (or `i - 1` for
+# a counter stepped down) stays in range, as the step itself does.
+fn ir_mark_counter_uses(body_idx: Int, step: Int, name: String, dir: String):
+    stmts := ir_block_statements(body_idx)
+    mut k := 0
+    while k < stmts.len():
+        stmt := stmts[k]
+        if stmt == step or (node_kind(stmt) == "assignment" and node_child_count(stmt) == 2 and node_child(stmt, 1) == step):
+            mut j := 0
+            while j < k:
+                ir_mark_counter_sums(stmts[j], name, dir)
+                j = j + 1
+            return
+        k = k + 1
+
+# mark the step an `if` branch takes on a name its condition bounds the way
+# a while condition does (ir_counter_candidates). with `x > e` true on the
+# way in, x is above the smallest Int, so the first `x = x - 1` of the
+# branch stays in range, and `x < e` does the same for `x + 1`. the step
+# must be one of the branch's own statements, since one in a nested block
+# may sit in a loop or a defer, and no statement before it may write x.
+fn ir_mark_guarded_steps(cond_idx: Int, body_idx: Int):
+    mut candidates: List[String] := []
+    ir_counter_candidates(cond_idx, candidates)
+    for cand in candidates:
+        name := cand.substring(0, cand.len() - 1)
+        dir := cand.substring(cand.len() - 1, cand.len())
+        if ir_assign_targets_global_slot(name):
+            continue
+        for stmt in ir_block_statements(body_idx):
+            mut found: List[Int] := []
+            ir_counter_assignments(stmt, name, dir, false, found)
+            if found.len() > 0:
+                if node_kind(stmt) == "assignment" and found.len() == 1 and found[0] >= 0:
+                    ir_counter_steps.insert(found[0], true)
+                break
 
 # the assignments to `name` in a loop body, as the step nodes they would
 # mark, with -1 for one that cannot be marked: one that is not a step of
@@ -13171,6 +13248,7 @@ fn ir_mark_counter_steps(cond_idx: Int, body_idx: Int):
         ir_counter_assignments(body_idx, name, dir, false, found)
         if found.len() == 1 and found[0] >= 0:
             ir_counter_steps.insert(found[0], true)
+            ir_mark_counter_uses(body_idx, found[0], name, dir)
 
 fn ir_emit_while_stmt(node: Node):
     head_label := ir_label()

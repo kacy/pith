@@ -121,6 +121,17 @@ unsafe impl Send for Ring {}
 // through the Vyukov sequence protocol on `Slot::sequence`.
 unsafe impl Sync for Ring {}
 
+/// high bit of `Ring::enqueue_pos`, set atomically on channel close so no
+/// concurrent lock-free `try_enqueue` can ever succeed after `close()` returns.
+const CLOSED_BIT: usize = 1usize << (usize::BITS - 1);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnqueueStatus {
+    Enqueued,
+    Full,
+    Closed,
+}
+
 impl Ring {
     /// how many slots a ring for `capacity` values allocates. split out of
     /// `new` so the memory accounting in `pith_channel_new` reports the size
@@ -156,19 +167,30 @@ impl Ring {
         }
     }
 
+    /// atomically seal the enqueue side so no subsequent `try_enqueue` can
+    /// claim a slot.
+    fn close(&self) {
+        self.enqueue_pos.0.fetch_or(CLOSED_BIT, Ordering::SeqCst);
+    }
+
     /// how many values are in the ring right now. approximate under concurrency
     /// (positions move independently), exact when the channel is quiescent.
     fn len(&self) -> usize {
-        let enq = self.enqueue_pos.0.load(Ordering::Acquire);
+        let enq = self.enqueue_pos.0.load(Ordering::Acquire) & !CLOSED_BIT;
         let deq = self.dequeue_pos.0.load(Ordering::Acquire);
         enq.saturating_sub(deq)
     }
 
-    /// lock-free enqueue: false when the channel is at capacity.
+    /// lock-free enqueue: rejects closed channels atomically via `CLOSED_BIT`
+    /// in `enqueue_pos`, eliminating both the send-vs-close race and the extra
+    /// `SeqCst` load on the fast path.
     #[inline(always)]
-    fn try_enqueue(&self, value: i64, capacity: usize) -> bool {
-        let mut pos = self.enqueue_pos.0.load(Ordering::Relaxed);
+    fn try_enqueue(&self, value: i64, capacity: usize) -> EnqueueStatus {
+        let mut pos = self.enqueue_pos.0.load(Ordering::Acquire);
         loop {
+            if pos & CLOSED_BIT != 0 {
+                return EnqueueStatus::Closed;
+            }
             // a non-power-of-two capacity leaves spare ring slots, so fullness
             // is not encoded in the slot sequences alone: enforce it here. when
             // the capacity is exact this check (and its read of the receivers'
@@ -176,17 +198,19 @@ impl Ring {
             if !self.exact
                 && pos.saturating_sub(self.dequeue_pos.0.load(Ordering::Acquire)) >= capacity
             {
-                return false;
+                return EnqueueStatus::Full;
             }
             let slot = &self.buffer[pos & self.mask];
             let seq = slot.sequence.load(Ordering::Acquire);
             if seq == pos {
                 // slot free for this position: claim it by advancing enqueue_pos.
+                // if `close()` sets `CLOSED_BIT` concurrently, this CAS fails
+                // and the next iteration sees `CLOSED_BIT`.
                 match self.enqueue_pos.0.compare_exchange_weak(
                     pos,
                     pos + 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 ) {
                     Ok(_) => {
                         // SAFETY: Slot was claimed exclusively via `enqueue_pos` CAS and its
@@ -194,16 +218,16 @@ impl Ring {
                         unsafe { *slot.cell.get() = value };
                         // release-publish the value to the dequeuer at this pos.
                         slot.sequence.store(pos + 1, Ordering::Release);
-                        return true;
+                        return EnqueueStatus::Enqueued;
                     }
                     Err(actual) => pos = actual,
                 }
             } else if seq < pos {
                 // the slot still holds a value from the previous lap: full.
-                return false;
+                return EnqueueStatus::Full;
             } else {
                 // another enqueuer already claimed this position; catch up.
-                pos = self.enqueue_pos.0.load(Ordering::Relaxed);
+                pos = self.enqueue_pos.0.load(Ordering::Acquire);
             }
         }
     }
@@ -244,10 +268,33 @@ impl Ring {
     }
 }
 
+/// An in-flight unbuffered rendezvous deposit.
+/// - `Blocking(v)`: deposited by a parked `channel_send_impl`; if `close()` runs
+///   before delivery, `close()` clears it so the sender wakes with failure (0)
+///   and retains ownership of `v`.
+/// - `Detached(v)`: deposited by `channel_try_send_impl` which already returned
+///   success (1), transferring ownership of `v` to the channel; `close()` leaves
+///   it intact so a receiver can drain it or `drain_channel_elements` releases
+///   it on channel free (preventing leaks).
+#[derive(Clone, Copy)]
+enum PendingValue {
+    Blocking(i64),
+    Detached(i64),
+}
+
+impl PendingValue {
+    #[inline(always)]
+    fn value(self) -> i64 {
+        match self {
+            PendingValue::Blocking(v) | PendingValue::Detached(v) => v,
+        }
+    }
+}
+
 struct ChannelState {
     capacity: usize,
     closed: bool,
-    pending_value: Option<i64>,
+    pending_value: Option<PendingValue>,
     /// Rendezvous handoffs completed on this channel. A parked unbuffered
     /// sender records this before it waits and compares afterwards: close()
     /// clears `pending_value` the same way a receiver taking it does, so
@@ -501,9 +548,9 @@ fn drain_channel_elements(t: &TaggedChannel) {
             unsafe { crate::collections::list::release_element(tag, v) };
         }
     }
-    if let Some(v) = lock_state(&t.inner.state).pending_value.take() {
+    if let Some(p) = lock_state(&t.inner.state).pending_value.take() {
         // SAFETY: Channel owned one refcount on the pending payload matching `tag`.
-        unsafe { crate::collections::list::release_element(tag, v) };
+        unsafe { crate::collections::list::release_element(tag, p.value()) };
     }
 }
 
@@ -830,12 +877,13 @@ fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, value: i64
     let green_task = green::current_task();
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
     loop {
-        if inner.closed_flag.load(Ordering::SeqCst) {
-            return 0;
-        }
-        if ring.try_enqueue(value, capacity) {
-            wake_parked(inner, ring, Role::Receiver);
-            return 1;
+        match ring.try_enqueue(value, capacity) {
+            EnqueueStatus::Enqueued => {
+                wake_parked(inner, ring, Role::Receiver);
+                return 1;
+            }
+            EnqueueStatus::Closed => return 0,
+            EnqueueStatus::Full => {}
         }
         if spins > 0 {
             spins -= 1;
@@ -846,15 +894,18 @@ fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, value: i64
         let mut state = lock_state(&inner.state);
         inner.parked_senders.fetch_add(1, Ordering::SeqCst);
         std::sync::atomic::fence(Ordering::SeqCst);
-        if inner.closed_flag.load(Ordering::SeqCst) {
-            inner.parked_senders.fetch_sub(1, Ordering::SeqCst);
-            return 0;
-        }
-        if ring.try_enqueue(value, capacity) {
-            inner.parked_senders.fetch_sub(1, Ordering::SeqCst);
-            drop(state);
-            wake_parked(inner, ring, Role::Receiver);
-            return 1;
+        match ring.try_enqueue(value, capacity) {
+            EnqueueStatus::Enqueued => {
+                inner.parked_senders.fetch_sub(1, Ordering::SeqCst);
+                drop(state);
+                wake_parked(inner, ring, Role::Receiver);
+                return 1;
+            }
+            EnqueueStatus::Closed => {
+                inner.parked_senders.fetch_sub(1, Ordering::SeqCst);
+                return 0;
+            }
+            EnqueueStatus::Full => {}
         }
         state = block_on_channel(park, inner, state, green_task, Role::Sender);
         drop(state);
@@ -942,7 +993,7 @@ fn channel_send_impl(t: &TaggedChannel, value: i64) -> i64 {
         // timeout. the send still returns only once the value is taken.
         if state.pending_value.is_none() {
             let handoffs_before = state.deliveries;
-            state.pending_value = Some(value);
+            state.pending_value = Some(PendingValue::Blocking(value));
             wake_receivers(inner, &mut state);
             // count ourselves as a waiting sender while we wait for the
             // receiver to take the value: the recv that takes it gates its
@@ -979,14 +1030,13 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 fn channel_try_send_impl(t: &TaggedChannel, value: i64) -> i64 {
     let inner = &t.inner;
     if let Some(ring) = &inner.ring {
-        if inner.closed_flag.load(Ordering::SeqCst) {
-            return 0;
-        }
-        if ring.try_enqueue(value, inner.capacity) {
-            wake_parked(inner, ring, Role::Receiver);
-            return 1;
-        }
-        return 0;
+        return match ring.try_enqueue(value, inner.capacity) {
+            EnqueueStatus::Enqueued => {
+                wake_parked(inner, ring, Role::Receiver);
+                1
+            }
+            EnqueueStatus::Full | EnqueueStatus::Closed => 0,
+        };
     }
     let mut state = lock_state(&inner.state);
 
@@ -997,7 +1047,7 @@ fn channel_try_send_impl(t: &TaggedChannel, value: i64) -> i64 {
     if state.receiver_waiting == 0 || state.pending_value.is_some() {
         return 0;
     }
-    state.pending_value = Some(value);
+    state.pending_value = Some(PendingValue::Detached(value));
     wake_receivers(inner, &mut state);
     1
 }
@@ -1020,12 +1070,12 @@ fn channel_recv_impl(t: &TaggedChannel) -> Option<i64> {
     let mut state = lock_state(&inner.state);
 
     loop {
-        if let Some(value) = state.pending_value.take() {
+        if let Some(pending) = state.pending_value.take() {
             // completed a rendezvous: wake the sender waiting for its value
             // to be taken.
             state.deliveries += 1;
             wake_senders(inner, &mut state);
-            return Some(value);
+            return Some(pending.value());
         }
 
         if state.closed {
@@ -1062,10 +1112,10 @@ fn channel_try_recv_impl(t: &TaggedChannel) -> Option<i64> {
         return None;
     }
     let mut state = lock_state(&inner.state);
-    if let Some(value) = state.pending_value.take() {
+    if let Some(pending) = state.pending_value.take() {
         state.deliveries += 1;
         wake_senders(inner, &mut state);
-        return Some(value);
+        return Some(pending.value());
     }
     None
 }
@@ -1110,10 +1160,21 @@ fn channel_close_impl(t: &TaggedChannel) -> i64 {
         return 0;
     }
     state.closed = true;
-    // publish close to the lock-free path before the wakes below, so a woken
-    // buffered waiter's re-check observes it.
+    // seal the lock-free ring atomically before publishing `closed_flag` and
+    // waking waiters, so no racing `try_enqueue` can succeed after `close()`.
+    if let Some(ring) = &inner.ring {
+        ring.close();
+    }
+    // publish close to the lock-free recv path before the wakes below, so a
+    // woken buffered waiter's re-check observes it.
     inner.closed_flag.store(true, Ordering::SeqCst);
-    state.pending_value = None;
+    // only discard a blocking sender's deposit (the sender wakes with 0 and
+    // retains ownership); a detached `try_send` deposit already transferred
+    // ownership to the channel and is either drained by a receiver or released
+    // in `drain_channel_elements`.
+    if matches!(state.pending_value, Some(PendingValue::Blocking(_))) {
+        state.pending_value = None;
+    }
     // wake every parked caller of both roles so they resume and observe `closed`,
     // the one notify that legitimately targets both sides. notify_all rather than
     // notify_one because there is no bound on how many are parked.
@@ -1725,6 +1786,40 @@ mod tests {
                 sum.load(Ordering::Relaxed),
                 total_msgs * (total_msgs - 1) / 2
             );
+        }
+    }
+
+    #[test]
+    fn ring_close_rejects_subsequent_enqueues_atomically() {
+        let ring = Ring::new(4);
+        assert!(matches!(ring.try_enqueue(10, 4), EnqueueStatus::Enqueued));
+        assert!(matches!(ring.try_enqueue(20, 4), EnqueueStatus::Enqueued));
+        ring.close();
+        assert!(matches!(ring.try_enqueue(30, 4), EnqueueStatus::Closed));
+        assert_eq!(ring.len(), 2);
+        assert_eq!(ring.try_dequeue(), Some(10));
+        assert_eq!(ring.try_dequeue(), Some(20));
+        assert_eq!(ring.try_dequeue(), None);
+        assert_eq!(ring.len(), 0);
+    }
+
+    #[test]
+    fn unbuffered_detached_try_send_survives_close_and_drains_cleanly() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let ch = pith_channel_new(0, 0);
+            // Simulate a waiting receiver so try_send succeeds and detaches ownership.
+            with_channel(ch, |t| {
+                lock_state(&t.inner.state).receiver_waiting = 1;
+            });
+            assert_eq!(pith_channel_try_send(ch, 42), 1);
+            assert_eq!(pith_channel_close(ch), 1);
+            // The detached value is still drainable by a receiver after close.
+            let got = channel_try_recv(ch);
+            assert_eq!(got, Some(42));
+            // Subsequent recv observes closed & drained.
+            assert_eq!(channel_recv(ch), None);
+            pith_channel_release(ch);
         }
     }
 }

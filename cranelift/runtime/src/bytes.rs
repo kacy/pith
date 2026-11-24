@@ -525,10 +525,21 @@ pub unsafe extern "C" fn pith_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
     unsafe { with_bytes2(a, b, constant_time_eq_impl) }.unwrap_or(0)
 }
 
+/// Maximum single secure-random draw (64 MiB): prevents an untrusted or buggy
+/// caller from triggering an unrecoverable OOM abort in `vec![0; len]`.
+const MAX_SECURE_RANDOM_BYTES: i64 = 64 * 1024 * 1024;
+
 #[no_mangle]
 pub extern "C" fn pith_secure_random_bytes(count: i64) -> i64 {
-    let len = count.max(0) as usize;
-    let mut out = vec![0_u8; len];
+    if count < 0 || count > MAX_SECURE_RANDOM_BYTES {
+        return 0;
+    }
+    let len = count as usize;
+    let mut out = Vec::new();
+    if out.try_reserve_exact(len).is_err() {
+        return 0;
+    }
+    out.resize(len, 0_u8);
     if len == 0 {
         return pith_bytes_from_vec(out);
     }
@@ -1232,6 +1243,19 @@ mod tests {
             let empty = pith_byte_buffer_new();
             assert_eq!(crate::string::pith_cstring_len(pith_byte_buffer_string(empty)), 0);
             pith_byte_buffer_free(empty);
+        }
+    }
+
+    #[test]
+    fn secure_random_rejects_negative_and_oversized_counts() {
+        assert_eq!(pith_secure_random_bytes(-1), 0);
+        assert_eq!(pith_secure_random_bytes(i64::MAX), 0);
+        assert_eq!(pith_secure_random_bytes(MAX_SECURE_RANDOM_BYTES + 1), 0);
+        let ok = pith_secure_random_bytes(32);
+        assert_ne!(ok, 0);
+        unsafe {
+            assert_eq!(pith_bytes_len(ok), 32);
+            pith_bytes_release(ok);
         }
     }
 }

@@ -731,7 +731,7 @@ fn set_deadline(conn: i64, write: bool, ms: i64) {
     let Some(guard) = socket(conn) else {
         return;
     };
-    let at = (ms > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+    let at = crate::fdio::deadline_after_ms(ms);
     fd_handle::set_deadline(&guard, write, at);
 }
 

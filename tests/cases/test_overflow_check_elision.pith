@@ -1,0 +1,370 @@
+# the compiler leaves out the overflow check of a loop counter's step and of
+# a step an `if` guards, and narrows the check of an operand it knows is never
+# negative. none of that may let an overflow through: every trap below runs
+# under isolate_call, so its failure is printed and the program goes on, and
+# the results that fit are printed after them, checked against values worked
+# out by hand.
+fn big() -> Int:
+    return 9223372036854775807
+
+fn small() -> Int:
+    return 0 - big() - 1
+
+fn n(x: Int) -> Int:
+    return x
+
+fn some_big() -> Int?:
+    return big()
+
+enum Held:
+    Full(Int)
+    Empty
+
+fn held_big() -> Held:
+    return Held.Full(big())
+
+fn note(x: Int):
+    if x == 0:
+        print("note zero")
+
+fn show(label: String, failure: String):
+    if failure == "":
+        print("{label}: no trap")
+    else:
+        print("{label}: {failure}")
+
+# a payload binding of a counter's name writes the counter's slot, so the
+# step after it must stop the program. were the payload given a slot of its
+# own, the loop would finish instead, which is right too. what must never
+# happen is a counter that wrapped: it would come back negative, and reading
+# an empty list then fails the call with an index error.
+fn not_wrapped(x: Int) -> Int:
+    empty: List[Int] := []
+    if x < 0:
+        return empty[0]
+    return x
+
+fn show_no_wrap(label: String, failure: String):
+    if failure == "" or failure == "integer overflow":
+        print("{label}: no wrap")
+    else:
+        print("{label}: {failure}")
+
+# `<=` against a bound that is not a length leaves the step checked
+fn count_through(start: Int, last: Int) -> Int:
+    mut i := start
+    while i <= last:
+        i = i + 1
+    return i
+
+# a step of two can pass the bound
+fn step_two(start: Int, bound: Int) -> Int:
+    mut i := start
+    while i < bound:
+        i = i + 2
+    return i
+
+# two steps for one test of the condition
+fn step_twice(start: Int, bound: Int) -> Int:
+    mut i := start
+    while i < bound:
+        i = i + 1
+        i = i + 1
+    return i
+
+# the body writes the counter before its step
+fn reset_then_step(start: Int, bound: Int, trigger: Int) -> Int:
+    mut i := start
+    while i < bound:
+        if i == trigger:
+            i = big()
+        i = i + 1
+    return i
+
+# a counter stepped down under `>=` reaches the smallest Int
+fn count_down_through(start: Int, last: Int) -> Int:
+    mut i := start
+    while i >= last:
+        i = i - 1
+    return i
+
+# an `if let` payload with the counter's name writes the counter
+fn rebound_by_if_let(bound: Int) -> Int:
+    mut i := 0
+    while i < bound:
+        if let i = some_big():
+            note(i)
+        i = i + 1
+    return i
+
+# so does a match payload
+fn rebound_by_match(bound: Int) -> Int:
+    mut i := 0
+    while i < bound:
+        match held_big():
+            Held.Full(i) => note(i)
+            Held.Empty => note(1)
+        i = i + 1
+    return i
+
+# a deferred sum runs after the step, when the counter can be at the bound
+fn deferred_use(start: Int, bound: Int) -> Int:
+    mut i := start
+    while i < bound:
+        defer note(i + 1)
+        i = i + 1
+    return i
+
+# a sum after the step sees the counter at the bound
+fn use_after_step(start: Int, bound: Int) -> Int:
+    mut i := start
+    mut last := 0
+    while i < bound:
+        i = i + 1
+        last = i + 1
+    return last
+
+# a sum before the step sees the counter below the bound, so it fits
+fn use_before_step(start: Int, bound: Int) -> Int:
+    mut i := start
+    mut last := 0
+    while i < bound:
+        last = i + 1
+        i = i + 1
+    return last
+
+# `lo < hi` bounds both: lo is below the largest Int, hi above the smallest
+fn meet(lo0: Int, hi0: Int) -> Int:
+    mut lo := lo0
+    mut hi := hi0
+    while lo < hi:
+        lo = lo + 1
+        hi = hi - 1
+    return hi
+
+# two steps down for one test of the condition
+fn lower_twice(lo: Int, hi0: Int) -> Int:
+    mut hi := hi0
+    while lo < hi:
+        hi = hi - 1
+        hi = hi - 1
+    return hi
+
+# a bound the body lowers still bounds each step
+fn shrinking_bound(start: Int, bound: Int) -> Int:
+    mut i := start
+    mut m := bound
+    while i < m:
+        m = m - 1
+        i = i + 1
+    return i
+
+# `<=` against a length bounds the counter well below the largest Int
+fn through_length(xs: List[Int]) -> Int:
+    count := xs.len()
+    mut i := 0
+    while i <= count:
+        i = i + 1
+    return i
+
+fn guarded_down(x0: Int, floor: Int) -> Int:
+    mut x := x0
+    if x > floor:
+        x = x - 1
+    return x
+
+fn guarded_up(x0: Int, ceiling: Int) -> Int:
+    mut x := x0
+    if x < ceiling:
+        x += 1
+    return x
+
+# the guard says nothing once the branch writes the name again
+fn guard_then_write(x0: Int, floor: Int) -> Int:
+    mut x := x0
+    if x > floor:
+        x = small()
+        x = x - 1
+    return x
+
+# `>=` leaves the name free to be the smallest Int
+fn guard_at_least(x0: Int, floor: Int) -> Int:
+    mut x := x0
+    if x >= floor:
+        x = x - 1
+    return x
+
+# a variable that is never negative except for one store is of unknown sign
+fn once_negative(flag: Bool) -> Int:
+    mut x := 0
+    if flag:
+        x = small() / 2
+    return x * 3
+
+# a wrapping add can take a counter below zero
+fn wrapped_counter() -> Int:
+    mut i := 0
+    i = i.wrapping_add(big())
+    i = i.wrapping_add(1)
+    return i * 2
+
+# 2^times, built only from values that are never negative
+fn power(times: Int) -> Int:
+    mut x := 1
+    mut k := 0
+    while k < times:
+        x = x * 2
+        k = k + 1
+    return x
+
+fn power_times_three(times: Int) -> Int:
+    mut x := 1
+    mut k := 0
+    while k < times:
+        x = x * 2
+        k = k + 1
+    return x * 3
+
+fn power_doubled(times: Int) -> Int:
+    mut x := 1
+    mut k := 0
+    while k < times:
+        x = x * 2
+        k = k + 1
+    return x + x
+
+fn plus_power(a: Int, times: Int) -> Int:
+    mut x := 1
+    mut k := 0
+    while k < times:
+        x = x * 2
+        k = k + 1
+    return a + x
+
+fn power_plus(a: Int, times: Int) -> Int:
+    mut x := 1
+    mut k := 0
+    while k < times:
+        x = x * 2
+        k = k + 1
+    return x + a
+
+fn minus_power(a: Int, times: Int) -> Int:
+    mut x := 1
+    mut k := 0
+    while k < times:
+        x = x * 2
+        k = k + 1
+    return a - x
+
+# both operands never negative: the difference always fits
+fn power_gap(times: Int, other: Int) -> Int:
+    mut x := 1
+    mut y := 0
+    mut k := 0
+    while k < times:
+        x = x * 2
+        k = k + 1
+    while y < other:
+        y = y + 1
+    return y - x
+
+# a sum of non-negative products, as bench/tight_loop.pith runs it
+fn triple_sum(count: Int) -> Int:
+    mut sum := 0
+    mut i := 0
+    while i < count:
+        sum = sum + i * 3
+        i = i + 1
+    return sum
+
+# a sum of a non-negative value that runs past the largest Int
+fn growing_sum(rounds: Int) -> Int:
+    mut p := 1
+    mut k := 0
+    while k < 62:
+        p = p * 2
+        k = k + 1
+    mut sum := 0
+    mut i := 0
+    while i < rounds:
+        sum = sum + p
+        i = i + 1
+    return sum
+
+# a loop index is never negative
+fn index_offsets(xs: List[Int], base: Int) -> Int:
+    mut total := 0
+    for x, i in xs:
+        total = base + i
+    return total
+
+fn last_index(xs: List[Int]) -> Int:
+    return xs.len() - 1
+
+fn range_triples(lo: Int, hi: Int) -> Int:
+    mut last := 0
+    for i in lo..hi:
+        last = i * 3
+    return last
+
+fn uint_sum(a: UInt, b: UInt) -> Int:
+    return "{a + b}".len()
+
+fn uint_difference(a: UInt, b: UInt) -> Int:
+    return "{a - b}".len()
+
+fn main():
+    top := big()
+    bottom := small()
+    show("count through max", isolate_call(fn() -> Int => count_through(top - 2, top)))
+    show("step of two past max", isolate_call(fn() -> Int => step_two(top - 3, top)))
+    show("two steps per test", isolate_call(fn() -> Int => step_twice(top - 1, top)))
+    show("counter written in body", isolate_call(fn() -> Int => reset_then_step(n(0), n(3), n(1))))
+    show("count down through min", isolate_call(fn() -> Int => count_down_through(bottom + 2, bottom)))
+    show_no_wrap("counter rebound by if let", isolate_call(fn() -> Int => not_wrapped(rebound_by_if_let(n(3)))))
+    show_no_wrap("counter rebound by match", isolate_call(fn() -> Int => not_wrapped(rebound_by_match(n(3)))))
+    show("deferred use at max", isolate_call(fn() -> Int => deferred_use(top - 2, top)))
+    show("use after step at max", isolate_call(fn() -> Int => use_after_step(top - 2, top)))
+    show("two steps down past min", isolate_call(fn() -> Int => lower_twice(bottom, bottom + 1)))
+    show("guard then write", isolate_call(fn() -> Int => guard_then_write(n(5), n(0))))
+    show("guard at least min", isolate_call(fn() -> Int => guard_at_least(bottom, bottom)))
+    show("once negative times 3", isolate_call(fn() -> Int => once_negative(true)))
+    show("wrapped counter times 2", isolate_call(fn() -> Int => wrapped_counter()))
+    show("2^63", isolate_call(fn() -> Int => power(n(63))))
+    show("2^62 * 3", isolate_call(fn() -> Int => power_times_three(n(62))))
+    show("2^62 + 2^62", isolate_call(fn() -> Int => power_doubled(n(62))))
+    show("2^62 + 2^62 left", isolate_call(fn() -> Int => plus_power(power(n(62)), n(62))))
+    show("2^62 + 2^62 right", isolate_call(fn() -> Int => power_plus(power(n(62)), n(62))))
+    show("min - 2^62", isolate_call(fn() -> Int => minus_power(bottom, n(62))))
+    show("sum past max", isolate_call(fn() -> Int => growing_sum(n(2))))
+    show("index past max", isolate_call(fn() -> Int => index_offsets([1, 2, 3], top - 1)))
+    show("range triple past max", isolate_call(fn() -> Int => range_triples(top / 3 - 1, top / 3 + 2)))
+    show("UInt max + 1", isolate_call(fn() -> Int => uint_sum(UInt(top) + UInt(top) + UInt(n(1)), UInt(n(1)))))
+    show("UInt 3 - 5", isolate_call(fn() -> Int => uint_difference(UInt(n(3)), UInt(n(5)))))
+
+    # the same shapes where nothing overflows
+    print("count through {count_through(n(0), n(10))} {count_through(top - 2, top - 1)}")
+    print("step of two {step_two(n(0), n(9))} {step_two(top - 3, top - 1)}")
+    print("two steps {step_twice(n(0), n(10))}")
+    print("counter written {reset_then_step(n(0), n(5), n(-1))}")
+    print("count down {count_down_through(n(5), n(0))} {count_down_through(bottom + 3, bottom + 1)}")
+    print("deferred use {deferred_use(n(0), n(4))} {deferred_use(top - 3, top - 1)}")
+    print("use after step {use_after_step(n(0), n(4))}")
+    print("use before step {use_before_step(n(0), n(4))} {use_before_step(top - 2, top) == top}")
+    print("shrinking bound {shrinking_bound(n(0), n(10))}")
+    print("meet {meet(n(0), n(10))} {meet(top - 2, top) == top - 1} {meet(bottom, bottom + 2) == bottom + 1}")
+    print("lower twice {lower_twice(n(0), n(5))} {lower_twice(bottom, bottom + 2) == bottom}")
+    print("through length {through_length([4, 5, 6])}")
+    print("guarded down {guarded_down(n(5), n(0))} {guarded_down(bottom + 1, bottom) == bottom} {guarded_down(bottom, bottom) == bottom}")
+    print("guarded up {guarded_up(n(5), n(9))} {guarded_up(top - 1, top) == top} {guarded_up(top, top) == top}")
+    print("once negative {once_negative(false)}")
+    print("powers {power(n(62))} {power_times_three(n(61))} {power_doubled(n(61))}")
+    print("power sums {plus_power(n(-5), n(62))} {power_plus(bottom, n(62))} {minus_power(n(0), n(62))} {minus_power(top, n(62))}")
+    print("power gap {power_gap(n(62), n(3))} {power_gap(n(0), n(0))}")
+    print("triple sum {triple_sum(n(1000))} {triple_sum(n(0))}")
+    print("growing sum {growing_sum(n(1))} {growing_sum(n(0))}")
+    print("index offsets {index_offsets([1, 2, 3], n(10))} {index_offsets([1, 2, 3], top - 2) == top}")
+    print("last index {last_index([])} {last_index([7, 8])}")
+    print("range triples {range_triples(n(-3), n(3))} {range_triples(n(0), n(5))}")
+    print("UInt {UInt(top) + UInt(top) + UInt(n(1))} {UInt(n(7)) - UInt(n(7))} {uint_sum(UInt(top), UInt(n(1)))}")

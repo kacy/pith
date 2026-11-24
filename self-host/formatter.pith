@@ -106,6 +106,7 @@ fn format_code_line(line: String) -> String:
     mut i := 0
     mut in_string := false
     mut brace_depth := 0
+    mut interp_quote := ""
 
     # preserve leading whitespace (indentation)
     while i < line.len():
@@ -128,36 +129,71 @@ fn format_code_line(line: String) -> String:
         if ch == quote:
             if not in_string:
                 in_string = true
+                interp_quote = ""
                 output = output + ch
                 i = i + 1
                 continue
 
         if in_string:
-            if ch == chr(92):
-                if i + 1 < line.len():
+            LB := chr(123)
+            RB := chr(125)
+            if brace_depth == 0:
+                if ch == chr(92) and i + 1 < line.len():
                     # escape sequence — copy both chars
                     output = output + ch + line[i + 1]
                     i = i + 2
                     continue
-            LB := chr(123)
-            RB := chr(125)
+                if ch == LB and i + 1 < line.len() and line[i + 1] == LB:
+                    # escaped literal `{{` does not open an interpolation
+                    output = output + ch + LB
+                    i = i + 2
+                    continue
+                if ch == RB and i + 1 < line.len() and line[i + 1] == RB:
+                    # escaped literal `}}`
+                    output = output + ch + RB
+                    i = i + 2
+                    continue
+                if ch == LB:
+                    brace_depth = 1
+                    interp_quote = ""
+                    output = output + ch
+                    i = i + 1
+                    continue
+                if ch == quote:
+                    in_string = false
+                    output = output + ch
+                    i = i + 1
+                    continue
+                output = output + ch
+                i = i + 1
+                continue
+            # inside `{...}` interpolation: track nested string literals so
+            # braces or quotes inside them do not corrupt brace_depth
+            if interp_quote != "":
+                if ch == chr(92) and i + 1 < line.len():
+                    output = output + ch + line[i + 1]
+                    i = i + 2
+                    continue
+                if ch == interp_quote:
+                    interp_quote = ""
+                output = output + ch
+                i = i + 1
+                continue
+            if ch == chr(34) or ch == chr(39):
+                interp_quote = ch
+                output = output + ch
+                i = i + 1
+                continue
             if ch == LB:
                 brace_depth = brace_depth + 1
                 output = output + ch
                 i = i + 1
                 continue
             if ch == RB:
-                if brace_depth > 0:
-                    brace_depth = brace_depth - 1
-                    output = output + ch
-                    i = i + 1
-                    continue
-            if ch == quote:
-                if brace_depth == 0:
-                    in_string = false
-                    output = output + ch
-                    i = i + 1
-                    continue
+                brace_depth = brace_depth - 1
+                output = output + ch
+                i = i + 1
+                continue
             output = output + ch
             i = i + 1
             continue
@@ -204,6 +240,10 @@ fn format_code_line(line: String) -> String:
                 continue
 
         # single-char binary operators: + * / %
+        if ch == "+" and is_sci_exponent_sign(output, line, i):
+            output = output + "+"
+            i = i + 1
+            continue
         if ch == "+" or ch == "*" or ch == "/" or ch == "%":
             output = ensure_trailing_space(output)
             output = output + ch + " "
@@ -211,8 +251,12 @@ fn format_code_line(line: String) -> String:
             i = skip_leading_spaces(line, i)
             continue
 
-        # minus — could be binary or unary
+        # minus — could be scientific exponent sign, binary, or unary
         if ch == "-":
+            if is_sci_exponent_sign(output, line, i):
+                output = output + "-"
+                i = i + 1
+                continue
             if is_preceded_by_operand(output):
                 output = ensure_trailing_space(output)
                 output = output + "- "
@@ -414,6 +458,42 @@ fn is_preceded_by_operand(output: String) -> Bool:
         return true
     return false
 
+# true when `+` or `-` at `line[i]` is the exponent sign of a scientific-
+# notation float literal (`1e-5`, `1.5E+3`, `1_000e-2`), so it binds tight
+# without spaces. requires no space before the sign, a trailing `e`/`E` on a
+# numeric literal (not an identifier like `scale-1`), and a following digit.
+fn is_sci_exponent_sign(output: String, line: String, i: Int) -> Bool:
+    if output.len() < 2 or i + 1 >= line.len():
+        return false
+    next_c := ord(line[i + 1])
+    if next_c < 48 or next_c > 57:
+        return false
+    last := output[output.len() - 1]
+    if last != "e" and last != "E":
+        return false
+    mut idx := output.len() - 2
+    mut saw_digit := false
+    mut saw_dot := false
+    while idx >= 0:
+        c := ord(output[idx])
+        if c >= 48 and c <= 57:
+            saw_digit = true
+            idx = idx - 1
+        elif output[idx] == "_" and saw_digit:
+            idx = idx - 1
+        elif output[idx] == "." and not saw_dot:
+            saw_dot = true
+            idx = idx - 1
+        else:
+            break
+    if not saw_digit:
+        return false
+    if idx >= 0:
+        prev := output[idx]
+        if is_alphanumeric(prev) or prev == "_":
+            return false
+    return true
+
 # check if a single character is alphanumeric
 fn is_alphanumeric(ch: String) -> Bool:
     if ch.len() != 1:
@@ -533,3 +613,23 @@ test "a range keeps its operator tight, inclusive or not":
     assert(fmt_source("fn f():" + nl + "    for n in 1 ..= 3:" + nl + "        print(n)" + nl).contains("1..=3"))
     assert(fmt_source("fn f(xs: List[Int]):" + nl + "    for i in 0 .. xs.len():" + nl + "        print(i)" + nl).contains("0..xs.len()"))
     assert(fmt_source("fn f(n: Int) -> Int:" + nl + "    match n:" + nl + "        0..=9 => 1" + nl + "        _ => 2" + nl).contains("0..=9 =>"))
+
+test "scientific notation floats and escaped braces in strings survive formatting":
+    nl := chr(10)
+    sci := fmt_source("fn f() -> Float:" + nl + "    a := 1e-5 + 2.5E+3" + nl + "    return a - 1e-9" + nl)
+    assert(sci.contains("a := 1e-5 + 2.5E+3"))
+    assert(sci.contains("return a - 1e-9"))
+    assert(fmt_source(sci) == sci)
+    # identifiers ending in e still format subtraction normally
+    ident := fmt_source("fn g(scale: Int) -> Int:" + nl + "    return scale-1" + nl)
+    assert(ident.contains("return scale - 1"))
+    # escaped {{ and nested string containing } inside interpolation stay intact
+    lb := chr(123)
+    rb := chr(125)
+    q := chr(34)
+    esc_src := "fn h(x: Int) -> String:" + nl + "    return " + q + lb + lb + "a" + rb + rb + " " + lb + "x" + rb + q + "+" + q + "ok" + q + nl
+    esc := fmt_source(esc_src)
+    assert(esc.contains(q + lb + lb + "a" + rb + rb + " " + lb + "x" + rb + q + " + " + q + "ok" + q))
+    nested_src := "fn k() -> String:" + nl + "    return " + q + lb + "f(" + q + rb + q + ")" + rb + q + "+" + q + "z" + q + nl
+    nested := fmt_source(nested_src)
+    assert(nested.contains(q + lb + "f(" + q + rb + q + ")" + rb + q + " + " + q + "z" + q))

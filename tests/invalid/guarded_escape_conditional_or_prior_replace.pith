@@ -1,0 +1,34 @@
+# a guarded value escaping a locked block is only safe when the field is
+# unconditionally replaced after the read; replacing it before the read or only
+# in a conditional branch still aliases live guarded storage (E276)
+struct Item:
+    name: String
+
+struct Box:
+    mu: Mutex
+    guard mu:
+        item: Item
+
+fn writer(b: Box):
+    locked b.mu:
+        b.item.name = "mutated"
+
+fn read_after_replace(b: Box) -> Item:
+    locked b.mu:
+        b.item = Item(name: "fresh")
+        return b.item
+
+fn read_then_maybe_replace(b: Box, flag: Bool) -> Item:
+    locked b.mu:
+        out := b.item
+        if flag:
+            b.item = Item(name: "fresh")
+        return out
+
+fn main():
+    b := Box(mu: Mutex(), item: Item(name: "start"))
+    w := spawn writer(b)
+    a := read_after_replace(b)
+    c := read_then_maybe_replace(b, false)
+    await w
+    print("{a.name} {c.name}")

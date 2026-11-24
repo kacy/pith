@@ -619,10 +619,17 @@ pub fn find_decl_position(text: String, node_kind: String, name: String) -> Pith
     keyword := decl_keyword(node_kind)
     plain := keyword + " " + name
     public := "pub " + plain
-    total := text_line_count(text)
-    mut line0 := 0
-    while line0 < total:
-        line := text_line(text, line0)
+    n := text.len()
+    mut pos := 0
+    mut line_no := 1
+    while pos <= n:
+        mut end := pos
+        while end < n and ord(text[end]) != 10:
+            end = end + 1
+        mut line_end := end
+        if line_end > pos and ord(text[line_end - 1]) == 13:
+            line_end = line_end - 1
+        line := text.substring(pos, line_end)
         # methods inside an impl block are indented; measure the indent
         # so their names locate at the real column, not just at column 1
         mut indent := 0
@@ -635,8 +642,11 @@ pub fn find_decl_position(text: String, node_kind: String, name: String) -> Pith
         elif body.starts_with(public):
             name_col = indent + keyword.len() + 5
         if name_col >= 0 and name_ends_at(line, name_col + name.len()):
-            return PithPos(line0 + 1, name_col + 1)
-        line0 = line0 + 1
+            return PithPos(line_no, name_col + 1)
+        if end >= n:
+            break
+        pos = end + 1
+        line_no = line_no + 1
     return PithPos(0, 0)
 
 # one SymbolInformation object {name, kind, location} for a declaration

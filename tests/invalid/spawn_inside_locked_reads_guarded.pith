@@ -1,0 +1,17 @@
+# spawning inside a locked block does not transfer the lock to the child task,
+# so the spawn call's arguments cannot read guarded fields (E271)
+struct Counter:
+    mu: Mutex
+    guard mu:
+        value: Int
+
+fn use_val(n: Int) -> Int:
+    return n + 1
+
+fn main():
+    c := Counter(mu: Mutex(), value: 1)
+    mut out := 0
+    locked c.mu:
+        t := spawn use_val(c.value)
+        out = 1
+    print("{out}")

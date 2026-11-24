@@ -394,13 +394,17 @@ mut d_file_list: List[String] := []
 # find the stdlib root by walking up from a starting directory.
 fn d_find_stdlib_root(start_dir: String) -> String:
     mut dir := start_dir
+    if dir == "" or dir == ".":
+        cwd := os_getcwd()
+        if cwd != "":
+            dir = cwd
     mut depth := 0
     while depth < 20:
         test_path := dir + "/std"
         if dir_exists(test_path):
             return dir
         parent := get_directory_path(dir)
-        if parent == dir:
+        if parent == dir or parent == ".":
             break
         dir = parent
         depth = depth + 1
@@ -416,6 +420,8 @@ fn get_directory_path(path: String) -> String:
         i = i + 1
     if last_slash < 0:
         return "."
+    if last_slash == 0:
+        return "/"
     return path.substring(0, last_slash)
 
 # derive a module name from a file path relative to the stdlib root.
@@ -425,9 +431,9 @@ fn convert_path_to_module(path: String, root: String) -> String:
     mut rel := path
     if path.len() > root.len() + 1:
         rel = path.substring(root.len() + 1, path.len())
-    # strip .pith extension
-    if rel.len() > 3 and rel.substring(rel.len() - 3, rel.len()) == ".pith":
-        rel = rel.substring(0, rel.len() - 3)
+    # strip .pith extension (5 bytes)
+    if rel.ends_with(".pith"):
+        rel = rel.substring(0, rel.len() - 5)
     # replace / with .
     mut result := ""
     mut i := 0
@@ -439,28 +445,22 @@ fn convert_path_to_module(path: String, root: String) -> String:
         i = i + 1
     return result
 
+# recursively collect all .pith files under `dir_path` in sorted order.
+fn scan_stdlib_dir(dir_path: String, depth: Int):
+    if depth > 8 or not dir_exists(dir_path):
+        return
+    entries := list_dir(dir_path).sort()
+    for entry in entries:
+        full := dir_path + "/" + entry
+        if entry.ends_with(".pith"):
+            d_file_list.push(full)
+        elif dir_exists(full):
+            scan_stdlib_dir(full, depth + 1)
+
 # scan the stdlib directory for .pith files.
 fn scan_stdlib_documentation(stdlib_root: String):
     d_file_list = []
-    std_dir := stdlib_root + "/std"
-    if not dir_exists(std_dir):
-        return
-
-    # flat .pith files in std/
-    entries := list_dir(std_dir)
-    for entry in entries:
-        if entry.len() > 3 and entry.substring(entry.len() - 3, entry.len()) == ".pith":
-            d_file_list.push(std_dir + "/" + entry)
-
-    # check subdirectories: net/, os/
-    subdirs := list_dir(std_dir)
-    for subdir in subdirs:
-        sub_path := std_dir + "/" + subdir
-        if dir_exists(sub_path):
-            sub_entries := list_dir(sub_path)
-            for sub_entry in sub_entries:
-                if sub_entry.len() > 3 and sub_entry.substring(sub_entry.len() - 3, sub_entry.len()) == ".pith":
-                    d_file_list.push(sub_path + "/" + sub_entry)
+    scan_stdlib_dir(stdlib_root + "/std", 0)
 
 # search stdlib documentation for a query string.
 # returns formatted results or a "no results" message.
@@ -481,9 +481,12 @@ pub fn doc_search(query: String, start_dir: String) -> String!:
         mod_name := convert_path_to_module(path, stdlib_root)
 
         doc_extract(content)
+        mut display_mod := d_mod_name
+        if display_mod == "":
+            display_mod = mod_name
 
         # check module-level match
-        mut mod_match := contains_case_insensitive(d_mod_name, query) or contains_case_insensitive(d_mod_desc, query)
+        mut mod_match := contains_case_insensitive(display_mod, query) or contains_case_insensitive(d_mod_desc, query)
 
         # check item-level matches
         mut matching_items: List[Int] := []
@@ -495,9 +498,9 @@ pub fn doc_search(query: String, start_dir: String) -> String!:
             found = true
             output = output + chr(10)
             if d_mod_desc != "":
-                output = output + "  " + d_mod_name + " — " + d_mod_desc + chr(10)
+                output = output + "  " + display_mod + " — " + d_mod_desc + chr(10)
             else:
-                output = output + "  " + d_mod_name + chr(10)
+                output = output + "  " + display_mod + chr(10)
 
             if mod_match:
                 # module name/description matched — show all items

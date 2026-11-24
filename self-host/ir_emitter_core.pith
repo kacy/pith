@@ -441,9 +441,14 @@ fn ir_loop_var_slot_name(fid: Int, name: String) -> String:
 # success exits and emitted only at error exits. ir_defer_scope_starts marks
 # where each open block scope begins in the flat stack; ir_defer_loop_base_stack
 # records the flat-stack length at each loop entry so break/continue emit only
-# the defers registered inside the loop. all four reset per function.
+# the defers registered inside the loop. all of them reset per function.
 mut ir_defer_nodes: List[Int] := []
 mut ir_defer_is_err: List[Int] := []
+# the loop variable slots in force where each entry was deferred, parallel to
+# ir_defer_nodes. an exit edge inside a `for` body re-emits a defer registered
+# outside the loop, and a name the loop variable shadows must still read the
+# function's own slot there, as it does where the defer was written.
+mut ir_defer_loop_slots: List[Map[String, String]] := []
 mut ir_defer_scope_starts: List[Int] := []
 mut ir_defer_loop_base_stack: List[Int] := []
 # open owned loop iterables (a split result, a keys() list). a `for` loop
@@ -1697,6 +1702,15 @@ fn ir_defer_push_scope():
 fn ir_defer_register(inner_idx: Int, is_err: Int):
     ir_defer_nodes.push(inner_idx)
     ir_defer_is_err.push(is_err)
+    ir_defer_loop_slots.push(ir_copy_var_types(ir_loop_var_slots))
+
+# emit one deferred entry with the loop variable slots of the place it was
+# deferred, then put the current ones back.
+fn ir_defer_emit_entry(i: Int):
+    current := ir_loop_var_slots
+    ir_loop_var_slots = ir_defer_loop_slots[i]
+    ir_stmt(ir_defer_nodes[i])
+    ir_loop_var_slots = current
 
 # emit deferred nodes from the top of the flat stack down to `stop` (inclusive
 # of `stop`), in LIFO order, WITHOUT truncating the stack. used at early exits
@@ -1707,7 +1721,7 @@ fn ir_defer_emit_through(stop: Int, is_error_exit: Bool):
     mut i := ir_defer_nodes.len() - 1
     while i >= stop:
         if is_error_exit or ir_defer_is_err[i] == 0:
-            ir_stmt(ir_defer_nodes[i])
+            ir_defer_emit_entry(i)
         i = i - 1
 
 # release every still-open loop's owned iterable at a function exit edge. the
@@ -1745,11 +1759,12 @@ fn ir_defer_pop_scope_emit():
         mut i := ir_defer_nodes.len() - 1
         while i >= start:
             if ir_defer_is_err[i] == 0:
-                ir_stmt(ir_defer_nodes[i])
+                ir_defer_emit_entry(i)
             i = i - 1
     while ir_defer_nodes.len() > start:
         ir_defer_nodes.remove(ir_defer_nodes.len() - 1)
         ir_defer_is_err.remove(ir_defer_is_err.len() - 1)
+        ir_defer_loop_slots.remove(ir_defer_loop_slots.len() - 1)
 
 # a loop records the flat-stack length at entry so break/continue emit only the
 # defers registered inside the loop body, not the enclosing function's.
@@ -10056,13 +10071,15 @@ fn ir_captures_uncounted(captures: List[String]) -> Bool:
 struct SavedDefers:
     nodes: List[Int]
     is_err: List[Int]
+    loop_slots: List[Map[String, String]]
     scope_starts: List[Int]
     loop_bases: List[Int]
 
 fn ir_defers_enter_function() -> SavedDefers:
-    saved := SavedDefers(ir_defer_nodes, ir_defer_is_err, ir_defer_scope_starts, ir_defer_loop_base_stack)
+    saved := SavedDefers(ir_defer_nodes, ir_defer_is_err, ir_defer_loop_slots, ir_defer_scope_starts, ir_defer_loop_base_stack)
     ir_defer_nodes = []
     ir_defer_is_err = []
+    ir_defer_loop_slots = []
     ir_defer_scope_starts = []
     ir_defer_loop_base_stack = []
     return saved
@@ -10070,6 +10087,7 @@ fn ir_defers_enter_function() -> SavedDefers:
 fn ir_defers_leave_function(saved: SavedDefers):
     ir_defer_nodes = saved.nodes
     ir_defer_is_err = saved.is_err
+    ir_defer_loop_slots = saved.loop_slots
     ir_defer_scope_starts = saved.scope_starts
     ir_defer_loop_base_stack = saved.loop_bases
 
@@ -14628,6 +14646,7 @@ fn ir_prepare_func_emission(ret_type: String):
     # defers are function-scoped: start each function with empty scope stacks
     ir_defer_nodes = []
     ir_defer_is_err = []
+    ir_defer_loop_slots = []
     ir_defer_scope_starts = []
     ir_defer_loop_base_stack = []
     ir_loop_iter_vars = []

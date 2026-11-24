@@ -107,7 +107,12 @@ wrapper_case() {
   local name=$1
   shift
   local output status normalized expected_file
-  output=$(PITH_NATIVE="$PITH" "$WRAPPER" test "$FIXTURE" "$@" 2>/dev/null)
+  # a refusal is reported on stderr, so a case that pins one keeps it
+  if [ -n "${KEEP_STDERR:-}" ]; then
+    output=$(PITH_NATIVE="$PITH" "$WRAPPER" test "$FIXTURE" "$@" 2>&1)
+  else
+    output=$(PITH_NATIVE="$PITH" "$WRAPPER" test "$FIXTURE" "$@" 2>/dev/null)
+  fi
   status=$?
   normalized=$(printf '%s\n' "$output" | sed 's/"duration_ms":[0-9][0-9]*/"duration_ms":<ms>/g')
   normalized=$(printf '%s\nexit: %d\n' "$normalized" "$status")
@@ -140,7 +145,7 @@ if [ "$UPDATE" != "1" ]; then
     wrapper_case json_unmatched_tag --json --tag nope
     # a value with a space cannot survive the shell-free spawn, so the wrapper
     # refuses it by name rather than passing half of it down
-    wrapper_case wrapper_space_refused --filter "two words"
+    KEEP_STDERR=1 wrapper_case wrapper_space_refused --filter "two words"
   else
     echo "skip: no self-hosted wrapper at $WRAPPER (run 'make self-host')"
   fi

@@ -1,0 +1,478 @@
+# std.pith.highlight - syntax highlighting for pith source
+#
+# colors pith code with the compiler's own lexer, std.pith.lexer, so the
+# highlighting follows the grammar exactly: a string ends where the compiler
+# says it ends, and a word is a keyword when the compiler says it is. the
+# language server's semantic tokens come from the same classification.
+#
+#   import std.pith.highlight as highlight
+#
+#   body := "<pre><code class=\"language-pith\">" + highlight.highlight_html(code) + "</code></pre>"
+#
+# `spans` is the renderer-neutral form: a list of spans that covers every
+# byte of the input exactly once, in order, each with one of these kinds:
+#
+#   plain        whitespace, line breaks, `_`, and bytes the lexer rejects
+#   keyword      `fn`, `if`, `self`, `true`, ..., and the contextual words
+#                `locked`, `guard`, `holding`, `where` and `frozen` where
+#                they act as keywords
+#   type         a name that starts with an uppercase letter
+#   function     a name called directly, `f(`, or declared, `fn f`
+#   variable     any other name
+#   string       a string literal: quotes, escapes, the literal text of an
+#                interpolated string, and a format spec such as `>8`
+#   number       an integer or float literal
+#   comment      a `#` comment, a `##` doc comment included
+#   operator     `+`, `->`, `:=`, `==`, `..`, `?`, `|` and the rest
+#   punctuation  `.`, `,`, `:`, brackets, and the braces of an interpolation
+#
+# the expression inside an interpolation, `"total {a + b}"`, is highlighted
+# as code. `highlight_html` wraps every span except plain ones in
+# `<span class="...">`; class_name gives the class for each kind, and
+# STYLESHEET is a default light and dark theme for those classes.
+#
+# nothing here fails: half-typed code, an unterminated string, control bytes
+# and invalid utf-8 all highlight, and the work is linear in the input.
+
+import std.html as html
+from std.pith.lexer import Token, lex_with_comments, unescape_interp_expr, interp_raw_offsets, split_format_spec
+
+# ---------------------------------------------------------------
+# spans
+# ---------------------------------------------------------------
+
+## one highlighted run of the input: `len` bytes from byte offset `start`,
+## all of one `kind` (see the module header for the kinds). spans come in
+## source order, cover every byte of the input exactly once, never split a
+## utf-8 character, and two neighbours never share a kind. only a plain span
+## holds a line break.
+pub struct Span:
+    pub start: Int
+    pub len: Int
+    pub kind: String
+
+# the lexer kinds that highlight as operators and as punctuation, matched
+# the way the lexer matches its keyword list
+OPERATOR_KINDS := ",plus,minus,star,slash,percent,eq,eq_eq,bang,bang_eq,less,less_eq,greater,greater_eq,arrow,fat_arrow,colon_eq,plus_eq,minus_eq,star_eq,slash_eq,question,dotdot,dotdoteq,pipe,"
+PUNCTUATION_KINDS := ",dot,comma,colon,lparen,rparen,lbracket,rbracket,lbrace,rbrace,"
+
+# the words the parser reads as keywords in one position only, so they lex
+# as identifiers: `locked m:`, `guard m:`, `fn f() holding m:`,
+# `where T: Show` and `frozen name: T`. in each a name follows the word, and
+# two names in a row are not valid pith anywhere else.
+CONTEXTUAL_KEYWORDS := ",locked,guard,holding,where,frozen,"
+
+# how deep interpolations nested in strings in interpolations are followed.
+# each level lexes its text again, so the cap keeps the work linear; deeper
+# expressions come out plain.
+MAX_INTERPOLATION_DEPTH := 8
+
+## the spans of `code`: every byte, in order, in runs of one kind. see Span
+## and the module header for what they promise and the kinds they carry.
+pub fn spans(code: String) -> List[Span]:
+    b := Builder([], [], [], 0)
+    walk_tokens(code, b, Frame(code, []), lex_with_comments(code), 0)
+    if b.cursor < code.len():
+        b.append(code.len(), "plain")
+    mut out: List[Span] := []
+    mut i := 0
+    while i < b.kinds.len():
+        out.push(Span(b.starts[i], b.lens[i], b.kinds[i]))
+        i = i + 1
+    return out
+
+# the spans built so far, as parallel lists. they run without a gap from
+# offset 0 to `cursor`.
+struct Builder:
+    mut starts: List[Int]
+    mut lens: List[Int]
+    mut kinds: List[String]
+    mut cursor: Int
+
+impl Builder:
+    # cover [start, end) with `kind`. a gap since the last span is plain, and
+    # a part already covered is skipped, so the spans stay contiguous
+    # whatever the caller passes.
+    fn put(start: Int, end: Int, kind: String):
+        mut first := start
+        if first < self.cursor:
+            first = self.cursor
+        if end <= first:
+            return
+        if first > self.cursor:
+            self.append(first, "plain")
+        self.append(end, kind)
+
+    # cover [cursor, end) with `kind`, joining the last span when it has the
+    # same kind
+    fn append(end: Int, kind: String):
+        n := self.kinds.len()
+        if n > 0 and self.kinds[n - 1] == kind:
+            self.lens[n - 1] = end - self.starts[n - 1]
+        else:
+            self.starts.push(self.cursor)
+            self.lens.push(end - self.cursor)
+            self.kinds.push(kind)
+        self.cursor = end
+
+# a token stream's text and where it sits in the input. the input itself
+# maps to itself and has no offsets. an interpolation's expression is lexed
+# from its unescaped text, and offsets[k] is where that text's byte k sits in
+# the input, with one more entry for its end.
+struct Frame:
+    text: String
+    offsets: List[Int]
+
+impl Frame:
+    # the input offset of this frame's byte `k`
+    fn at(k: Int) -> Int:
+        if self.offsets.len() == 0:
+            return k
+        return self.offsets[k]
+
+# classify one token stream into the builder
+fn walk_tokens(code: String, b: Builder, frame: Frame, toks: List[Token], depth: Int):
+    mut i := 0
+    while i < toks.len():
+        tok := toks[i]
+        if tok.kind == "string_start":
+            i = walk_string(code, b, frame, toks, i, depth)
+        else:
+            if tok.len > 0:
+                b.put(frame.at(tok.offset), frame.at(tok.offset + tok.len), token_kind(frame, toks, i))
+            i = i + 1
+
+# an interpolated string: its literal text, its braces and each expression
+# inside it. returns the index of the first token past its pieces.
+fn walk_string(code: String, b: Builder, frame: Frame, toks: List[Token], i: Int, depth: Int) -> Int:
+    head := toks[i]
+    region_end := head.offset + head.len
+    b.put(frame.at(head.offset), frame.at(head.offset + head.value.len()), "string")
+    mut j := i + 1
+    while j < toks.len() and is_string_piece(toks[j].kind) and toks[j].offset < region_end:
+        piece := toks[j]
+        string_delimiters(code, b, frame.at(piece.offset))
+        if piece.kind == "interpolation_expr":
+            walk_interpolation(code, b, frame, piece, depth)
+        else:
+            b.put(frame.at(piece.offset), frame.at(piece.offset + piece.len), "string")
+        j = j + 1
+    string_delimiters(code, b, frame.at(region_end))
+    return j
+
+fn is_string_piece(kind: String) -> Bool:
+    return kind == "interpolation_expr" or kind == "string_mid" or kind == "string_end"
+
+# the bytes between the pieces of an interpolated string, up to `end`: the
+# braces around each expression and the closing quote
+fn string_delimiters(code: String, b: Builder, end: Int):
+    mut p := b.cursor
+    while p < end:
+        c := ord(code[p])
+        if c == 123 or c == 125:
+            b.put(p, p + 1, "punctuation")
+        else:
+            b.put(p, p + 1, "string")
+        p = p + 1
+
+# the text between an interpolation's braces: the expression as code, then
+# a format spec if there is one
+fn walk_interpolation(code: String, b: Builder, frame: Frame, piece: Token, depth: Int):
+    split := split_format_spec(piece.value)
+    expr_end := piece.offset + split.0.len()
+    if depth < MAX_INTERPOLATION_DEPTH:
+        rel := interp_raw_offsets(split.0)
+        mut offsets: List[Int] := []
+        for r in rel:
+            offsets.push(frame.at(piece.offset + r))
+        text := unescape_interp_expr(split.0)
+        walk_tokens(code, b, Frame(text, offsets), lex_with_comments(text), depth + 1)
+    # space before the closing brace or the spec's colon is plain
+    b.put(b.cursor, frame.at(expr_end), "plain")
+    if split.1.len() > 0:
+        b.put(frame.at(expr_end), frame.at(expr_end + 1), "punctuation")
+        b.put(frame.at(expr_end + 1), frame.at(piece.offset + piece.len), "string")
+
+# the kind of token `i`, which is not part of an interpolated string
+fn token_kind(frame: Frame, toks: List[Token], i: Int) -> String:
+    tok := toks[i]
+    kind := tok.kind
+    if kind.starts_with("kw_"):
+        return "keyword"
+    if kind == "identifier":
+        return identifier_kind(toks, i)
+    if kind == "int_lit" or kind == "float_lit":
+        return "number"
+    if kind == "string_lit":
+        return "string"
+    if kind == "comment":
+        return "comment"
+    if OPERATOR_KINDS.contains("," + kind + ","):
+        return "operator"
+    if PUNCTUATION_KINDS.contains("," + kind + ","):
+        return "punctuation"
+    # an unterminated string is an error token that starts at its quote; it
+    # still reads as a string while it is being typed
+    if kind == "err" and ord(frame.text[tok.offset]) == 34:
+        return "string"
+    return "plain"
+
+# a name is a keyword in a contextual keyword's position, a type when it
+# starts uppercase, a function when it is declared or called, and a
+# variable otherwise
+fn identifier_kind(toks: List[Token], i: Int) -> String:
+    tok := toks[i]
+    mut next_kind := ""
+    mut next_offset := 0 - 1
+    if i + 1 < toks.len():
+        next_kind = toks[i + 1].kind
+        next_offset = toks[i + 1].offset
+    if CONTEXTUAL_KEYWORDS.contains("," + tok.value + ",") and (next_kind == "identifier" or next_kind == "kw_self"):
+        return "keyword"
+    first := ord(tok.value[0])
+    if first >= 65 and first <= 90:
+        return "type"
+    if i > 0 and toks[i - 1].kind == "kw_fn":
+        return "function"
+    if next_kind == "lparen" and next_offset == tok.offset + tok.len:
+        return "function"
+    return "variable"
+
+# ---------------------------------------------------------------
+# html
+# ---------------------------------------------------------------
+
+## the css class highlight_html puts on a span of `kind`: "pith-kw" for a
+## keyword, "pith-ty" for a type, "pith-fn" for a function, "pith-var" for a
+## variable, "pith-str" for a string, "pith-num" for a number, "pith-com" for
+## a comment, "pith-op" for an operator and "pith-punct" for punctuation.
+## "" for plain text, which gets no span, and for an unknown kind.
+pub fn class_name(kind: String) -> String:
+    if kind == "keyword":
+        return "pith-kw"
+    if kind == "type":
+        return "pith-ty"
+    if kind == "function":
+        return "pith-fn"
+    if kind == "variable":
+        return "pith-var"
+    if kind == "string":
+        return "pith-str"
+    if kind == "number":
+        return "pith-num"
+    if kind == "comment":
+        return "pith-com"
+    if kind == "operator":
+        return "pith-op"
+    if kind == "punctuation":
+        return "pith-punct"
+    return ""
+
+## `code` as html: every span but a plain one wrapped in
+## `<span class="...">` with the class class_name gives, and all text
+## escaped with std.html. the result is the inside of a code block; the
+## caller writes the `<pre><code>` around it. line breaks stay as they are,
+## so the block needs `white-space: pre`, which `<pre>` gives.
+pub fn highlight_html(code: String) -> String:
+    mut parts: List[String] := []
+    for span in spans(code):
+        text := html.escape(code.substring(span.start, span.start + span.len))
+        css := class_name(span.kind)
+        if css == "":
+            parts.push(text)
+        else:
+            parts.push("<span class=\"" + css + "\">" + text + "</span>")
+    return parts.join("")
+
+## a default theme for the classes highlight_html writes: one set of colors
+## for a light page and one under `prefers-color-scheme: dark`. variables
+## and plain text keep the page's own color. a site with its own theme can
+## skip this and style the same classes itself.
+pub STYLESHEET := (
+    ".pith-kw {{ color: #7c3aed; }}\n" +
+    ".pith-ty {{ color: #0e7490; }}\n" +
+    ".pith-fn {{ color: #1d4ed8; }}\n" +
+    ".pith-str {{ color: #15803d; }}\n" +
+    ".pith-num {{ color: #b45309; }}\n" +
+    ".pith-com {{ color: #6b7280; font-style: italic; }}\n" +
+    ".pith-op {{ color: #be185d; }}\n" +
+    ".pith-punct {{ color: #4b5563; }}\n" +
+    "@media (prefers-color-scheme: dark) {{\n" +
+    "  .pith-kw {{ color: #c4b5fd; }}\n" +
+    "  .pith-ty {{ color: #67e8f9; }}\n" +
+    "  .pith-fn {{ color: #93c5fd; }}\n" +
+    "  .pith-str {{ color: #86efac; }}\n" +
+    "  .pith-num {{ color: #fcd34d; }}\n" +
+    "  .pith-com {{ color: #9ca3af; }}\n" +
+    "  .pith-op {{ color: #f9a8d4; }}\n" +
+    "  .pith-punct {{ color: #d1d5db; }}\n" +
+    "}}\n"
+)
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+# the spans of `code` as text: a plain span as its own text, any other as
+# "[kind text]"
+fn render(code: String) -> String:
+    mut parts: List[String] := []
+    for span in spans(code):
+        text := code.substring(span.start, span.start + span.len)
+        if span.kind == "plain":
+            parts.push(text)
+        else:
+            parts.push("[" + span.kind + " " + text + "]")
+    return parts.join("")
+
+# every promise Span makes, checked over `code`. substring() stops the test
+# if a span boundary splits a character.
+fn check_spans(code: String):
+    mut at := 0
+    mut previous := ""
+    mut parts: List[String] := []
+    for span in spans(code):
+        assert_eq(span.start, at)
+        assert(span.len > 0)
+        assert(span.kind != previous)
+        text := code.substring(span.start, span.start + span.len)
+        if span.kind != "plain":
+            assert(not text.contains(chr(10)))
+        parts.push(text)
+        previous = span.kind
+        at = span.start + span.len
+    assert_eq(at, code.len())
+    assert_eq(parts.join(""), code)
+
+# a source of about `size` bytes cut from pieces of pith, broken pith and
+# stray bytes, in an order a fixed linear congruential sequence picks
+fn random_ish_source(size: Int) -> String:
+    pieces := ["fn ", "name", "Type", " := ", " + ", "(", ")", "[", "]", "{{", "}}", ",", ".", ":", "->", "\n", "\n    ", "    ", "\t", "0x1F", "1_000", "2.5e3", "\"text\"", "\"a {{b}} c\"", "\"{{x:>8}}\"", "\"{{f(\\\"y\\\")}}\"", "\"{{m[\"k\"]}}\"", "\"open", "\"{{", "\\", "# note\n", "## doc\n", "locked m:", "é", "中", chr(1), chr(127), chr(195), chr(255), "\r\n", "_", "|", "?"]
+    mut parts: List[String] := []
+    mut seed := 12345
+    mut total := 0
+    while total < size:
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        piece := pieces[seed / 65536 % pieces.len()]
+        parts.push(piece)
+        total = total + piece.len()
+    return parts.join("")
+
+test "names, keywords, literals and operators get their kinds":
+    assert_eq(render("fn add(a: Int) -> Int:"), "[keyword fn] [function add][punctuation (][variable a][punctuation :] [type Int][punctuation )] [operator ->] [type Int][punctuation :]")
+    assert_eq(render("x := 0x1F + 2.5e3 - 1_000"), "[variable x] [operator :=] [number 0x1F] [operator +] [number 2.5e3] [operator -] [number 1_000]")
+    assert_eq(render("if self.ok and not done:"), "[keyword if] [keyword self][punctuation .][variable ok] [keyword and] [keyword not] [variable done][punctuation :]")
+    assert_eq(render("a == b != c <= d"), "[variable a] [operator ==] [variable b] [operator !=] [variable c] [operator <=] [variable d]")
+    assert_eq(render("xs[0].y, pair.0.1"), "[variable xs][punctuation [][number 0][punctuation ].][variable y][punctuation ,] [variable pair][punctuation .][number 0][punctuation .][number 1]")
+    assert_eq(render("s := \"hi\" + none"), "[variable s] [operator :=] [string \"hi\"] [operator +] [keyword none]")
+    assert_eq(render("for _ in 0..n:"), "[keyword for] _ [keyword in] [number 0][operator ..][variable n][punctuation :]")
+
+test "a name is a type, a function or a variable by its spelling and place":
+    assert_eq(render("Point.new(Color.Red)"), "[type Point][punctuation .][function new][punctuation (][type Color][punctuation .][type Red][punctuation )]")
+    assert_eq(render("f(x) + g (y)"), "[function f][punctuation (][variable x][punctuation )] [operator +] [variable g] [punctuation (][variable y][punctuation )]")
+    assert_eq(render("fn map[T](x: T)"), "[keyword fn] [function map][punctuation [][type T][punctuation ](][variable x][punctuation :] [type T][punctuation )]")
+
+test "contextual keywords are keywords only where a name follows":
+    assert_eq(render("locked m:"), "[keyword locked] [variable m][punctuation :]")
+    assert_eq(render("locked self.mu:"), "[keyword locked] [keyword self][punctuation .][variable mu][punctuation :]")
+    assert_eq(render("locked := 1"), "[variable locked] [operator :=] [number 1]")
+    assert_eq(render("guard mu:"), "[keyword guard] [variable mu][punctuation :]")
+    assert_eq(render("fn f() holding m:"), "[keyword fn] [function f][punctuation ()] [keyword holding] [variable m][punctuation :]")
+    assert_eq(render("where T: Show"), "[keyword where] [type T][punctuation :] [type Show]")
+    assert_eq(render("frozen name: String"), "[keyword frozen] [variable name][punctuation :] [type String]")
+
+test "comments alone on a line, after code and inside a group":
+    code := "# top\nfn main():\n    # inside\n    x := 1 # after\n    ## doc\n"
+    assert_eq(render(code), "[comment # top]\n[keyword fn] [function main][punctuation ():]\n    [comment # inside]\n    [variable x] [operator :=] [number 1] [comment # after]\n    [comment ## doc]\n")
+    assert_eq(render("f(\n    # arg\n    1)"), "[function f][punctuation (]\n    [comment # arg]\n    [number 1][punctuation )]")
+    assert_eq(render("x := 1\n\n   # indented, then a blank line\n\ny := 2\n"), "[variable x] [operator :=] [number 1]\n\n   [comment # indented, then a blank line]\n\n[variable y] [operator :=] [number 2]\n")
+
+test "an interpolated string highlights its expressions as code":
+    assert_eq(render("\"a {{b}} c\""), "[string \"a ][punctuation {{][variable b][punctuation }}][string  c\"]")
+    assert_eq(render("\"{{a}}-{{b}}\""), "[string \"][punctuation {{][variable a][punctuation }}][string -][punctuation {{][variable b][punctuation }}][string \"]")
+    assert_eq(render("\"{{}}\""), "[string \"][punctuation {{}}][string \"]")
+    assert_eq(render("\"{{ a + b }}\""), "[string \"][punctuation {{] [variable a] [operator +] [variable b] [punctuation }}][string \"]")
+    # braces nested inside the expression
+    assert_eq(render("\"{{f({{1: 2}})}}\""), "[string \"][punctuation {{][function f][punctuation ({{][number 1][punctuation :] [number 2][punctuation }})}}][string \"]")
+    # `{{` is a literal brace, so this string has no interpolation at all
+    assert_eq(render("\"{{{{x}}}}\""), "[string \"{{{{x}}}}\"]")
+    assert_eq(render("\"a {{{{ {{b}} }}}}\""), "[string \"a {{{{ ][punctuation {{][variable b][punctuation }}][string  }}}}\"]")
+
+test "quotes inside an interpolation, escaped or bare, and nested strings":
+    assert_eq(render("\"{{f(\\\"y\\\")}}\""), "[string \"][punctuation {{][function f][punctuation (][string \\\"y\\\"][punctuation )}}][string \"]")
+    assert_eq(render("\"{{m[\"k\"]}}\""), "[string \"][punctuation {{][variable m][punctuation [][string \"k\"][punctuation ]}}][string \"]")
+    assert_eq(render("\"{{f(\"{{x}}\")}}\""), "[string \"][punctuation {{][function f][punctuation (][string \"][punctuation {{][variable x][punctuation }}][string \"][punctuation )}}][string \"]")
+    assert_eq(render("\"a\\tb\\\\\""), "[string \"a\\tb\\\\\"]")
+
+test "a format spec reads as part of the string":
+    assert_eq(render("\"{{x:>8}}\""), "[string \"][punctuation {{][variable x][punctuation :][string >8][punctuation }}][string \"]")
+    assert_eq(render("\"{{v:.2}} {{n:08}}\""), "[string \"][punctuation {{][variable v][punctuation :][string .2][punctuation }}][string  ][punctuation {{][variable n][punctuation :][string 08][punctuation }}][string \"]")
+    # a suffix that is not a spec stays code
+    assert_eq(render("\"{{x:y}}\""), "[string \"][punctuation {{][variable x][punctuation :][variable y][punctuation }}][string \"]")
+
+test "a string stops at the end of its line":
+    assert_eq(render("s := \"one\ntwo\"\n"), "[variable s] [operator :=] [string \"one]\n[variable two][string \"]\n")
+    assert_eq(render("\"a {{b}}\nc"), "[string \"a ][punctuation {{][variable b][punctuation }}]\n[variable c]")
+
+test "broken and partial input still highlights":
+    assert_eq(render("\"unterminated"), "[string \"unterminated]")
+    assert_eq(render("\""), "[string \"]")
+    assert_eq(render("\"{{a"), "[string \"][punctuation {{][variable a]")
+    # the lexer ends an unterminated escape before its backslash
+    assert_eq(render("x := \"a\\"), "[variable x] [operator :=] [string \"a]\\")
+    assert_eq(render("x := 0x"), "[variable x] [operator :=] 0x")
+    assert_eq(render("é := 1"), "é [operator :=] [number 1]")
+    for code in ["\"", "\"{{", "\"{{a", "\"{{a}}", "\"{{a}}b", "\"{{a}}b{{", "\"a\\", "\\", "{{", "}}", "x := 0x", "fn (", ")))", "  x\n y\n", "\t\r\n", "é\"", "中"]:
+        check_spans(code)
+
+test "control bytes and invalid utf-8 are plain and covered":
+    check_spans(chr(1) + "x" + chr(127) + chr(0) + "y")
+    check_spans(chr(195))
+    check_spans(chr(255) + "x" + chr(195) + chr(128) + chr(195))
+    check_spans("\"" + chr(255) + "\" + " + chr(128))
+    check_spans("# " + chr(255) + "\n" + chr(195) + "a")
+    assert_eq(spans(chr(195) + chr(169) + "x").len(), 2)
+    assert_eq(spans(chr(195) + chr(169) + "x")[0].len, 2)
+
+test "the empty input has no spans":
+    assert_eq(spans("").len(), 0)
+    assert_eq(highlight_html(""), "")
+
+test "a large random-ish input is covered exactly":
+    check_spans(random_ish_source(1000000))
+
+test "inputs that used to take quadratic time stay linear":
+    # one string with many interpolations, many pieces queued at once
+    check_spans("\"" + "{{a}}".repeat(50000) + "\"")
+    # strings nested in interpolations far past the depth that is followed
+    check_spans("\"{{".repeat(20000) + "x" + "}}\"".repeat(20000))
+    # one interpolation full of escapes, unescaped once
+    check_spans("\"{{" + "\\\\".repeat(100000) + "}}\"")
+    # a long name, a long literal with separators, and a run of stray bytes
+    check_spans("a".repeat(300000))
+    check_spans("1_".repeat(100000) + "1")
+    check_spans(chr(255).repeat(100000))
+
+test "highlight_html escapes the text and wraps every kind but plain":
+    assert_eq(highlight_html("x := \"<a & b>\" # 'q'"), "<span class=\"pith-var\">x</span> <span class=\"pith-op\">:=</span> <span class=\"pith-str\">&quot;&lt;a &amp; b&gt;&quot;</span> <span class=\"pith-com\"># &#39;q&#39;</span>")
+    assert_eq(highlight_html("fn f():\n    return 1\n"), "<span class=\"pith-kw\">fn</span> <span class=\"pith-fn\">f</span><span class=\"pith-punct\">():</span>\n    <span class=\"pith-kw\">return</span> <span class=\"pith-num\">1</span>\n")
+    assert_eq(highlight_html("T"), "<span class=\"pith-ty\">T</span>")
+    assert_eq(highlight_html("<"), "<span class=\"pith-op\">&lt;</span>")
+    assert_eq(highlight_html("é&"), "é&amp;")
+
+test "every kind has its class and the stylesheet covers them":
+    assert_eq(class_name("keyword"), "pith-kw")
+    assert_eq(class_name("type"), "pith-ty")
+    assert_eq(class_name("function"), "pith-fn")
+    assert_eq(class_name("variable"), "pith-var")
+    assert_eq(class_name("string"), "pith-str")
+    assert_eq(class_name("number"), "pith-num")
+    assert_eq(class_name("comment"), "pith-com")
+    assert_eq(class_name("operator"), "pith-op")
+    assert_eq(class_name("punctuation"), "pith-punct")
+    assert_eq(class_name("plain"), "")
+    assert_eq(class_name("nonsense"), "")
+    for css in ["pith-kw", "pith-ty", "pith-fn", "pith-str", "pith-num", "pith-com", "pith-op", "pith-punct"]:
+        assert(STYLESHEET.contains("." + css + " {{"))
+        assert(STYLESHEET.contains("  ." + css + " {{"))
+    assert(STYLESHEET.contains("@media (prefers-color-scheme: dark)"))

@@ -112,6 +112,8 @@ impl From<&ElemRef<'_>> for SetElement {
 }
 
 /// The set behind a handle.
+/// `#[repr(C)]` pins `magic` at offset 0 for raw-pointer validation.
+#[repr(C)]
 pub struct SetImpl {
     /// Magic word for the fast validity check (see set_magic_ok)
     magic: u32,

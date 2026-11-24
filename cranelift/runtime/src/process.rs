@@ -493,17 +493,23 @@ fn wait_off_green(handle: i64) -> i64 {
     }
 }
 
-/// collect the exit status of a child that has already ended. blocks if it has
-/// not, which is why every caller checks first.
+/// collect the exit status of a child that has already ended. never holds the
+/// global handle lock across a blocking wait: if the child has not exited yet
+/// (for instance after a spurious/failed pidfd wait), falls back to
+/// `poll_until_exit` which releases the lock between checks.
 fn reap(handle: i64) -> i64 {
-    let mut handles = process_handles().lock();
-    let Some(entry) = handles.get_mut(&handle) else {
-        return -1;
-    };
-    match entry.child.wait() {
-        Ok(status) => exit_code(status),
-        Err(_) => -1,
+    {
+        let mut handles = process_handles().lock();
+        let Some(entry) = handles.get_mut(&handle) else {
+            return -1;
+        };
+        match entry.child.try_wait() {
+            Ok(Some(status)) => return exit_code(status),
+            Ok(None) => {}
+            Err(_) => return -1,
+        }
     }
+    poll_until_exit(handle)
 }
 
 /// wait for a child there is no pidfd for: look under the registry lock, and

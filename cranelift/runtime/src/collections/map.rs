@@ -188,6 +188,8 @@ impl MapVal {
 /// Internal map implementation using idiomatic Rust
 ///
 /// Uses HashMap for O(1) lookups; values live in the table itself.
+/// `#[repr(C)]` pins `magic` at offset 0 for raw-pointer validation.
+#[repr(C)]
 pub struct MapImpl {
     /// Magic word for the fast validity check (see map_magic_ok)
     magic: u32,

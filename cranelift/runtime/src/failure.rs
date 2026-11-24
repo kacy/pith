@@ -24,6 +24,7 @@
 //! another worker inside the call is still caught correctly. the chain head
 //! is read through the task's map each time, never cached across pith code.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 /// one catch frame. `sp` is the stack pointer `isolate_enter` saved after
@@ -32,8 +33,13 @@ struct Frame {
     sp: usize,
     prev: *mut Frame,
     /// the runtime error that unwound the call, once there is one.
-    message: Option<String>,
+    /// `Cow<'static, str>` allows static trap messages (e.g. from SIGILL)
+    /// to unwind without allocating on the heap inside a signal handler.
+    message: Option<Cow<'static, str>>,
     /// the mutexes the call locked and has not unlocked, oldest first.
+    /// each handle carries a retained sync count taken in `note_lock_slow`
+    /// so unwinding can safely unlock it even if the failing code dropped
+    /// its last language-level reference to the mutex.
     locks: Vec<usize>,
 }
 
@@ -110,18 +116,26 @@ pub unsafe extern "C" fn pith_isolate_call(closure: i64) -> *mut i8 {
     match message {
         None => {
             // a call that returned holding a lock leaves it held, as any
-            // function may. an enclosing frame takes the entries over, so a
-            // failure further out still finds them.
+            // function may. an enclosing frame takes the entries (and their
+            // retained counts) over, so a failure further out still finds them.
             if !prev.is_null() && !locks.is_empty() {
                 // SAFETY: `prev` is an enclosing catch frame still live on this same stack.
                 unsafe { (*prev).locks.extend(locks) };
+            } else {
+                for handle in locks {
+                    // SAFETY: Releases the count taken in `note_lock_slow`; the caller still owns the lock.
+                    unsafe { crate::concurrency::sync_handle::pith_sync_release(handle as i64) };
+                }
             }
             crate::runtime_core::pith_cstring_empty()
         }
         Some(message) => {
             for handle in locks.into_iter().rev() {
-                // SAFETY: Each recorded handle came from `note_lock` for a mutex locked by this call.
-                unsafe { crate::concurrency::mutex::pith_mutex_unlock(handle as *mut _) };
+                // SAFETY: Each recorded handle came from `note_lock` (and is kept alive by our retained count).
+                unsafe {
+                    crate::concurrency::mutex::pith_mutex_unlock(handle as *mut _);
+                    crate::concurrency::sync_handle::pith_sync_release(handle as i64);
+                }
             }
             crate::runtime_core::pith_strdup_string(&message)
         }
@@ -139,6 +153,52 @@ unsafe fn run(fp: *mut Frame, func: i64, closure: i64) {
 /// plain call and every runtime error exits.
 const CATCHES: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
 
+/// Write all bytes to stderr using async-signal-safe `libc::write` (no Rust
+/// stdio locks, no heap allocations).
+fn write_stderr_raw(bytes: &[u8]) {
+    let mut written = 0;
+    while written < bytes.len() {
+        // SAFETY: writing a valid borrowed byte slice to STDERR_FILENO.
+        let n = unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                bytes[written..].as_ptr() as *const libc::c_void,
+                bytes.len() - written,
+            )
+        };
+        if n > 0 {
+            written += n as usize;
+        } else if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Stop at a runtime error with a static message without allocating on the heap
+/// or taking stdio/atexit locks: safe to call from `overflow_trap::on_sigill`.
+#[cold]
+#[inline(never)]
+pub(crate) fn fail_static(message: &'static str) -> ! {
+    let frame = head();
+    if frame.is_null() || !CATCHES {
+        write_stderr_raw(b"pith runtime error: ");
+        write_stderr_raw(message.as_bytes());
+        write_stderr_raw(b"\n");
+        // SAFETY: `_exit` is async-signal-safe and avoids atexit/stdio mutex deadlocks.
+        unsafe { libc::_exit(1) };
+    }
+    // SAFETY: a frame on the chain belongs to a `pith_isolate_call` that is
+    // still running below us on this same stack.
+    unsafe {
+        (*frame).message = Some(Cow::Borrowed(message));
+        #[cfg(pith_asan)]
+        __asan_handle_no_return();
+        isolate_resume((*frame).sp)
+    }
+}
+
 /// Stop at a runtime error: unwind to the innermost catch frame with
 /// `message`, or print it and exit with status 1 when there is none.
 ///
@@ -155,7 +215,7 @@ pub(crate) fn fail(message: String) -> ! {
     // SAFETY: a frame on the chain belongs to a `pith_isolate_call` that is
     // still running below us on this same stack.
     unsafe {
-        (*frame).message = Some(message);
+        (*frame).message = Some(Cow::Owned(message));
         #[cfg(pith_asan)]
         __asan_handle_no_return();
         isolate_resume((*frame).sp)
@@ -170,8 +230,12 @@ extern "C" {
 #[cold]
 #[inline(never)]
 unsafe fn note_lock_slow(frame: *mut Frame, handle: usize) {
-    // SAFETY: Caller guarantees `frame` is the running task's live catch frame.
-    unsafe { (*frame).locks.push(handle) };
+    // SAFETY: Caller guarantees `frame` is the running task's live catch frame
+    // and `handle` is a live mutex handle.
+    unsafe {
+        crate::concurrency::sync_handle::pith_sync_retain(handle as i64);
+        (*frame).locks.push(handle);
+    }
 }
 
 #[cold]
@@ -182,6 +246,8 @@ unsafe fn note_unlock_slow(mut frame: *mut Frame, handle: usize) {
         let locks = unsafe { &mut (*frame).locks };
         if let Some(i) = locks.iter().rposition(|&h| h == handle) {
             locks.remove(i);
+            // SAFETY: Releases the matching count taken in `note_lock_slow`.
+            unsafe { crate::concurrency::sync_handle::pith_sync_release(handle as i64) };
             return;
         }
         // SAFETY: frames on the chain are live, as in `fail`.
@@ -368,7 +434,7 @@ mod tests {
         unsafe { run(fp, func as usize as i64, 0) };
         let prev = unsafe { (*fp).prev };
         set_head(prev);
-        unsafe { (*fp).message.take() }
+        unsafe { (*fp).message.take() }.map(Cow::into_owned)
     }
 
     #[test]

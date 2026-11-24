@@ -1,0 +1,27 @@
+# `==` and `!=` on a list, map or set would compare the handles, so two
+# collections with the same contents compared unequal. the checker refuses
+# them (E217) and points at lists_equal and sets_equal. a comparison with
+# `none` and `==` on strings and structs stay legal.
+struct Point:
+    x: Int
+
+fn main():
+    a := [1, 2]
+    b := [1, 2]
+    print("{a == b}")
+    print("{a != [3]}")
+    m: Map[String, Int] := {"k": 1}
+    n: Map[String, Int] := {"k": 1}
+    print("{m == n}")
+    s: Set[Int] := {1}
+    t: Set[Int] := {1}
+    print("{s != t}")
+    maybe: List[Int]? := a
+    print("{maybe == b}")
+
+    # still legal
+    print("{maybe == none}")
+    print("{maybe != none}")
+    print("{"x" == "x"}")
+    p := Point(x: 1)
+    print("{p == p}")

@@ -1674,11 +1674,14 @@ fn parse_block_after(prefix: List[Int]) -> Int:
     mut stmts: List[Int] := prefix
     while not check("dedent") and not check("eof"):
         before := current_token_position
-        stmts.push(parse_statement())
+        stmt := parse_statement()
+        stmts.push(stmt)
         if current_token_position == before:
             parser_report_error_here("E242", "parser stalled in block", "")
             stmts.push(add_leaf_with_position("error", "parser stalled in block"))
             advance_token()
+        else:
+            expect_statement_end(stmt)
         begin_statement()
         skip_newlines()
     expect("dedent")
@@ -1686,6 +1689,38 @@ fn parse_block_after(prefix: List[Int]) -> Int:
     block_depth = block_depth - 1
 
     return add_node_with_position("block", "", stmts)
+
+# the kind of the last token consumed, comments skipped
+fn _prev_tok_kind() -> String:
+    mut i := current_token_position - 1
+    while i >= 0:
+        k := tok_kind(i)
+        if k != "comment":
+            return k
+        i = i - 1
+    return ""
+
+# a statement ends at a line end, or at the dedent that closed a block it
+# ended with. anything else on the line would otherwise parse as a second
+# statement, so `assert x == 4` became the bare name `assert` followed by a
+# comparison whose result was dropped. report it and skip the rest of the
+# line.
+fn expect_statement_end(stmt: Int):
+    node := get_node(stmt)
+    kind := _cur_tok_kind()
+    if kind == "newline" or kind == "dedent" or kind == "eof" or kind == "err":
+        # a bare name alone does nothing, and is most often a call missing
+        # its parentheses
+        if node.kind == "ident":
+            parser_report_error_here("E242", "the name `" + node.value + "` alone has no effect", "to call `" + node.value + "`, write `" + node.value + "()`")
+        return
+    if _prev_tok_kind() == "dedent":
+        return
+    if node.kind == "ident":
+        parser_report_error_here("E240", "expected a line end after `" + node.value + "` but found " + kind, "to call `" + node.value + "`, put its arguments in parentheses: `" + node.value + "(...)`")
+    else:
+        parser_report_error_here("E240", "expected a line end after the statement but found " + kind, "")
+    skip_to_line_end()
 
 # a block nested past max_block_depth: report it and skip the block whole,
 # through the dedent that closes it, so parsing resumes after it.

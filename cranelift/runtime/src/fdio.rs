@@ -61,11 +61,16 @@ pub(crate) fn set_nonblocking(fd: RawFd) {
 /// how many bytes a read asks for when the caller gives no limit.
 pub(crate) const DEFAULT_CHUNK: usize = 4096;
 
-/// the byte count one read asks for: `max_bytes`, or `DEFAULT_CHUNK` when it
-/// is not positive. shared by the socket, pipe and file reads.
+/// upper bound for a single read chunk allocation (4 MiB), so a caller passing
+/// an untrusted or huge `max_bytes` cannot trigger a single-shot OOM abort
+/// before the kernel even answers. callers reading exact/all bytes loop.
+pub(crate) const MAX_CHUNK: usize = 4 * 1024 * 1024;
+
+/// the byte count one read asks for: `max_bytes` clamped to `MAX_CHUNK`, or
+/// `DEFAULT_CHUNK` when it is not positive. shared by socket, pipe and file reads.
 pub(crate) fn chunk_size(max_bytes: i64) -> usize {
     if max_bytes > 0 {
-        max_bytes as usize
+        (max_bytes as usize).min(MAX_CHUNK)
     } else {
         DEFAULT_CHUNK
     }
@@ -79,7 +84,17 @@ pub(crate) fn chunk_size(max_bytes: i64) -> usize {
 /// represent overflows the addition rather than expressing anything a caller
 /// meant. clamping is the right reading either way: at this length a wait and
 /// a wait that never ends are the same wait.
-const MAX_WAIT_MS: i64 = i32::MAX as i64;
+pub(crate) const MAX_WAIT_MS: i64 = i32::MAX as i64;
+
+/// compute `Instant::now() + ms` without panicking when `ms` is huge.
+/// returns `None` for `ms <= 0` or if `Instant` overflows even after clamping.
+pub(crate) fn deadline_after_ms(ms: i64) -> Option<Instant> {
+    if ms <= 0 {
+        return None;
+    }
+    let clamped = ms.min(MAX_WAIT_MS) as u64;
+    Instant::now().checked_add(Duration::from_millis(clamped))
+}
 
 /// poll a single fd until it is ready, times out, or errors: the blocking wait
 /// every non-green caller uses, and the whole story on platforms without the
@@ -426,7 +441,7 @@ impl WaitBudget {
         let resolved = match *self {
             WaitBudget::Unasked => {
                 let per_call = match cached_timeout_ms(guard, read, channel) {
-                    ms if ms > 0 => Some(Instant::now() + Duration::from_millis(ms as u64)),
+                    ms if ms > 0 => deadline_after_ms(ms),
                     _ => None,
                 };
                 // the socket's deadline, when it has one, is a fixed instant,
@@ -508,6 +523,7 @@ pub(crate) fn socket_read_yielding(guard: &Guard, size: usize) -> Option<Vec<u8>
 /// down to return this call, not the peer finishing.
 fn read_channel(guard: &Guard, size: usize, channel: Channel) -> Option<Vec<u8>> {
     let fd = guard.fd() as i64;
+    let size = size.min(MAX_CHUNK);
     let mut buf = vec![0u8; size];
     let mut budget = WaitBudget::Unasked;
     loop {
@@ -639,25 +655,32 @@ pub(crate) fn socket_read_blocking(guard: &Guard, size: usize) -> Option<Vec<u8>
         return read_channel(guard, size, Channel::PolledSocket);
     }
     let fd = guard.fd() as i64;
+    let size = size.min(MAX_CHUNK);
     let mut buf = vec![0u8; size];
-    // the syscall can sit in the kernel up to SO_RCVTIMEO (forever, with no
-    // timeout set) touching only this owned buffer, so it is a native window
-    // for the cycle collector. the bracket is kept to the syscall itself.
-    let n = {
-        let _native = crate::cycle::native_bracket();
-        // SAFETY: reading into a buffer we own; `fd` is
-        // held open by `guard` for the duration of this call.
-        unsafe { Channel::Socket.read(fd as i32, &mut buf) }
-    };
-    if n >= 0 {
-        if n == 0 && !guard.is_live() {
-            return None;
+    loop {
+        // the syscall can sit in the kernel up to SO_RCVTIMEO (forever, with no
+        // timeout set) touching only this owned buffer, so it is a native window
+        // for the cycle collector. the bracket is kept to the syscall itself.
+        let n = {
+            let _native = crate::cycle::native_bracket();
+            // SAFETY: reading into a buffer we own; `fd` is
+            // held open by `guard` for the duration of this call.
+            unsafe { Channel::Socket.read(fd as i32, &mut buf) }
+        };
+        if n >= 0 {
+            if n == 0 && !guard.is_live() {
+                return None;
+            }
+            buf.truncate(n as usize);
+            return Some(buf);
         }
-        buf.truncate(n as usize);
-        return Some(buf);
+        let err = errno();
+        if err == libc::EINTR {
+            continue;
+        }
+        Channel::Socket.check(fd, err, "read");
+        return None;
     }
-    Channel::Socket.check(fd, errno(), "read");
-    None
 }
 
 /// one write to a socket that blocks in the kernel, the counterpart of
@@ -670,21 +693,26 @@ pub(crate) fn socket_write_blocking(guard: &Guard, data: &[u8]) -> Result<usize,
         return write_channel(guard, data, Channel::PolledSocket);
     }
     let fd = guard.fd() as i64;
-    // a full send buffer can hold this in the kernel indefinitely; like the
-    // blocking read it touches only the borrowed buffer, so it is a native
-    // window for the cycle collector, kept to the syscall itself.
-    let n = {
-        let _native = crate::cycle::native_bracket();
-        // SAFETY: writing from a buffer we borrow; `fd` is
-        // held open by `guard` for the duration of this call.
-        unsafe { Channel::Socket.write(fd as i32, data) }
-    };
-    if n >= 0 {
-        return Ok(n as usize);
+    loop {
+        // a full send buffer can hold this in the kernel indefinitely; like the
+        // blocking read it touches only the borrowed buffer, so it is a native
+        // window for the cycle collector, kept to the syscall itself.
+        let n = {
+            let _native = crate::cycle::native_bracket();
+            // SAFETY: writing from a buffer we borrow; `fd` is
+            // held open by `guard` for the duration of this call.
+            unsafe { Channel::Socket.write(fd as i32, data) }
+        };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let err = errno();
+        if err == libc::EINTR {
+            continue;
+        }
+        Channel::Socket.check(fd, err, "write");
+        return Err(write_error(guard, err));
     }
-    let err = errno();
-    Channel::Socket.check(fd, err, "write");
-    Err(write_error(guard, err))
 }
 
 #[cfg(test)]
@@ -1257,5 +1285,15 @@ mod tests {
                 "{call} stderr: {stderr}"
             );
         }
+    }
+
+    #[test]
+    fn deadline_and_chunk_size_clamp_extreme_inputs_without_panicking() {
+        assert!(deadline_after_ms(0).is_none());
+        assert!(deadline_after_ms(-5).is_none());
+        assert!(deadline_after_ms(i64::MAX).is_some());
+        assert_eq!(chunk_size(0), DEFAULT_CHUNK);
+        assert_eq!(chunk_size(-10), DEFAULT_CHUNK);
+        assert_eq!(chunk_size(i64::MAX), MAX_CHUNK);
     }
 }

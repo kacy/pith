@@ -132,6 +132,20 @@ for key in names:                             # fresh bytes values, in no fixed 
     print("{key.len()}")
 ```
 
+`==` and `!=` are not defined on lists, maps and sets: on a collection they
+would compare the handles, so two lists with the same elements would compare
+unequal. The checker refuses them (E217). Compare contents with
+`lists_equal(a, b)` or `sets_equal(a, b)` from `std.collections`, or with
+`assert_eq(a, b)` in a test. A comparison with `none` (`maybe_items == none`)
+is still allowed.
+
+```pith
+from std.collections import lists_equal
+
+if lists_equal(parts, ["a", "b"]):
+    print("match")
+```
+
 Struct fields can be updated in place. Structs are heap-allocated reference
 values, so a write through one handle is visible through every other handle
 to the same instance — useful for stateful iterators and small caches, and a

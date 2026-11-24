@@ -86,11 +86,9 @@ extern "C" fn on_sigill(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
                 libc::pthread_sigmask(libc::SIG_SETMASK, &(*uc).uc_sigmask, std::ptr::null_mut());
             }
         }
-        // SAFETY: the runtime's error trap; it does not return.
-        unsafe {
-            crate::runtime_core::pith_runtime_error(7);
-        }
-        return;
+        // Zero-allocation static failure path: avoids heap allocation and
+        // stdio/atexit locks inside the signal handler.
+        crate::failure::fail_static("integer overflow");
     }
     // not ours: restore the default action and let the process die of SIGILL
     // as it would have. a fault re-raises itself when the instruction runs

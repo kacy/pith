@@ -922,9 +922,67 @@ fn nested_fill_object<'a>(
     dtors: &DtorTable<'_>,
     depth: usize,
 ) -> NestedFill {
+/// Compact bitset for field presence/mismatch tracking: inline `u64` for the
+/// common <=64-field struct (zero heap allocation), spilling into `Vec<u64>`
+/// for structs with 65+ fields so `1u64 << idx` never overflows.
+struct FieldBits {
+    lo: u64,
+    hi: Vec<u64>,
+}
+
+impl FieldBits {
+    #[inline]
+    fn new() -> Self {
+        FieldBits {
+            lo: 0,
+            hi: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, idx: usize) {
+        if idx < 64 {
+            self.lo |= 1u64 << idx;
+        } else {
+            let word = (idx - 64) / 64;
+            let bit = (idx - 64) % 64;
+            if self.hi.len() <= word {
+                self.hi.resize(word + 1, 0);
+            }
+            self.hi[word] |= 1u64 << bit;
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self, idx: usize) {
+        if idx < 64 {
+            self.lo &= !(1u64 << idx);
+        } else {
+            let word = (idx - 64) / 64;
+            let bit = (idx - 64) % 64;
+            if let Some(slot) = self.hi.get_mut(word) {
+                *slot &= !(1u64 << bit);
+            }
+        }
+    }
+
+    #[inline]
+    fn contains(&self, idx: usize) -> bool {
+        if idx < 64 {
+            (self.lo & (1u64 << idx)) != 0
+        } else {
+            let word = (idx - 64) / 64;
+            let bit = (idx - 64) % 64;
+            self.hi
+                .get(word)
+                .is_some_and(|w| (*w & (1u64 << bit)) != 0)
+        }
+    }
+}
+
     let spec = target.spec;
-    let mut filled: u64 = 0;
-    let mut wrong: u64 = 0;
+    let mut filled = FieldBits::new();
+    let mut wrong = FieldBits::new();
     let mut deferred: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut cur = SpecCursor { pos: 0, idx: 0 };
     let inner_depth = depth + 1;
@@ -953,7 +1011,6 @@ fn nested_fill_object<'a>(
                 pos = nested_skip_value(input, pos, inner_depth)?;
             }
             Some((idx, field)) => {
-                let bit = 1u64 << idx;
                 let mut ok = false;
                 match field.kind {
                     b's' if b == b'"' => {
@@ -1065,11 +1122,11 @@ fn nested_fill_object<'a>(
                     }
                 }
                 if ok {
-                    filled |= bit;
-                    wrong &= !bit;
+                    filled.set(idx);
+                    wrong.clear(idx);
                 } else {
-                    filled &= !bit;
-                    wrong |= bit;
+                    filled.clear(idx);
+                    wrong.set(idx);
                     deferred.retain(|(slot_idx, _)| *slot_idx != idx);
                 }
             }
@@ -1091,12 +1148,11 @@ fn nested_fill_object<'a>(
     let mut idx = 0;
     while spec_pos < spec.len() {
         let field = nested_field_at(spec, spec_pos);
-        let bit = 1u64 << idx;
         let name = &spec[field.name_start..field.name_end];
-        if wrong & bit != 0 {
+        if wrong.contains(idx) {
             return Ok((pos, Some(nested_field_error(b"expected ", field.kind, name))));
         }
-        if filled & bit == 0 {
+        if !filled.contains(idx) {
             return Ok((pos, Some(nested_field_error(b"missing ", field.kind, name))));
         }
         if field.kind == b'o' || field.kind == b'l' || field.kind == b'm' {
@@ -1523,8 +1579,9 @@ unsafe fn nested_fill_root(
 mod tests {
     use super::{
         float_of_span, nested_elem_tag, nested_element_error, nested_element_prefixed, nested_field_at,
-        nested_kind_error_at, nested_member_path, nested_prefixed_at, nested_read_number, nested_spec_field_count,
-        pith_json_float_bits, NestedAbort, JSON_FLOAT_REFUSED, NESTED_TOO_DEEP,
+        nested_fill_from_input, nested_kind_error_at, nested_member_path, nested_prefixed_at, nested_read_number,
+        nested_spec_field_count, pith_json_float_bits, DtorTable, NestedAbort, ObjectTarget, JSON_FLOAT_REFUSED,
+        NESTED_TOO_DEEP,
     };
 
     #[test]
@@ -1660,5 +1717,45 @@ mod tests {
             assert_eq!(pith_json_float_bits(0, 0, 1), JSON_FLOAT_REFUSED);
         }
         assert!(f64::from_bits(JSON_FLOAT_REFUSED as u64).is_nan());
+    }
+
+    #[test]
+    fn nested_decode_handles_structs_with_more_than_64_fields() {
+        // 70 integer fields: previously `1u64 << idx` wrapped/panicked past 63.
+        let mut spec = Vec::new();
+        let mut doc = Vec::from(&b"{"[..]);
+        for i in 0..70usize {
+            if i > 0 {
+                spec.push(b',');
+                doc.push(b',');
+            }
+            spec.extend_from_slice(format!("if{i}").as_bytes());
+            doc.extend_from_slice(format!("\"f{i}\":{i}").as_bytes());
+        }
+        doc.push(b'}');
+        let dtors = DtorTable(&[]);
+        unsafe {
+            let struct_ptr = crate::runtime_core::pith_struct_alloc(70);
+            assert_ne!(struct_ptr, 0);
+            let target = ObjectTarget::from_raw(&spec, struct_ptr);
+            assert_eq!(nested_fill_from_input(&doc, target, false, &dtors), Ok(()));
+            let base = struct_ptr as *const i64;
+            for i in 0..70usize {
+                assert_eq!(*base.add(i), i as i64);
+            }
+            // Missing field #69 must be reported, not aliased onto field #5.
+            let mut missing_doc = Vec::from(&b"{"[..]);
+            for i in 0..69usize {
+                if i > 0 {
+                    missing_doc.push(b',');
+                }
+                missing_doc.extend_from_slice(format!("\"f{i}\":{i}").as_bytes());
+            }
+            missing_doc.push(b'}');
+            let target2 = ObjectTarget::from_raw(&spec, struct_ptr);
+            let err = nested_fill_from_input(&missing_doc, target2, false, &dtors).unwrap_err();
+            assert_eq!(err, b"missing int field: f69");
+            crate::pith_struct_release(struct_ptr);
+        }
     }
 }

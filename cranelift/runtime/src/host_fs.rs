@@ -473,11 +473,10 @@ pub unsafe extern "C" fn pith_file_open_append(path: *const i8) -> i64 {
 /// what the callers already collapse them to.
 fn read_handle_chunk(handle: i64, max_bytes: i64) -> Option<Vec<u8>> {
     let size = crate::fdio::chunk_size(max_bytes);
-    if !blocking::offloads() {
-        let mut handles = file_handles().lock();
-        return read_chunk(handles.get_mut(&handle)?, size);
-    }
     let mut file = clone_file(handle)?;
+    if !blocking::offloads() {
+        return read_chunk(&mut file, size);
+    }
     blocking::run(&POOL, move || read_chunk(&mut file, size))
 }
 
@@ -488,22 +487,15 @@ fn read_handle_chunk(handle: i64, max_bytes: i64) -> Option<Vec<u8>> {
 /// handle, one opened for reading included, as an empty pipe or socket write
 /// does.
 fn write_handle_chunk(handle: i64, data: &[u8]) -> Result<usize, String> {
-    if !blocking::offloads() {
-        let mut handles = file_handles().lock();
-        let Some(file) = handles.get_mut(&handle) else {
-            return Err(UNKNOWN_FILE_HANDLE.to_string());
-        };
-        if data.is_empty() {
-            return Ok(0);
-        }
-        return write_chunk(file, data).0;
-    }
     let cloned = match file_handles().lock().get(&handle) {
         Some(_) if data.is_empty() => return Ok(0),
         Some(file) => file.try_clone(),
         None => return Err(UNKNOWN_FILE_HANDLE.to_string()),
     };
     let mut file = cloned.map_err(|err| err.to_string())?;
+    if !blocking::offloads() {
+        return write_chunk(&mut file, data).0;
+    }
     let data = data.to_vec();
     blocking::run(&POOL, move || write_chunk(&mut file, &data)).0
 }

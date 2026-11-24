@@ -234,6 +234,16 @@ error[E217]: operator '+' not supported for types Bool and Bool
       ^^^^^^^^^^
 ```
 
+`==` and `!=` on a list, map or set report here too. on a collection they
+would compare the handles rather than the contents:
+
+```
+error[E217]: operator == is not defined on a list: it would compare identity, not contents
+  4 |     print("{a == b}")
+               ^
+  fix: compare the contents with `lists_equal(a, b)` from std.collections, or `assert_eq(a, b)` in a test
+```
+
 ### E218 — match guard must be Bool
 
 the `if` guard on a match arm doesn't evaluate to Bool.
@@ -482,6 +492,16 @@ the `!` operator was used inside a function that does not itself return a result
 
 the parser expected a specific token but encountered a different one.
 
+a statement ends at the line end, so a second expression on the same line is
+an error rather than a second statement. a call needs its parentheses:
+
+```
+error[E240]: expected a line end after `assert` but found identifier
+  6 |     assert x == 4
+          ^
+  fix: to call `assert`, put its arguments in parentheses: `assert(...)`
+```
+
 ### E241 — unexpected end of file
 
 the parser reached the end of the file before a required token or block terminator appeared.
@@ -489,7 +509,8 @@ the parser reached the end of the file before a required token or block terminat
 ### E242 — invalid syntax
 
 the parser encountered a token sequence that does not form a valid expression,
-pattern, or declaration.
+pattern, or declaration. a bare name alone as a statement, such as `x` on its
+own line, is reported here too: it has no effect.
 
 it also reports input nested past the parser's limits: expressions, types or
 patterns more than 256 levels deep, an expression tree deeper than 25,000

@@ -137,15 +137,21 @@ calli   r3 r2 int 1 r1           # the one new instruction
 
 `calli REG PTR RETKIND NARGS ARG...` lowers to a Cranelift `call_indirect`
 with N i64 parameters and one i64 return. That is the plain abi every function
-already uses, and methods of an `impl Iface for T` block are never moved to the
-register-result abi, so a result-returning method needs no second form.
+already uses, so the function in a slot returns a fallible result as its box.
 
-Each slot points at the concrete method itself. No thunks are needed: a scalar
-receiver (`impl Shape for Int`) is a word like a handle, and a default method
-the impl did not override is emitted for the type under the impl's own method
-name. The receiver is pinned (retained) for the call, as a closure field is,
-and owned arguments are released after it the way a direct method call
-releases them.
+A slot usually points at the concrete method itself. A method of an
+`impl Iface for T` block keeps the boxed result unless the type's own impl
+declares a method of the same name, as std/io does for its streams. The two
+then compile to one symbol, which takes the register-result abi when every
+body under it fits. Direct calls read the register pair, and the slot points
+at `<symbol>.iface`, an adapter that calls the method and folds the pair into
+the box. No name written in source contains a `.`, so the adapter's name
+cannot collide with one. Nothing else needs an adapter: a scalar receiver
+(`impl Shape for Int`) is a word like a handle, and a default method the impl
+did not override is emitted for the type under the impl's own method name.
+The receiver is pinned (retained) for the call, as a closure field is, and
+owned arguments are released after it the way a direct method call releases
+them.
 
 The checker records each conversion against the value's expression node, the
 same way it records an optional widening, and the emitter builds the box

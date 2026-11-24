@@ -1,0 +1,74 @@
+# a method declared both in a type's own impl and in its interface impl
+# returns its result in the register pair, and an interface value reaches it
+# through an adapter that boxes the pair. every round calls each such method
+# directly and through an interface value, on the ok and the error path, with
+# a fresh String ok value, a fresh String message and a struct error, so a
+# count the adapter keeps on either path grows the heap.
+import leakprobe as probe
+
+interface Store:
+    fn take(n: Int) -> String!
+    fn pick(n: Int) -> Int!Bad
+
+struct Bad:
+    reason: String
+    code: Int
+
+struct Shelf:
+    prefix: String
+
+impl Shelf:
+    fn take(n: Int) -> String!:
+        if n % 2 == 1:
+            fail "no item {n} on {self.prefix}"
+        return self.prefix + "-" + n.to_string()
+
+    fn pick(n: Int) -> Int!Bad:
+        if n % 3 == 0:
+            fail Bad{"too far on " + self.prefix, n}
+        return n * 3
+
+impl Store for Shelf:
+    fn take(n: Int) -> String!:
+        if n % 2 == 1:
+            fail "no item {n} on {self.prefix}"
+        return self.prefix + "-" + n.to_string()
+
+    fn pick(n: Int) -> Int!Bad:
+        if n % 3 == 0:
+            fail Bad{"too far on " + self.prefix, n}
+        return n * 3
+
+fn measured(r: String!) -> Int:
+    if r.is_ok:
+        return r.ok.len()
+    return r.err.len()
+
+fn through_try(st: Store, n: Int) -> Int!:
+    return st.take(n)!.len() + st.take(n + 2)!.len()
+
+fn round(i: Int) -> Int:
+    s := Shelf(prefix: "p" + i.to_string())
+    st: Store := s
+    mut total := measured(s.take(i)) + measured(s.take(i + 1))
+    total = total + measured(st.take(i)) + measured(st.take(i + 1))
+    total = total + (s.pick(i) catch 0) + (s.pick(i + 1) catch 0)
+    total = total + (st.pick(i) catch 0) + (st.pick(i + 1) catch 0)
+    r := st.pick(i + 2)
+    if r.is_err:
+        total = total + r.err.reason.len()
+    total = total + (through_try(st, i) catch 1)
+    st.take(i + 3)
+    return total
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

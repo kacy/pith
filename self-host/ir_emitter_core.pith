@@ -90,6 +90,10 @@ mut ir_index_offset_targets: Map[Int, Int] := {}
 # set while one of those steps, or an index offset that skips its check, is
 # emitted, so ir_int_op hands back the plain op instead of the checked one
 mut ir_plain_int_arith := false
+# set with it for a counter step alone: that sum is exact, so ir_int_op hands
+# back `addnsw`, which tells the consumer the result cannot have wrapped. an
+# index offset can wrap (the bounds check catches it), so it stays `add`.
+mut ir_exact_int_arith := false
 # the owned error of the `catch err:` block being emitted. the block's first
 # statement binds it, through a caught_error node.
 mut ir_caught_error_reg := 0
@@ -6326,12 +6330,15 @@ fn ir_int_checks_overflow(tid: Int) -> Bool:
 # the op that computes `op` on values of type `tid`: the unsigned form of
 # division, remainder and ordering for an unsigned word, and the checked form
 # of `+`, `-` and `*` for a type that stops on overflow (`addc`, or `uaddc`
-# for an unsigned word). anything else is the op itself.
+# for an unsigned word). an Int counter step is `addnsw` (see
+# ir_exact_int_arith). anything else is the op itself.
 fn ir_int_op(tid: Int, op: String) -> String:
     if (op == "add" or op == "sub" or op == "mul") and ir_int_checks_overflow(tid) and not ir_plain_int_arith:
         if ir_is_unsigned_word(tid):
             return "u" + op + "c"
         return op + "c"
+    if op == "add" and ir_exact_int_arith and ir_int_checks_overflow(tid) and not ir_is_unsigned_word(tid):
+        return "addnsw"
     if not ir_is_unsigned_word(tid):
         return op
     if op == "div" or op == "mod" or op == "lt" or op == "gt" or op == "lte" or op == "gte":
@@ -11388,8 +11395,10 @@ fn ir_expr(idx: Int) -> Int:
     if node.kind == "binary":
         if ir_counter_steps.contains_key(idx) or ir_index_offset_unchecked(idx):
             ir_plain_int_arith = true
+            ir_exact_int_arith = ir_counter_steps.contains_key(idx)
             step_r := ir_emit_binary_expr(node)
             ir_plain_int_arith = false
+            ir_exact_int_arith = false
             return step_r
         return ir_narrow_sized_result(idx, node.value, ir_emit_binary_expr(node))
 
@@ -12683,8 +12692,10 @@ fn ir_stmt(idx: Int):
 
     if kind == "assignment":
         ir_plain_int_arith = ir_counter_steps.contains_key(idx)
+        ir_exact_int_arith = ir_plain_int_arith
         ir_emit_compound_assignment(node)
         ir_plain_int_arith = false
+        ir_exact_int_arith = false
         return
 
     ir_stmt_control(idx, node)
@@ -13418,12 +13429,14 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
         null_again := ir_reg()
         ir_emit("iconst " + null_again.to_string() + " 0")
         ir_emit("store " + value_slot + " " + null_again.to_string())
+    # the head found the index below a length, and only this step writes
+    # it, so the step is exact
     idx3 := ir_reg()
     ir_emit("load " + idx3.to_string() + " " + fi)
     one_r := ir_reg()
     ir_emit("iconst " + one_r.to_string() + " 1")
     inc_r := ir_reg()
-    ir_emit("add " + inc_r.to_string() + " " + idx3.to_string() + " " + one_r.to_string())
+    ir_emit("addnsw " + inc_r.to_string() + " " + idx3.to_string() + " " + one_r.to_string())
     ir_emit("store " + fi + " " + inc_r.to_string())
     ir_emit("jmp " + head_l)
     ir_emit_label(end_l)
@@ -13498,12 +13511,18 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
+    # an exclusive range's head found the value below hi, and only this step
+    # writes it, so the step is exact. an inclusive range's last value can be
+    # the largest Int, so its step stays a plain add.
     v3 := ir_reg()
     ir_emit("load " + v3.to_string() + " " + fv)
     one_r := ir_reg()
     ir_emit("iconst " + one_r.to_string() + " 1")
     inc_r := ir_reg()
-    ir_emit("add " + inc_r.to_string() + " " + v3.to_string() + " " + one_r.to_string())
+    mut step_op := "addnsw"
+    if inclusive:
+        step_op = "add"
+    ir_emit(step_op + " " + inc_r.to_string() + " " + v3.to_string() + " " + one_r.to_string())
     ir_emit("store " + fv + " " + inc_r.to_string())
     if has_index:
         p3 := ir_reg()

@@ -80,7 +80,20 @@ addc|subc|mulc REG A B        REG = A op B for source arithmetic on an Int: a
                               program with the integer-overflow runtime error.
 uaddc|usubc|umulc REG A B     the same for UInt and UInt64, against the unsigned
                               range.
+addnsw REG A B                REG = A + B on an Int, where the front end proved
+                              the sum fits: a loop counter's step, or a counter
+                              plus one before the step. it has no check, and
+                              unlike `add` its result has not wrapped.
 ```
+
+the consumer narrows a check when an operand is known never to be negative: a
+constant of at least zero, a length, a load of a variable whose every store is
+one of these, or the `addc`, `mulc` or `addnsw` of two of them
+(`cranelift/codegen/src/nonneg.rs`). with such operands `a - b` needs no check,
+`x * c` compares `x` with the top of its range only, and `a + b` compares the
+sum with an operand instead of testing the overflow flag. `wrapping_add` lowers
+to a plain `add`, so an `add` says nothing about the sign of its result, and a
+sum the front end proved is written `addnsw`.
 
 **float arithmetic**
 

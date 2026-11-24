@@ -48,45 +48,113 @@ from errors import render_diagnostics, render_diagnostics_for_path, render_diagn
 from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_search
 from package_cli import package_root_path, cmd_package_deps, cmd_package_lock, cmd_package_install, cmd_package_inspect, cmd_package_context, cmd_new
 from lsp_server import run_lsp_server
+import std.os as os
+import std.os.path as paths
 
 # ---------------------------------------------------------------
 # native backend passthrough
 # build/run/test still go through the Rust backend, but this CLI now forwards
 # those commands so the self-hosted binary is usable in bootstrap verification.
 
+# the directory holding this executable, from argv[0]: the path it was
+# started by, or the PATH entry that holds it when it was started by bare
+# name. "" when neither names a file.
+fn own_dir() -> String:
+    a := args()
+    if a.len() == 0:
+        return ""
+    mut exe := a[0]
+    if not exe.contains("/"):
+        exe = os.which(exe)
+    if exe == "":
+        return ""
+    return paths.dir(exe)
+
+# the toolchain root beside this executable: the checkout holding
+# `self-host/pith_main`, or the install holding `lib/pith_main`. "" when
+# the directory above has no std.
+fn own_root() -> String:
+    dir := own_dir()
+    if dir == "":
+        return ""
+    root := paths.join(dir, "..")
+    if dir_exists(paths.join(root, "std")):
+        return root
+    return ""
+
+# when PITH_HOME is unset, point it at the toolchain this executable
+# belongs to, so a source file outside any checkout still finds std here
+# and in the backend and ir driver this spawns. a checkout's own std still
+# wins, since the import walk looks above the source file first.
+fn default_pith_home():
+    if env("PITH_HOME").len() > 0:
+        return
+    root := own_root()
+    if root != "":
+        _set := os.set_env("PITH_HOME", root)
+
+# where the native backend may be, in order: the working directory's
+# checkout, then beside this executable in a checkout
+# (`target/release/pith` next to `self-host/pith_main`) or an install
+# (`bin/pith` next to `lib/pith_main`), then under PITH_HOME.
+fn native_backend_candidates() -> List[String]:
+    mut out := ["./target/release/pith", "../target/release/pith"]
+    dir := own_dir()
+    if dir != "":
+        out.push(paths.join(dir, "../target/release/pith"))
+        out.push(paths.join(dir, "../bin/pith"))
+    home := env("PITH_HOME")
+    if home.len() > 0:
+        out.push(paths.join(home, "bin/pith"))
+    return out
+
+# the native backend: PITH_NATIVE when set, else the first candidate that
+# exists. a missing backend is an error naming every path tried.
 fn native_backend_path() -> String:
     configured := env("PITH_NATIVE")
     if configured.len() > 0:
+        if not file_exists(configured):
+            print_err("error: PITH_NATIVE is set to " + configured + ", which does not exist")
+            exit(1)
         return configured
-    if file_exists("./target/release/pith"):
-        return "./target/release/pith"
-    if file_exists("../target/release/pith"):
-        return "../target/release/pith"
-    return "./target/release/pith"
+    tried := native_backend_candidates()
+    for candidate in tried:
+        if file_exists(candidate):
+            return candidate
+    print_err("error: cannot find the native pith backend; tried " + tried.join(", ") + ". build it with `cargo build --release` in cranelift/, or set PITH_NATIVE to its path")
+    exit(1)
+    return ""
 
-# the backend is spawned without a shell and the command line is split on
-# whitespace, so no argument can carry a space. the guards below refuse one
-# rather than passing a half-argument down; the runner reads every selection
-# flag from the environment too, which is the way to pass a value with a space
-# through this wrapper.
+# the backend is spawned without a shell, but `exec` splits its command
+# line on whitespace, so no argument can carry a space. the guards below
+# refuse one rather than passing a half-argument down; the native cli
+# takes such paths, and the runner reads every selection flag from the
+# environment too, which is the way to pass a value with a space through
+# this wrapper.
 fn backend_command(command: String, path: String, extra: List[String]) -> String:
     if path.contains(" "):
-        print("error: paths with spaces are not supported by self-hosted " + command)
+        print_err("error: self-hosted " + command + " cannot pass a path containing a space to the backend; run the native cli (target/release/pith " + command + ") for this path instead")
         exit(1)
     backend := native_backend_path()
     if backend.contains(" "):
-        print("error: backend path contains spaces; set PITH_NATIVE to a path without spaces")
+        print_err("error: the native backend path " + backend + " contains a space, which self-hosted " + command + " cannot pass on; set PITH_NATIVE to a path without spaces")
         exit(1)
     mut parts := [backend, command, path]
     for arg in extra:
         if arg.contains(" "):
-            print("error: arguments with spaces are not supported by self-hosted " + command + "; pass the value through the environment instead")
+            print_err("error: self-hosted " + command + " cannot pass an argument containing a space to the backend; pass the value through the environment instead")
             exit(1)
         parts.push(arg)
     return parts.join(" ")
 
+# `exec` answers -1 when the backend could not be started at all, which
+# would otherwise surface as a bare exit status 255.
 fn run_backend_command(command: String, path: String, extra: List[String]) -> String!:
-    status := exec(backend_command(command, path, extra))
+    line := backend_command(command, path, extra)
+    status := exec(line)
+    if status == 0 - 1:
+        print_err("error: could not start the native backend: " + line)
+        exit(1)
     if status != 0:
         exit(status)
     return ""
@@ -521,6 +589,7 @@ fn run_cli() -> String!:
 # an error that nothing below handled fails the command with a message
 # and status 1
 fn main():
+    default_pith_home()
     result := run_cli()
     if result.is_err:
         print_err("error: " + result.err)

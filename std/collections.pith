@@ -61,6 +61,26 @@ pub fn copy_set[T](items: Set[T]) -> Set[T]:
         result.add(item)
     return result
 
+# whether two lists hold equal elements in the same order. `==` on two
+# lists is refused because it would compare the handles; this compares the
+# elements with `==`.
+pub fn lists_equal[T](left: List[T], right: List[T]) -> Bool:
+    if left.len() != right.len():
+        return false
+    for item, i in left:
+        if item != right[i]:
+            return false
+    return true
+
+# whether two sets hold the same elements.
+pub fn sets_equal[T](left: Set[T], right: Set[T]) -> Bool:
+    if left.len() != right.len():
+        return false
+    for item in left:
+        if not right.contains(item):
+            return false
+    return true
+
 # drop items from the end until at most len remain.
 pub fn truncate_list[T](items: List[T], len: Int):
     while items.len() > len:
@@ -863,6 +883,20 @@ test "collection set helpers return expected membership":
     assert(both.contains("blue"))
     assert(not both.contains("red"))
     assert(only_left.contains("red"))
+
+test "lists_equal and sets_equal compare contents":
+    assert(lists_equal([1, 2, 3], [1, 2, 3]))
+    assert(not lists_equal([1, 2, 3], [1, 3, 2]))
+    assert(not lists_equal([1, 2], [1, 2, 3]))
+    empty: List[Int] := []
+    assert(lists_equal(empty, []))
+    tail := "b"
+    assert(lists_equal(["a", "bb"], ["a", tail + tail]))
+    assert(not lists_equal(["a", "b"], ["a", "c"]))
+    left: Set[String] := {"red", "blue"}
+    assert(sets_equal(left, {"blue", "red"}))
+    assert(not sets_equal(left, {"blue"}))
+    assert(not sets_equal(left, {"blue", "green"}))
 
 test "collection predicate helpers find values":
     nums := [1, 2, 3, 4]

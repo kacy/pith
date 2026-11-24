@@ -280,6 +280,7 @@ fn main() -> Int:
     ints_both("ints_empty", ints_doc("e", "[]"))
     ints_both("ints_one", ints_doc("o", "[42]"))
     ints_both("ints_many", ints_doc("m", "[1,-2,3,0,99999]"))
+    ints_both("ints_bounds", ints_doc("x", "[9223372036854775807,-9223372036854775808,1000000000000000000]"))
     ints_bytes := json.decode[Ints](bytes.from_string_utf8(ints_doc("b", "[7,8]")))
     if ints_bytes.is_err:
         print("ints_bytes err: " + ints_bytes.err.message)
@@ -366,6 +367,8 @@ fn main() -> Int:
     ints_err("missing_list", obj(q("name") + ":" + q("w")))
     ints_err("missing_after_list", obj(q("xs") + ":[1]"))
     ints_err("big_int_element", ints_doc("w", "[99999999999999999999]"))
+    ints_err("past_max_element", ints_doc("w", "[9223372036854775808]"))
+    ints_err("past_min_element", ints_doc("w", "[-9223372036854775809]"))
     fill_err("elem_missing_first", rows_doc(obj(q("id") + ":1") + "," + row(2, "two")))
     node_err("elem_missing_first", rows_doc(obj(q("id") + ":1") + "," + row(2, "two")))
     fill_err("elem_missing_second", rows_doc(row(1, "one") + "," + obj(q("label") + ":" + q("l"))))

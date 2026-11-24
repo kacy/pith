@@ -124,8 +124,12 @@ fn main() -> Int:
     show_nested("trailing_comma", json.decode_text[Nested](obj(q("name") + ":" + q("a") + "," + q("addr") + ":" + obj(q("city") + ":" + q("p") + "," + q("zip") + ":1,") + "," + q("score") + ":1,")))
     show_nested("unclosed", json.decode_text[Nested](chr(123) + q("name") + ":" + q("a") + "," + q("score") + ":1," + q("addr") + ":" + chr(123) + q("city") + ":" + q("p") + "," + q("zip") + ":1"))
 
-    # numbers: a sign, an int past 64 bits, a float where an int is expected
+    # numbers: a sign, Int's bounds, an int past 64 bits, a float where an
+    # int is expected
     show_nested("signed", json.decode_text[Nested](nested_doc("a", inner_doc("p", 0 - 12), "+7")))
+    show_nested("max_int", json.decode_text[Nested](nested_doc("a", inner_doc("p", 9223372036854775807), "-9223372036854775808")))
+    show_nested("past_max_int", json.decode_text[Nested](nested_doc("a", paris, "9223372036854775808")))
+    show_nested("past_min_int", json.decode_text[Nested](nested_doc("a", paris, "-9223372036854775809")))
     show_nested("big_int", json.decode_text[Nested](nested_doc("a", paris, "99999999999999999999")))
     show_nested("float_int", json.decode_text[Nested](nested_doc("a", paris, "1.5")))
     show_nested("float_in_nested", json.decode_text[Nested](nested_doc("a", obj(q("city") + ":" + q("p") + "," + q("zip") + ":1e3"), "1")))

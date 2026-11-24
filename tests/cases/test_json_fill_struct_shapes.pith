@@ -10,7 +10,7 @@
 # ownership of every string it mints. so: a small struct, a wide one with
 # keys in declaration order and in reverse, nested and list shapes for the
 # pool path next to it, unknown keys of every scalar kind, a repeated key,
-# whitespace, escapes, saturating ints, and each error in turn.
+# whitespace, escapes, ints at and past Int's bounds, and each error in turn.
 
 import std.json as json
 import std.bytes as bytes
@@ -122,9 +122,11 @@ fn main() -> Int:
     escaped := obj(q("id") + ":4," + q("name") + ":" + dq + "a" + bs + dq + "b" + bs + bs + "c" + bs + "nd" + dq + "," + q("active") + ":true")
     show_small("escaped", json.decode_text[Small](escaped))
 
-    # an empty string value, and an int past 64 bits saturates
+    # an empty string value, Int's bounds, and an int past 64 bits fails
     edge := obj(q("id") + ":99999999999999999999999," + q("name") + ":" + q("") + "," + q("active") + ":false")
     show_small("edge", json.decode_text[Small](edge))
+    for bound in ["9223372036854775807", "-9223372036854775808", "9223372036854775808", "-9223372036854775809"]:
+        show_small("bound " + bound, json.decode_text[Small](obj(q("id") + ":" + bound + "," + q("name") + ":" + q("b") + "," + q("active") + ":true")))
 
     # the wide struct, in declaration order and reversed
     show_wide("wide", json.decode_text[Wide](wide_doc(false)))

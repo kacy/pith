@@ -64,7 +64,7 @@ const CALLI_CALLEE: &str = "<calli>";
 /// instructions that make a plain value from plain operands
 const PLAIN_OPS: &[&str] = &[
     "iconst", "fconst", "add", "sub", "mul", "div", "mod", "lt", "gt", "lte", "gte", "eq", "neq",
-    "addc", "subc", "mulc", "uaddc", "usubc", "umulc",
+    "addc", "subc", "mulc", "uaddc", "usubc", "umulc", "addnsw",
     "udiv", "urem", "ult", "ugt", "ulte", "ugte",
     "and", "or", "xor", "shl", "shr", "ushr", "not", "neg", "band", "bor", "bxor", "fadd", "fsub",
     "fmul", "fdiv", "flt", "fgt", "flte", "fgte", "feq", "fneq", "optflag", "funcref",

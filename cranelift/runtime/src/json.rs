@@ -534,9 +534,11 @@ fn nested_is_number_char(b: u8) -> bool {
 
 /// std.json's number branch with parse_integer_manual: the span of number
 /// characters at `pos`; `Ok(None)` when it holds a `.`, `e` or `E` and so
-/// parses as a float, `Err` when its digits pass the parser's overflow
-/// bound. Signs and stray number characters inside the span are skipped
-/// the way the parser skips them, so `1-2` reads as 12 and `-` alone as 0.
+/// parses as a float, `Err` when the integer is outside i64, as json.parse
+/// refuses it. Signs and stray number characters inside the span are
+/// skipped the way the parser skipped them, so `1-2` reads as 12 and `-`
+/// alone as 0. The digits are accumulated as a negative number, since
+/// i64::MIN has no positive counterpart.
 fn nested_read_number(input: &[u8], pos: usize) -> Result<(Option<i64>, usize), ()> {
     let i = number_span_end(input, pos + 1);
     if input[pos + 1..i].iter().any(|b| matches!(b, b'.' | b'e' | b'E')) {
@@ -547,13 +549,11 @@ fn nested_read_number(input: &[u8], pos: usize) -> Result<(Option<i64>, usize), 
     let mut value: i64 = 0;
     for &b in span {
         if b.is_ascii_digit() {
-            if value > 922337203685477580 / 10 {
-                return Err(());
-            }
-            value = value * 10 + (b - b'0') as i64;
+            value = value.checked_mul(10).and_then(|v| v.checked_sub((b - b'0') as i64)).ok_or(())?;
         }
     }
-    Ok((Some(if neg { -value } else { value }), i))
+    let value = if neg { value } else { value.checked_neg().ok_or(())? };
+    Ok((Some(value), i))
 }
 
 /// std.json's parse_value for a value nobody keeps: consumed with the
@@ -1523,9 +1523,21 @@ unsafe fn nested_fill_root(
 mod tests {
     use super::{
         float_of_span, nested_elem_tag, nested_element_error, nested_element_prefixed, nested_field_at,
-        nested_kind_error_at, nested_member_path, nested_prefixed_at, nested_spec_field_count, pith_json_float_bits,
-        NestedAbort, JSON_FLOAT_REFUSED, NESTED_TOO_DEEP,
+        nested_kind_error_at, nested_member_path, nested_prefixed_at, nested_read_number, nested_spec_field_count,
+        pith_json_float_bits, NestedAbort, JSON_FLOAT_REFUSED, NESTED_TOO_DEEP,
     };
+
+    #[test]
+    fn number_reader_covers_the_whole_i64_range() {
+        let read = |text: &str| nested_read_number(text.as_bytes(), 0).map(|(v, _)| v);
+        assert_eq!(read("9223372036854775807"), Ok(Some(i64::MAX)));
+        assert_eq!(read("-9223372036854775808"), Ok(Some(i64::MIN)));
+        assert_eq!(read("1000000000000000000"), Ok(Some(1_000_000_000_000_000_000)));
+        assert_eq!(read("9223372036854775808"), Err(()));
+        assert_eq!(read("-9223372036854775809"), Err(()));
+        assert_eq!(read("99999999999999999999999"), Err(()));
+        assert_eq!(read("1.5"), Ok(None));
+    }
 
     #[test]
     fn spec_field_reads_a_list_entry_and_a_destructor_index() {

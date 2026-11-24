@@ -1,0 +1,197 @@
+# a weak field store or read takes the runtime's field lock only when its
+# holder is marked shared, and every route to another task marks a struct
+# before the other task can reach it (cranelift/runtime/src/share.rs). each
+# holder here is written while it is still local, on the unlocked path. then
+# it crosses by one route, and two tasks store into and read its weak field
+# at once. if a route left the holder unmarked, both tasks would skip the
+# lock, and a store could free the old target's header under a read's
+# upgrade. PITH_QUARANTINE=1 reports that, and adding PITH_RC_CHECK=1 aborts
+# the run at the first weak field access to an unmarked holder from a task
+# that did not build it.
+#
+# a race, so a clean run is evidence rather than proof.
+
+struct Child:
+    name: String
+    n: Int
+
+struct Holder:
+    weak w: Child?
+
+struct Outer:
+    inner: Holder
+
+struct Link:
+    weak to: Holder?
+
+interface Slot:
+    fn put(c: Child?)
+    fn torn() -> Int
+
+impl Slot for Holder:
+    fn put(c: Child?):
+        self.w = c
+    fn torn() -> Int:
+        if let c = self.w:
+            if c.name != "child-" + c.n.to_string():
+                return 1
+        return 0
+
+ROUNDS := 100000
+GLOBAL := Holder(w: none)
+
+fn child(i: Int) -> Child:
+    return Child(name: "child-" + i.to_string(), n: i)
+
+# each store drops the field's weak count on the child before, whose only
+# strong owner is already gone, so that count is all that keeps its header
+fn write(h: Holder, rounds: Int) -> Int:
+    mut i := 0
+    while i < rounds:
+        c := child(i)
+        h.w = c
+        i = i + 1
+    h.w = none
+    return i
+
+fn read(h: Holder, rounds: Int) -> Int:
+    mut torn := 0
+    mut i := 0
+    while i < rounds:
+        if let c = h.w:
+            if c.name != "child-" + c.n.to_string():
+                torn = torn + 1
+        i = i + 1
+    return torn
+
+fn race(h: Holder) -> Int:
+    w := spawn write(h, ROUNDS)
+    r := spawn read(h, ROUNDS * 2)
+    wrote := await w
+    return await r + wrote - ROUNDS
+
+fn by_spawn_arguments() -> Int:
+    h := Holder(w: none)
+    write(h, 1000)
+    return race(h)
+
+fn run(f: fn() -> Int) -> Int:
+    return f()
+
+fn by_closure() -> Int:
+    h := Holder(w: none)
+    write(h, 1000)
+    w := spawn run(fn() -> Int => write(h, ROUNDS))
+    r := spawn run(fn() -> Int => read(h, ROUNDS * 2))
+    wrote := await w
+    return await r + wrote - ROUNDS
+
+fn read_sent(ch: Channel[Holder]) -> Int:
+    got := ch.recv()
+    if got == none:
+        return 0
+    return read(got.value(), ROUNDS * 2)
+
+fn by_channel() -> Int:
+    h := Holder(w: none)
+    write(h, 1000)
+    ch := Channel[Holder](1)
+    r := spawn read_sent(ch)
+    ch.send(h)
+    wrote := write(h, ROUNDS)
+    return await r + wrote - ROUNDS
+
+fn write_global(rounds: Int) -> Int:
+    return write(GLOBAL, rounds)
+
+fn read_global(rounds: Int) -> Int:
+    return read(GLOBAL, rounds)
+
+fn by_global() -> Int:
+    w := spawn write_global(ROUNDS)
+    r := spawn read_global(ROUNDS * 2)
+    wrote := await w
+    return await r + wrote - ROUNDS
+
+fn write_inner(o: Outer, rounds: Int) -> Int:
+    return write(o.inner, rounds)
+
+fn read_inner(o: Outer, rounds: Int) -> Int:
+    return read(o.inner, rounds)
+
+fn by_field() -> Int:
+    o := Outer(inner: Holder(w: none))
+    write(o.inner, 1000)
+    w := spawn write_inner(o, ROUNDS)
+    r := spawn read_inner(o, ROUNDS * 2)
+    wrote := await w
+    return await r + wrote - ROUNDS
+
+fn built(rounds: Int) -> Holder:
+    h := Holder(w: none)
+    write(h, rounds)
+    return h
+
+# the task that built the holder is gone by the time this one reads it, so
+# the result's mark is what a check build tests here
+fn by_task_result() -> Int:
+    t := spawn built(1000)
+    h := await t
+    torn := read(h, 10) + write(h, 10) - 10
+    return torn + race(h)
+
+fn write_linked(l: Link, rounds: Int) -> Int:
+    if let h = l.to:
+        return write(h, rounds)
+    return 0
+
+fn read_linked(l: Link, rounds: Int) -> Int:
+    if let h = l.to:
+        return read(h, rounds)
+    return 0
+
+fn by_weak_edge() -> Int:
+    h := Holder(w: none)
+    write(h, 1000)
+    l := Link(to: h)
+    w := spawn write_linked(l, ROUNDS)
+    r := spawn read_linked(l, ROUNDS * 2)
+    wrote := await w
+    torn := await r + wrote - ROUNDS
+    # h is the holder's strong owner until both tasks are done
+    return torn + read(h, 1)
+
+fn put_rounds(s: Slot, rounds: Int) -> Int:
+    mut i := 0
+    while i < rounds:
+        s.put(child(i))
+        i = i + 1
+    s.put(none)
+    return i
+
+fn torn_rounds(s: Slot, rounds: Int) -> Int:
+    mut torn := 0
+    mut i := 0
+    while i < rounds:
+        torn = torn + s.torn()
+        i = i + 1
+    return torn
+
+fn by_interface() -> Int:
+    h := Holder(w: none)
+    write(h, 1000)
+    s: Slot := h
+    w := spawn put_rounds(s, ROUNDS)
+    r := spawn torn_rounds(s, ROUNDS * 2)
+    wrote := await w
+    return await r + wrote - ROUNDS
+
+fn main():
+    print("spawn arguments: {by_spawn_arguments()}")
+    print("closure capture: {by_closure()}")
+    print("channel send: {by_channel()}")
+    print("module global: {by_global()}")
+    print("field of a shared struct: {by_field()}")
+    print("task result: {by_task_result()}")
+    print("weak edge: {by_weak_edge()}")
+    print("interface value: {by_interface()}")

@@ -1,15 +1,22 @@
 # std.regex - a small regular expression engine.
 #
-# the matcher is a pike vm: the pattern compiles to bytecode and the
-# vm advances every live thread one input character at a time, so
-# matching is linear in the input for any pattern — there is no
-# backtracking to go pathological.
+# the matcher is a pike vm: the pattern compiles to bytecode and the vm
+# advances every live thread one input byte at a time. nothing
+# backtracks, so a search is linear in the input for any pattern, and so
+# are find_all and replace_all (see "iterating over every match").
 #
-# supported: literals, `.` (any char but newline), classes [a-z0-9]
-# and [^...], escapes \d \w \s \D \W \S \t \n and escaped metas,
-# quantifiers * + ? (greedy), alternation |, capturing groups (...),
-# and anchors ^ $. not supported: {n,m} counts, lazy quantifiers,
-# backreferences, lookaround.
+# supported: literals, `.` (any byte but newline), classes [a-z0-9] and
+# [^...], escapes \d \w \s \D \W \S \t \n \r \f \v and escaped
+# punctuation, greedy quantifiers * + ?, counted repeats {n} {n,} {n,m}
+# up to 1000, alternation |, capturing groups (...), non-capturing groups
+# (?:...), and anchors ^ $.
+#
+# compile refuses the rest with an error that names the feature: lazy and
+# possessive quantifiers, backreferences (\1 to \9 and \k), lookahead,
+# lookbehind, atomic groups, named groups, inline flags, word boundaries
+# \b \B, posix classes such as [:alpha:], and any other escaped letter or
+# digit. a `{` that does not start a well-formed counted repeat matches
+# itself, as in go, so `a{`, `a{,2}` and `{x}` are literal text.
 
 # instruction opcodes
 OP_CHAR := 0
@@ -21,6 +28,24 @@ OP_SAVE := 5
 OP_MATCH := 6
 OP_BOL := 7
 OP_EOL := 8
+
+# a pattern is usually dev-controlled, but a server that compiles a user-
+# supplied one must not be crashable by it: the parser recurses per group
+# nesting (deep nesting overflows the native stack) and quantifier handling is
+# superlinear in the pattern length. cap the length so both stay well below the
+# danger zone. real patterns are far shorter than this.
+MAX_PATTERN_LEN := 4096
+
+# the largest count a counted repeat may ask for, as in re2 and go.
+MAX_REPEAT := 1000
+
+# the most instructions a compiled pattern may hold. without counted
+# repeats a pattern of MAX_PATTERN_LEN characters stays below this. the
+# cap stops a nested repeat such as `(a{1000}){1000}` from expanding into
+# a million instructions, and it bounds how deep the vm recurses through
+# a chain of control instructions.
+MAX_PROGRAM_LEN := 12288
+TOO_LARGE := "pattern too large after expanding counted repeats"
 
 ## one compiled instruction: an opcode and up to two arguments.
 pub struct Inst:
@@ -61,6 +86,12 @@ fn c_peek(c: Compiler) -> String:
     if c.pos >= c.pattern.len():
         return ""
     return c.pattern[c.pos]
+
+# the pattern byte `ahead` places past the cursor, or "" past the end.
+fn c_peek_at(c: Compiler, ahead: Int) -> String:
+    if c.pos + ahead >= c.pattern.len():
+        return ""
+    return c.pattern[c.pos + ahead]
 
 fn c_emit(c: Compiler, op: Int, a: Int, b: Int) -> Int:
     c.insts.push(Inst(op, a, b))
@@ -106,7 +137,12 @@ fn parse_alt(c: Compiler):
         k = k + 1
 
 fn insert_split(c: Compiler, at: Int, alt_target: Int):
-    # insert OP_SPLIT at index `at`; all targets >= at shift by one
+    # insert OP_SPLIT at index `at`. every target past `at` moves up by
+    # one. a target equal to `at` moves too when it comes from the
+    # fragment starting there, such as the loop back of `a+`. from an
+    # instruction before `at` it means "go on to what follows", and that
+    # is now the new split. moving it would skip the split, so `a?b*`
+    # would demand a `b` after skipping the `a`.
     mut fixed: List[Inst] := []
     mut i := 0
     while i < c.insts.len():
@@ -114,9 +150,9 @@ fn insert_split(c: Compiler, at: Int, alt_target: Int):
         mut a := inst.a
         mut b := inst.b
         if inst.op == OP_JMP or inst.op == OP_SPLIT:
-            if a >= at:
+            if a > at or (a == at and i >= at):
                 a = a + 1
-            if inst.op == OP_SPLIT and b >= at:
+            if inst.op == OP_SPLIT and (b > at or (b == at and i >= at)):
                 b = b + 1
         fixed.push(Inst(inst.op, a, b))
         i = i + 1
@@ -140,6 +176,8 @@ fn parse_concat(c: Compiler):
         if ch == "" or ch == "|" or ch == ")":
             return
         parse_repeat(c)
+        if c.insts.len() > MAX_PROGRAM_LEN:
+            c_fail(c, TOO_LARGE)
 
 fn parse_repeat(c: Compiler):
     atom_start := c.insts.len()
@@ -147,7 +185,14 @@ fn parse_repeat(c: Compiler):
     if c.error != "":
         return
     ch := c_peek(c)
-    if ch == "*":
+    if ch == "{{":
+        count := scan_count(c)
+        if count.min < 0:
+            # not a counted repeat: the `{` stays a literal for the next atom
+            return
+        c.pos = count.end
+        expand_count(c, atom_start, count.min, count.max)
+    elif ch == "*":
         c.pos = c.pos + 1
         # split(body, out) before atom; jmp back after
         insert_split(c, atom_start, 0)
@@ -163,20 +208,160 @@ fn parse_repeat(c: Compiler):
         insert_split(c, atom_start, 0)
         end_pc := c.insts.len()
         c.insts[atom_start] = Inst(OP_SPLIT, atom_start + 1, end_pc)
+    else:
+        return
+    check_after_quantifier(c)
+
+# a quantifier must not be followed by another one. `?` and `+` after a
+# quantifier spell the lazy and possessive forms in other engines; refuse
+# them by name so they do not read as a stray quantifier.
+fn check_after_quantifier(c: Compiler):
+    next := c_peek(c)
+    if next == "?":
+        c_fail(c, "lazy quantifiers are not supported")
+    elif next == "+":
+        c_fail(c, "possessive quantifiers are not supported")
+    elif next == "*" or (next == "{{" and scan_count(c).min >= 0):
+        c_fail(c, "quantifier follows another quantifier")
+
+# the bounds of a counted repeat, and the pattern offset just past its `}`.
+# `min` is -1 when the text at the cursor is not a counted repeat; `max`
+# is -1 for an open upper bound.
+struct Count:
+    min: Int
+    max: Int
+    end: Int
+
+# read `{n}`, `{n,}` or `{n,m}` at the cursor without moving it. any other
+# text after a `{` is not a repeat, and the `{` matches itself, as in go.
+fn scan_count(c: Compiler) -> Count:
+    p := c.pattern
+    mut i := c.pos + 1
+    lo_start := i
+    mut lo := 0
+    while i < p.len() and is_digit(p[i]):
+        lo = digit_push(lo, p[i])
+        i = i + 1
+    if i == lo_start or i >= p.len():
+        return Count(0 - 1, 0, 0)
+    if p[i] == "}}":
+        return Count(lo, lo, i + 1)
+    if p[i] != ",":
+        return Count(0 - 1, 0, 0)
+    i = i + 1
+    hi_start := i
+    mut hi := 0
+    while i < p.len() and is_digit(p[i]):
+        hi = digit_push(hi, p[i])
+        i = i + 1
+    if i >= p.len() or p[i] != "}}":
+        return Count(0 - 1, 0, 0)
+    if i == hi_start:
+        return Count(lo, 0 - 1, i + 1)
+    return Count(lo, hi, i + 1)
+
+fn is_digit(ch: String) -> Bool:
+    return ch >= "0" and ch <= "9"
+
+# append a digit, saturating well above MAX_REPEAT so a long run of digits
+# cannot overflow.
+fn digit_push(value: Int, ch: String) -> Int:
+    if value > MAX_REPEAT * 10:
+        return value
+    return value * 10 + ord(ch) - 48
+
+# expand the fragment from atom_start to the end of the program into a
+# counted repeat by copying it. `x{2,4}` becomes `xx(x(x)?)?` and `x{2,}`
+# becomes `xx+`, the shapes re2 uses. every copy saves to the same group
+# slots, so a group inside the repeat reports its last iteration.
+fn expand_count(c: Compiler, atom_start: Int, lo: Int, hi: Int):
+    if lo > MAX_REPEAT or hi > MAX_REPEAT:
+        c_fail(c, "repeat count above 1000")
+        return
+    if hi >= 0 and hi < lo:
+        c_fail(c, "repeat count maximum below its minimum")
+        return
+    mut frag: List[Inst] := []
+    mut i := atom_start
+    while i < c.insts.len():
+        frag.push(c.insts[i])
+        i = i + 1
+    mut copies := lo
+    if hi > lo:
+        copies = hi
+    elif hi < 0 and lo == 0:
+        copies = 1
+    if atom_start + copies * (frag.len() + 1) > MAX_PROGRAM_LEN:
+        c_fail(c, TOO_LARGE)
+        return
+    while c.insts.len() > atom_start:
+        c.insts.remove(c.insts.len() - 1)
+    if hi < 0:
+        if lo == 0:
+            # x{0,} is x*
+            split_pc := c_emit(c, OP_SPLIT, 0, 0)
+            copy_fragment(c, frag, atom_start)
+            c_emit(c, OP_JMP, split_pc, 0)
+            c.insts[split_pc] = Inst(OP_SPLIT, split_pc + 1, c.insts.len())
+            return
+        # x{n,} is n - 1 copies of x, then x+
+        mut k := 1
+        while k < lo:
+            copy_fragment(c, frag, atom_start)
+            k = k + 1
+        last := c.insts.len()
+        copy_fragment(c, frag, atom_start)
+        c_emit(c, OP_SPLIT, last, c.insts.len() + 1)
+        return
+    mut k := 0
+    while k < lo:
+        copy_fragment(c, frag, atom_start)
+        k = k + 1
+    # each optional copy may skip straight to the end, which nests them
+    mut splits: List[Int] := []
+    while k < hi:
+        splits.push(c_emit(c, OP_SPLIT, 0, 0))
+        copy_fragment(c, frag, atom_start)
+        k = k + 1
+    end_pc := c.insts.len()
+    for s in splits:
+        c.insts[s] = Inst(OP_SPLIT, s + 1, end_pc)
+
+# append a copy of a fragment that was compiled at `origin`, moving its jump
+# targets along with it. every target in a fragment falls inside it or at
+# its end.
+fn copy_fragment(c: Compiler, frag: List[Inst], origin: Int):
+    shift := c.insts.len() - origin
+    for inst in frag:
+        if inst.op == OP_JMP:
+            c.insts.push(Inst(OP_JMP, inst.a + shift, 0))
+        elif inst.op == OP_SPLIT:
+            c.insts.push(Inst(OP_SPLIT, inst.a + shift, inst.b + shift))
+        else:
+            c.insts.push(inst)
 
 fn parse_atom(c: Compiler):
     ch := c_peek(c)
     if ch == "(":
         c.pos = c.pos + 1
+        mut capture := true
+        if c_peek(c) == "?":
+            if not group_kind_supported(c):
+                return
+            # `(?:` groups without capturing
+            c.pos = c.pos + 2
+            capture = false
         group := c.ngroups
-        c.ngroups = c.ngroups + 1
-        c_emit(c, OP_SAVE, group * 2, 0)
+        if capture:
+            c.ngroups = c.ngroups + 1
+            c_emit(c, OP_SAVE, group * 2, 0)
         parse_alt(c)
         if c_peek(c) != ")":
             c_fail(c, "unclosed group")
             return
         c.pos = c.pos + 1
-        c_emit(c, OP_SAVE, group * 2 + 1, 0)
+        if capture:
+            c_emit(c, OP_SAVE, group * 2 + 1, 0)
         return
     if ch == "[":
         parse_class(c)
@@ -196,35 +381,122 @@ fn parse_atom(c: Compiler):
     if ch == chr(92):
         c.pos = c.pos + 1
         esc := c_peek(c)
-        if esc == "":
-            c_fail(c, "trailing backslash")
+        problem := escape_problem(esc)
+        if problem != "":
+            c_fail(c, problem)
             return
         c.pos = c.pos + 1
         emit_escape(c, esc)
         return
-    if ch == "*" or ch == "+" or ch == "?":
+    if ch == "*" or ch == "+" or ch == "?" or (ch == "{{" and scan_count(c).min >= 0):
         c_fail(c, "quantifier with nothing to repeat")
         return
     c.pos = c.pos + 1
     c_emit(c, OP_CHAR, ord(ch), 0)
 
-fn emit_escape(c: Compiler, esc: String):
-    if esc == "d" or esc == "D":
-        c_emit(c, OP_CLASS, add_class(c, [48, 57], esc == "D"), 0)
-        return
-    if esc == "w" or esc == "W":
-        c_emit(c, OP_CLASS, add_class(c, [48, 57, 65, 90, 97, 122, 95, 95], esc == "W"), 0)
-        return
-    if esc == "s" or esc == "S":
-        c_emit(c, OP_CLASS, add_class(c, [32, 32, 9, 10, 13, 13], esc == "S"), 0)
-        return
+# the cursor is on the `?` of `(?`. only `(?:` is supported; name the
+# other forms so the error says what the pattern asked for.
+fn group_kind_supported(c: Compiler) -> Bool:
+    next := c_peek_at(c, 1)
+    if next == ":":
+        return true
+    after := c_peek_at(c, 2)
+    if next == "=" or next == "!":
+        c_fail(c, "lookahead is not supported")
+    elif next == "<" and (after == "=" or after == "!"):
+        c_fail(c, "lookbehind is not supported")
+    elif next == ">":
+        c_fail(c, "atomic groups are not supported")
+    elif next == "P" or next == "<" or next == "'":
+        c_fail(c, "named groups are not supported")
+    else:
+        c_fail(c, "group flags are not supported")
+    return false
+
+# the engine knows the shorthand classes, the control escapes and escaped
+# punctuation, which matches itself. any other escaped letter or digit is
+# refused: each one means something in other engines (a backreference, a
+# word boundary, a hex code) that matching it literally would get wrong.
+fn escape_problem(esc: String) -> String:
+    if esc == "":
+        return "trailing backslash"
+    if "dDwWsStnrfv".contains(esc):
+        return ""
+    if (esc >= "1" and esc <= "9") or esc == "k":
+        return "backreferences are not supported"
+    if esc == "b" or esc == "B":
+        return "word boundaries are not supported"
+    if is_digit(esc) or (esc >= "a" and esc <= "z") or (esc >= "A" and esc <= "Z"):
+        return "unsupported escape " + chr(92) + esc
+    return ""
+
+# the byte an escape stands for, for the escapes that name one.
+fn escape_code(esc: String) -> Int:
     if esc == "t":
-        c_emit(c, OP_CHAR, 9, 0)
-        return
+        return 9
     if esc == "n":
-        c_emit(c, OP_CHAR, 10, 0)
+        return 10
+    if esc == "r":
+        return 13
+    if esc == "f":
+        return 12
+    if esc == "v":
+        return 11
+    return ord(esc)
+
+# the ranges of a shorthand class \d \w \s, before any negation.
+fn shorthand_ranges(esc: String) -> List[Int]:
+    lower := esc.to_lower()
+    if lower == "d":
+        return [48, 57]
+    if lower == "w":
+        return [48, 57, 65, 90, 97, 122, 95, 95]
+    return [32, 32, 9, 10, 13, 13]
+
+fn is_shorthand(esc: String) -> Bool:
+    return "dDwWsS".contains(esc)
+
+# the byte ranges outside `ranges`. the vm compares single bytes, so the
+# complement of a class is taken over 0 to 255.
+fn complement(ranges: List[Int]) -> List[Int]:
+    mut hit: List[Bool] := []
+    while hit.len() < 256:
+        hit.push(false)
+    mut i := 0
+    while i + 1 < ranges.len():
+        mut code := ranges[i]
+        while code <= ranges[i + 1] and code < 256:
+            hit[code] = true
+            code = code + 1
+        i = i + 2
+    mut out: List[Int] := []
+    mut code := 0
+    while code < 256:
+        if not hit[code]:
+            lo := code
+            while code + 1 < 256 and not hit[code + 1]:
+                code = code + 1
+            out.push(lo)
+            out.push(code)
+        code = code + 1
+    return out
+
+fn emit_escape(c: Compiler, esc: String):
+    if is_shorthand(esc):
+        negate := esc == "D" or esc == "W" or esc == "S"
+        c_emit(c, OP_CLASS, add_class(c, shorthand_ranges(esc), negate), 0)
         return
-    c_emit(c, OP_CHAR, ord(esc), 0)
+    c_emit(c, OP_CHAR, escape_code(esc), 0)
+
+# true when the cursor starts a posix class name such as `[:alpha:]`.
+fn at_posix_class(c: Compiler) -> Bool:
+    p := c.pattern
+    if c.pos + 1 >= p.len() or p[c.pos + 1] != ":":
+        return false
+    mut i := c.pos + 2
+    while i < p.len() and ((p[i] >= "a" and p[i] <= "z") or p[i] == "^"):
+        i = i + 1
+    return i + 1 < p.len() and i > c.pos + 2 and p[i] == ":" and p[i + 1] == "]"
 
 fn add_class(c: Compiler, ranges: List[Int], negate: Bool) -> Int:
     c.classes.push(ClassDef(ranges, negate))
@@ -246,35 +518,24 @@ fn parse_class(c: Compiler):
         elif ch == chr(92):
             c.pos = c.pos + 1
             esc := c_peek(c)
+            problem := escape_problem(esc)
+            if problem != "":
+                c_fail(c, problem)
+                return
             c.pos = c.pos + 1
-            if esc == "d":
-                ranges.push(48)
-                ranges.push(57)
-            elif esc == "w":
-                ranges.push(48)
-                ranges.push(57)
-                ranges.push(65)
-                ranges.push(90)
-                ranges.push(97)
-                ranges.push(122)
-                ranges.push(95)
-                ranges.push(95)
-            elif esc == "s":
-                ranges.push(32)
-                ranges.push(32)
-                ranges.push(9)
-                ranges.push(10)
-                ranges.push(13)
-                ranges.push(13)
-            elif esc == "t":
-                ranges.push(9)
-                ranges.push(9)
-            elif esc == "n":
-                ranges.push(10)
-                ranges.push(10)
+            mut add: List[Int] := []
+            if is_shorthand(esc):
+                add = shorthand_ranges(esc)
+                if esc == "D" or esc == "W" or esc == "S":
+                    add = complement(add)
             else:
-                ranges.push(ord(esc))
-                ranges.push(ord(esc))
+                code := escape_code(esc)
+                add = [code, code]
+            for v in add:
+                ranges.push(v)
+        elif ch == "[" and at_posix_class(c):
+            c_fail(c, "posix classes such as [:alpha:] are not supported")
+            return
         else:
             lo := ord(ch)
             c.pos = c.pos + 1
@@ -294,13 +555,6 @@ fn parse_class(c: Compiler):
         c_fail(c, "unclosed class")
         return
     c_emit(c, OP_CLASS, add_class(c, ranges, negate), 0)
-
-# a pattern is usually dev-controlled, but a server that compiles a user-
-# supplied one must not be crashable by it: the parser recurses per group
-# nesting (deep nesting overflows the native stack) and quantifier handling is
-# superlinear in the pattern length. cap the length so both stay well below the
-# danger zone — real patterns are far shorter than this.
-MAX_PATTERN_LEN := 4096
 
 ## compile a pattern; errors carry the offending position.
 pub fn compile(pattern: String) -> Regex!:
@@ -503,6 +757,267 @@ fn slots_aligned(input: String, slots: List[Int]) -> Bool:
         i = i + 1
     return true
 
+# --- iterating over every match -------------------------------------------
+# find_all does not call search again after each match. a search ends
+# only when no thread that outranks its match is left. for `.*y|x` over a
+# run of `x` the `.*y` thread lives to the end of the input, so each search
+# would read the rest of the input and the loop would be quadratic.
+#
+# one backward pass records, for every position, which instructions can
+# still reach a match from there. with that table each step follows the
+# first thread, in priority order, that can still finish, which is the
+# thread the vm would report. a match costs its own length, a start offset
+# with no match costs one table lookup, and the iteration is linear in the
+# input. the one exception is a match that ends inside a multi-byte
+# character: it is rejected, as in search, and the walk from the next
+# start reads those bytes again.
+#
+# the instructions that read input or match are the "leaves" here. the
+# table holds one bit per leaf and position, packed LEAF_BITS to an Int.
+
+LEAF_BITS := 62
+
+struct Scan:
+    re: Regex
+    input: String
+    leaf_of: List[Int]
+    words: Int
+    # per leaf, the leaves reachable through control instructions after
+    # it reads a character: one set for a step inside the input and one
+    # for a step onto its end, where `$` holds.
+    next_inner: List[Int]
+    next_end: List[Int]
+    # the leaves reachable from pc 0, for each combination of being at
+    # the start and at the end of the input: index start * 2 + end.
+    entry: List[Int]
+    # the leaves that can still reach a match, per position: (n + 1) rows
+    live: List[Int]
+    # visit marks for the walk through control instructions
+    mark: List[Int]
+    step: Int
+
+fn has_bit(set: List[Int], base: Int, leaf: Int) -> Bool:
+    return bit_and(set[base + leaf / LEAF_BITS], bit_shl(1, leaf % LEAF_BITS)) != 0
+
+fn set_bit(set: List[Int], base: Int, leaf: Int):
+    i := base + leaf / LEAF_BITS
+    set[i] = bit_or(set[i], bit_shl(1, leaf % LEAF_BITS))
+
+fn intersects(a: List[Int], a_base: Int, b: List[Int], b_base: Int, words: Int) -> Bool:
+    mut w := 0
+    while w < words:
+        if bit_and(a[a_base + w], b[b_base + w]) != 0:
+            return true
+        w = w + 1
+    return false
+
+fn zeros(count: Int) -> List[Int]:
+    mut out: List[Int] := []
+    while out.len() < count:
+        out.push(0)
+    return out
+
+# the leaves reachable from pc through control instructions, appended to
+# `out` as `words` Ints.
+fn push_closure(re: Regex, leaf_of: List[Int], words: Int, pc: Int, at_start: Bool, at_end: Bool, out: List[Int]):
+    base := out.len()
+    mut w := 0
+    while w < words:
+        out.push(0)
+        w = w + 1
+    mut visited: Set[Int] := {}
+    mut stack: List[Int] := [pc]
+    while stack.len() > 0:
+        at := stack[stack.len() - 1]
+        stack.remove(stack.len() - 1)
+        if visited.contains(at):
+            continue
+        visited.add(at)
+        inst := re.insts[at]
+        if inst.op == OP_JMP:
+            stack.push(inst.a)
+        elif inst.op == OP_SPLIT:
+            stack.push(inst.a)
+            stack.push(inst.b)
+        elif inst.op == OP_SAVE:
+            stack.push(at + 1)
+        elif inst.op == OP_BOL:
+            if at_start:
+                stack.push(at + 1)
+        elif inst.op == OP_EOL:
+            if at_end:
+                stack.push(at + 1)
+        else:
+            set_bit(out, base, leaf_of[at])
+
+fn reads_byte(re: Regex, inst: Inst, code: Int) -> Bool:
+    if inst.op == OP_CHAR:
+        return code == inst.a
+    if inst.op == OP_ANY:
+        return code != 10
+    if inst.op == OP_CLASS:
+        return class_matches(re.classes[inst.a], code)
+    return false
+
+fn new_scan(re: Regex, input: String) -> Scan:
+    mut leaf_of: List[Int] := []
+    mut leaves: List[Int] := []
+    mut pc := 0
+    while pc < re.insts.len():
+        op := re.insts[pc].op
+        if op == OP_CHAR or op == OP_ANY or op == OP_CLASS or op == OP_MATCH:
+            leaf_of.push(leaves.len())
+            leaves.push(pc)
+        else:
+            leaf_of.push(0 - 1)
+        pc = pc + 1
+    words := (leaves.len() + LEAF_BITS - 1) / LEAF_BITS
+    mut next_inner: List[Int] := []
+    mut next_end: List[Int] := []
+    for leaf_pc in leaves:
+        if re.insts[leaf_pc].op == OP_MATCH:
+            # nothing follows a match; keep the rows aligned
+            push_closure(re, leaf_of, words, leaf_pc, false, false, next_inner)
+            push_closure(re, leaf_of, words, leaf_pc, false, true, next_end)
+        else:
+            push_closure(re, leaf_of, words, leaf_pc + 1, false, false, next_inner)
+            push_closure(re, leaf_of, words, leaf_pc + 1, false, true, next_end)
+    mut entry: List[Int] := []
+    push_closure(re, leaf_of, words, 0, false, false, entry)
+    push_closure(re, leaf_of, words, 0, false, true, entry)
+    push_closure(re, leaf_of, words, 0, true, false, entry)
+    push_closure(re, leaf_of, words, 0, true, true, entry)
+    # the backward pass. a match instruction succeeds wherever it is
+    # reached; a reading leaf can finish at pos when it accepts the byte
+    # there and some leaf after it can finish at pos + 1.
+    n := input.len()
+    live := zeros((n + 1) * words)
+    mut matches: List[Int] := []
+    mut leaf := 0
+    while leaf < leaves.len():
+        if re.insts[leaves[leaf]].op == OP_MATCH:
+            matches.push(leaf)
+        leaf = leaf + 1
+    for m in matches:
+        set_bit(live, n * words, m)
+    mut pos := n - 1
+    while pos >= 0:
+        code := ord(input[pos])
+        row := pos * words
+        next_row := row + words
+        mut next := next_inner
+        if pos + 1 == n:
+            next = next_end
+        leaf = 0
+        while leaf < leaves.len():
+            inst := re.insts[leaves[leaf]]
+            if reads_byte(re, inst, code) and intersects(next, leaf * words, live, next_row, words):
+                set_bit(live, row, leaf)
+            leaf = leaf + 1
+        for m in matches:
+            set_bit(live, row, m)
+        pos = pos - 1
+    return Scan(re, input, leaf_of, words, next_inner, next_end, entry, live, zeros(re.insts.len()), 0)
+
+# follow control instructions from pc at pos in priority order and return
+# the first leaf that can still finish, or -1. the save instructions on
+# the way to that leaf record pos into slots.
+fn pick(s: Scan, pc: Int, pos: Int, slots: List[Int]) -> Int:
+    if s.mark[pc] == s.step:
+        return 0 - 1
+    s.mark[pc] = s.step
+    inst := s.re.insts[pc]
+    if inst.op == OP_JMP:
+        return pick(s, inst.a, pos, slots)
+    if inst.op == OP_SPLIT:
+        first := pick(s, inst.a, pos, slots)
+        if first >= 0:
+            return first
+        return pick(s, inst.b, pos, slots)
+    if inst.op == OP_SAVE:
+        leaf := pick(s, pc + 1, pos, slots)
+        if leaf >= 0:
+            slots[inst.a] = pos
+        return leaf
+    if inst.op == OP_BOL:
+        if pos != 0:
+            return 0 - 1
+        return pick(s, pc + 1, pos, slots)
+    if inst.op == OP_EOL:
+        if pos != s.input.len():
+            return 0 - 1
+        return pick(s, pc + 1, pos, slots)
+    if has_bit(s.live, pos * s.words, s.leaf_of[pc]):
+        return pc
+    return 0 - 1
+
+# the match that starts at `start`, as capture slots, or an empty list.
+# once the entry check passes, every step finds a leaf that can finish,
+# so the walk reads exactly the characters of the match.
+fn walk(s: Scan, start: Int) -> List[Int]:
+    mut at_start := 0
+    if start == 0:
+        at_start = 1
+    mut at_end := 0
+    if start == s.input.len():
+        at_end = 1
+    if not intersects(s.entry, (at_start * 2 + at_end) * s.words, s.live, start * s.words, s.words):
+        return []
+    mut slots: List[Int] := []
+    while slots.len() < s.re.ngroups * 2:
+        slots.push(0 - 1)
+    mut pc := 0
+    mut pos := start
+    while true:
+        s.step = s.step + 1
+        leaf := pick(s, pc, pos, slots)
+        if leaf < 0:
+            return []
+        if s.re.insts[leaf].op == OP_MATCH:
+            return slots
+        pc = leaf + 1
+        pos = pos + 1
+    return []
+
+# the leftmost match at or after `start` whose offsets fall on character
+# boundaries, the same answer search gives.
+fn scan_search(s: Scan, start: Int) -> List[Int]:
+    n := s.input.len()
+    mut at := start
+    while at <= n:
+        if on_boundary(s.input, at):
+            slots := walk(s, at)
+            if slots.len() >= 2 and slots_aligned(s.input, slots):
+                return slots
+        at = at + 1
+    return []
+
+# every match as a flat list of start, stop pairs. after a match the next
+# search starts where it ended. an empty match moves the search one
+# character on, and an empty match right where the previous match ended
+# is dropped, as in go: `a*` over "baaac" yields 0-0, 1-4 and 5-5.
+fn match_spans(re: Regex, input: String) -> List[Int]:
+    s := new_scan(re, input)
+    mut out: List[Int] := []
+    mut pos := 0
+    mut prev_end := 0 - 1
+    while pos <= input.len():
+        slots := scan_search(s, pos)
+        if slots.len() < 2:
+            return out
+        mut accept := true
+        if slots[1] == pos:
+            if slots[0] == prev_end:
+                accept = false
+            pos = pos + 1
+        else:
+            pos = slots[1]
+        prev_end = slots[1]
+        if accept:
+            out.push(slots[0])
+            out.push(slots[1])
+    return out
+
 impl Regex:
     ## true when the pattern matches anywhere in the input.
     pub fn is_match(input: String) -> Bool:
@@ -533,33 +1048,31 @@ impl Regex:
             g = g + 1
         return out
 
-    ## every non-overlapping match, left to right.
+    ## every non-overlapping match, left to right, in time linear in the
+    ## input. an empty match right after the previous match is skipped.
     pub fn find_all(input: String) -> List[Match]:
+        spans := match_spans(self, input)
         mut out: List[Match] := []
-        mut start := 0
-        while start <= input.len():
-            slots := search(self, input, start)
-            if slots.len() < 2:
-                return out
-            stop := slots[1]
-            out.push(Match(slots[0], stop, input.substring(slots[0], stop)))
-            if stop == slots[0]:
-                start = stop + 1
-            else:
-                start = stop
+        mut i := 0
+        while i < spans.len():
+            out.push(Match(spans[i], spans[i + 1], input.substring(spans[i], spans[i + 1])))
+            i = i + 2
         return out
 
-    ## replace every match with the replacement text.
+    ## replace every match that find_all reports with the replacement text.
     pub fn replace_all(input: String, replacement: String) -> String:
         # collect the pieces and join once at the end: appending each segment
         # to the result string recopied everything accumulated so far, which
         # made replacement quadratic in the number of matches.
+        spans := match_spans(self, input)
         mut parts: List[String] := []
         mut last := 0
-        for m in self.find_all(input):
-            parts.push(input.substring(last, m.start))
+        mut i := 0
+        while i < spans.len():
+            parts.push(input.substring(last, spans[i]))
             parts.push(replacement)
-            last = m.stop
+            last = spans[i + 1]
+            i = i + 2
         parts.push(input.substring(last, input.len()))
         return parts.join("")
 
@@ -666,3 +1179,97 @@ test "compile rejects an oversized pattern":
     # (deep nesting) or run the superlinear quantifier path.
     assert(compile("a".repeat(MAX_PATTERN_LEN + 1)).is_err)
     assert(compile("a".repeat(16)).is_ok)
+
+fn spans_of(pattern: String, input: String) -> String:
+    re := compile(pattern) catch e:
+        return e
+    mut out: List[String] := []
+    for m in re.find_all(input):
+        out.push("{m.start}-{m.stop}")
+    return out.join(" ")
+
+fn compile_error(pattern: String) -> String:
+    compiled := compile(pattern)
+    if compiled.is_ok:
+        return "compiled"
+    return compiled.err
+
+test "counted repeats match the counted number of times":
+    assert(compile("^a{{2}}$")!.is_match("aa"))
+    assert(not compile("^a{{2}}$")!.is_match("a{{2}}"))
+    assert_eq(compile("a{{2,3}}")!.find("aaaa").value().text, "aaa")
+    assert(not compile("^a{{2,3}}$")!.is_match("a"))
+    assert(compile("^(ab){{2,}}$")!.is_match("ababab"))
+    assert(not compile("^(ab){{2,}}$")!.is_match("ab"))
+    assert(compile("^xa{{0}}y$")!.is_match("xy"))
+    assert(compile("^a{{0,}}$")!.is_match("aaa"))
+    assert(compile("^[0-9]{{3}}-[0-9]{{4}}$")!.is_match("555-1234"))
+    assert_eq(spans_of("a{{2}}", "aaaaa"), "0-2 2-4")
+
+test "a group inside a counted repeat captures its last iteration":
+    caps := compile("(\\w){{3}}")!.captures("abcd")?
+    assert_eq(caps, ["abc", "c"])
+    opt := compile("(a){{0,2}}b")!.captures("b")?
+    assert_eq(opt, ["b", ""])
+
+test "a brace that does not start a counted repeat is a literal":
+    assert(compile("a{{")!.is_match("a{{"))
+    assert(compile("a{{,2}}")!.is_match("a{{,2}}"))
+    assert(compile("{{x}}")!.is_match("{{x}}"))
+    assert(compile("x{{}}")!.is_match("x{{}}"))
+    assert(compile("a{{2")!.is_match("a{{2"))
+    assert(compile("a{{ 2}}")!.is_match("a{{ 2}}"))
+    assert(compile("\\{{2}}")!.is_match("{{2}}"))
+
+test "compile names the syntax it does not support":
+    assert(compile_error("(a)\\1").starts_with("backreferences are not supported"))
+    assert(compile_error("\\k<n>").starts_with("backreferences are not supported"))
+    assert(compile_error("a*?").starts_with("lazy quantifiers are not supported"))
+    assert(compile_error("a+?").starts_with("lazy quantifiers are not supported"))
+    assert(compile_error("a??").starts_with("lazy quantifiers are not supported"))
+    assert(compile_error("a{{1,2}}?").starts_with("lazy quantifiers are not supported"))
+    assert(compile_error("a*+").starts_with("possessive quantifiers are not supported"))
+    assert(compile_error("a{{2}}+").starts_with("possessive quantifiers are not supported"))
+    assert(compile_error("a(?=b)").starts_with("lookahead is not supported"))
+    assert(compile_error("a(?!b)").starts_with("lookahead is not supported"))
+    assert(compile_error("(?<=a)b").starts_with("lookbehind is not supported"))
+    assert(compile_error("(?<!a)b").starts_with("lookbehind is not supported"))
+    assert(compile_error("(?>a)").starts_with("atomic groups are not supported"))
+    assert(compile_error("(?P<n>a)").starts_with("named groups are not supported"))
+    assert(compile_error("(?<n>a)").starts_with("named groups are not supported"))
+    assert(compile_error("(?i)a").starts_with("group flags are not supported"))
+    assert(compile_error("\\bword").starts_with("word boundaries are not supported"))
+    assert(compile_error("\\x41").starts_with("unsupported escape"))
+    assert(compile_error("[\\1]").starts_with("backreferences are not supported"))
+    assert(compile_error("[[:alpha:]]").starts_with("posix classes"))
+    assert(compile_error("a**").starts_with("quantifier follows another quantifier"))
+    assert(compile_error("a{{2}}{{3}}").starts_with("quantifier follows another quantifier"))
+    assert(compile_error("{{2}}").starts_with("quantifier with nothing to repeat"))
+    assert(compile_error("a{{1001}}").starts_with("repeat count above 1000"))
+    assert(compile_error("a{{3,2}}").starts_with("repeat count maximum below its minimum"))
+    assert(compile_error("((a{{200}}){{100}})").starts_with("pattern too large"))
+    assert_eq(compile_error("(a)\\1"), "backreferences are not supported at position 4")
+
+test "non-capturing groups, control escapes and negated shorthands in classes":
+    caps := compile("(?:ab)+(c)")!.captures("ababc")?
+    assert_eq(caps, ["ababc", "c"])
+    assert(compile("a\\r\\n")!.is_match("a\r\n"))
+    assert(compile("^[\\D]+$")!.is_match("ab-"))
+    assert(not compile("[\\D]")!.is_match("123"))
+    assert(compile("^[^\\W]+$")!.is_match("abc_1"))
+
+test "an optional atom before a star can skip both":
+    assert_eq(compile("a?b*")!.find("xbb").value().start, 0)
+    assert(compile("^a?(?:b|c)$")!.is_match("c"))
+
+test "find_all drops an empty match right after a match, as go does":
+    assert_eq(spans_of("a*", "baaac"), "0-0 1-4 5-5")
+    assert_eq(spans_of("x*", "abc"), "0-0 1-1 2-2 3-3")
+    assert_eq(spans_of("a|", "aab"), "0-1 1-2 3-3")
+    assert_eq(compile("a*")!.replace_all("baaac", "-"), "-b-c-")
+    assert_eq(compile("$")!.replace_all("ab", "!"), "ab!")
+
+test "find_all reports every match a search that outlives its match finds":
+    assert_eq(spans_of(".*y|x", "xxx"), "0-1 1-2 2-3")
+    assert_eq(spans_of(".*y|x", "xxyx"), "0-3 3-4")
+    assert_eq(compile(".*y|x")!.find_all("x".repeat(5000)).len(), 5000)

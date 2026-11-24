@@ -1,5 +1,5 @@
 # the regex engine: matching, captures, find_all, replace_all across
-# the supported syntax.
+# the supported syntax, and the compile errors for the syntax it refuses.
 import std.regex as regex
 
 fn check(pattern: String, input: String, want: Bool) -> Int:
@@ -50,4 +50,30 @@ fn main() -> Int!:
     bad := regex.compile("(unclosed")
     if bad.is_err:
         print("compile error: {bad.err}")
+
+    # counted repeats, and a `{` that does not start one, which is literal
+    ok = 0
+    ok = ok + check("^a{{2}}$", "aa", true)
+    ok = ok + check("^a{{2}}$", "a{{2}}", false)
+    ok = ok + check("^a{{2,3}}$", "aaa", true)
+    ok = ok + check("^a{{2,3}}$", "aaaa", false)
+    ok = ok + check("^(ab){{2,}}$", "ababab", true)
+    ok = ok + check("^\\d{{3}}-\\d{{4}}$", "555-1234", true)
+    ok = ok + check("a{{", "a{{", true)
+    ok = ok + check("a{{,2}}", "a{{,2}}", true)
+    ok = ok + check("{{x}}", "{{x}}", true)
+    ok = ok + check("a{{2", "a{{2", true)
+    print("counted and literal braces: {ok} of 10")
+
+    for pattern in ["a{{2,3}}?", "a*+", "(a)\\1", "(?=a)", "(?<!a)", "(?>a)", "(?P<n>a)", "\\bx", "\\x41", "a{{1001}}", "a{{3,2}}"]:
+        refused := regex.compile(pattern)
+        if refused.is_err:
+            print("refused {pattern}: {refused.err}")
+        else:
+            print("MISSING ERROR for {pattern}")
+
+    # an empty match right after a match is skipped, as in go
+    for m in regex.compile("a*")!.find_all("baaac"):
+        print("a* in baaac: [{m.start},{m.stop})")
+    print(regex.compile("a*")!.replace_all("baaac", "-"))
     return 0

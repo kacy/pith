@@ -66,7 +66,11 @@ variables:
   its own. so it gets storage of its own for the length of the body,
   which keeps it out of the slot a local of the same name uses — where
   the rebind's release-the-old, and the exit cleanup on an early
-  return, would drop a count the loop never took. the one exception is
+  return, would drop a count the loop never took. a `return` or `fail`
+  of the loop variable retains it like any other borrow and leaves a
+  local of the same name in the exit cleanup, and a `defer` written
+  before the loop reads that local even when an exit inside the body
+  runs it. the one exception is
   a loop over a string: `char_at` mints a fresh one-byte string per
   iteration and no container holds it, so the loop owns that count.
   the slot is released at the step label (which `continue` reaches)

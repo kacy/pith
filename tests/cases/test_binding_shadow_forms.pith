@@ -1,15 +1,16 @@
 # the inner-scope bindings that may reuse a name bound outside them, and what
 # each one must leave alone. a function has one slot per name, so a nested
 # binding that reuses an enclosing local's name is refused (E262, pinned in
-# tests/diagnostics/cases/nested_binding_forms.pith). what stays legal is what
-# does get storage of its own:
+# tests/diagnostics/cases/nested_binding_forms.pith). these stay legal:
 #
 # - a `for` variable, which has a slot for the length of the loop. a defer
 #   written outside the loop reads the function's own slot even when an early
-#   return runs it inside the loop body.
+#   return runs it inside the loop body, and returning the loop variable still
+#   releases the local it shadows.
 # - a closure parameter, and a binding in a closure body that the closure does
 #   not capture from outside: the closure is a function of its own.
-# - sibling blocks, which never enclose one another.
+# - bindings in sibling blocks, which never enclose one another and share a
+#   slot.
 #
 # the values are strings, lists and structs, so a slot released twice or not
 # at all shows up under memcheck.

@@ -1,7 +1,7 @@
 # std.markdown - commonmark to html, safe by default
 #
-# a commonmark 0.31.2 parser with an html renderer. the defaults are chosen for
-# the case that matters most, rendering text someone else wrote:
+# a commonmark 0.31.2 parser with an html renderer. the defaults suit text
+# someone else wrote:
 #
 #   import std.markdown as markdown
 #
@@ -68,7 +68,7 @@ pub MAX_NESTING := 32
 # `[a](b` repeated linear.
 MAX_LINK_PARENS := 32
 
-# the most characters a link label may hold between its brackets.
+# the most bytes a link label may hold between its brackets.
 MAX_LABEL_BYTES := 999
 
 # the reference expansion budget is the input size, but never less than this.
@@ -553,8 +553,6 @@ fn scan_link_label(source: String, position: Int) -> Int:
         if c == 91:
             return -1
         if c == 93:
-            if i - position - 1 > MAX_LABEL_BYTES:
-                return -1
             return i + 1
         i += 1
     return -1

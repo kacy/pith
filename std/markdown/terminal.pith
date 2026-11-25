@@ -22,7 +22,8 @@
 #     between the items of a loose list, as in the html.
 #   - tables with each column as wide as its widest cell, narrowed and
 #     wrapped to fit the width when they do not, and aligned as the
-#     delimiter row says.
+#     delimiter row says. a table with more columns than the width has room
+#     for at one column each runs past it.
 #   - footnote references as `[1]`, and the definitions after a rule at the
 #     end.
 #
@@ -969,3 +970,15 @@ test "every line fits at every width":
 test "an empty document is empty":
     assert_eq(plain("", 80), "")
     assert_eq(plain("\n\n", 80), "")
+
+test "large inputs lay out in linear time":
+    # a word far wider than a line, a long run of cjk text, many list
+    # items, a wide table and a long code line: each grows the work with
+    # its size and nothing more
+    assert(fits(plain("x".repeat(200000), 40), 40))
+    assert(fits(plain("日本".repeat(50000), 40), 40))
+    assert(fits(plain("- item\n".repeat(20000), 40), 40))
+    header := "|" + " h |".repeat(200) + "\n|" + " - |".repeat(200) + "\n"
+    assert(plain(header + ("|" + " c |".repeat(200) + "\n").repeat(200), 80).len() > 0)
+    assert(fits(plain("```\n" + "y".repeat(200000) + "\n```\n", 40), 40))
+    assert(fits(styled("```pith\n" + "z := 1 + ".repeat(20000) + "1\n```\n", 40), 40))

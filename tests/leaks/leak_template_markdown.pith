@@ -1,10 +1,11 @@
 # markdown through a template and through std.web.pages, over and over. a
 # round renders a template whose `<%md %>` tags write a document with and
 # without heading ids, lists its headings with markdown.toc, splits front
-# matter off it, and serves a page with yaml front matter through a layout,
-# which parses the yaml, copies it into the context and answers through
-# http.serve_content. a context node, a yaml node or a heading that is not
-# released moves the peak between the two round counts.
+# matter off it, and serves a page with yaml front matter and a block of pith
+# code through a layout, which parses the yaml, copies it into the context,
+# highlights the code and answers through http.serve_content. a context node,
+# a yaml node, a heading or a span that is not released moves the peak
+# between the two round counts.
 import leakprobe as probe
 import std.bytes as bytes
 import std.fs as fs
@@ -18,7 +19,7 @@ import std.web.pages as pages
 LAYOUT := "<title><%= title %></title><nav><% for h in toc %><a href=\"#<%= h.id %>\"><%= h.text %></a><% end %></nav><main><%md content %></main>"
 
 fn document(i: Int) -> String:
-    return "---\ntitle: round {i}\ntags: [a, b]\n---\n# Heading {i}\n\nsome *text* and a [link](/u) <b>raw</b>\n\n## Heading {i}\n\n- one\n- two\n"
+    return "---\ntitle: round {i}\ntags: [a, b]\n---\n# Heading {i}\n\nsome *text* and a [link](/u) <b>raw</b>\n\n## Heading {i}\n\n- one\n- two\n\n```pith\nn := {i} + 1\n```\n"
 
 fn request_for(path: String) -> http.HttpRequestBytes:
     return http.HttpRequestBytes(head: bytes.empty(), body: bytes.empty(), method_text: "GET", path_text: path, query_text: "", version_text: "HTTP/1.1", headers_text: "", body_text_cache: "", header_map: {}, query_map: {}, path_parts_cache: [])

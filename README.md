@@ -302,7 +302,8 @@ non-trivial pith look like."
 | `pith check <file>` | type check; `--json` for machine output |
 | `pith fmt <file>` | format; `--check` to verify |
 | `pith lint <file>` | conventions; `--json` available |
-| `pith doc <file>` | docs; `--check` requires every pub item documented |
+| `pith doc <file>` | api docs; `--check` requires every pub item documented, or that a `.md` file's pith code type checks |
+| `pith doc <topic>` | show a guide from `docs/` in the terminal, such as `pith doc markdown` |
 | `pith lsp` | language server over stdio |
 | `pith new <dir>` | scaffold a package |
 | `pith package <cmd>` | check, test, lint, doc, deps, lock, install, inspect, context |

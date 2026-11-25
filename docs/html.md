@@ -241,6 +241,9 @@ element text, where a `<div>` could go. in an attribute value, a tag, a
 comment, `<script>`, `<style>`, `<title>` or `<textarea>`, the template fails
 to compile. `heading_ids(true)` and `heading_anchors(true)` on a compiled
 template give the headings it renders ids and links to themselves.
+`code_highlighter(highlight.code_block)` highlights its pith code blocks. the
+template trusts what a highlighter returns the way it trusts `<%raw %>`, so the
+audit looks for `code_highlighter(` too.
 [docs/markdown.md](markdown.md) has the markdown side, and `std.web.pages`
 serves whole directories of markdown through a layout.
 

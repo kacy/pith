@@ -285,6 +285,7 @@ cases=(
   "tests/leaks/leak_json_optional_fields SHAPE=opt_items"
   "tests/leaks/leak_json_optional_fields SHAPE=opt_map"
   "tests/leaks/leak_json_optional_fields SHAPE=concat"
+  "tests/leaks/leak_json_optional_fields SHAPE=path"
   "tests/leaks/leak_json_optional_fields SHAPE=absent"
   "tests/leaks/leak_decode_optional_present SHAPE=toml"
   "tests/leaks/leak_decode_optional_present SHAPE=toml_nested"

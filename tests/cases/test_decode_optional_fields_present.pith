@@ -3,8 +3,12 @@
 # decoded struct being dropped when it was taken out first, and be released
 # with the struct on a decode that fails at a later field. json takes the
 # scalar-object path for the flat struct and the node path for the rest; toml,
-# yaml and config take the handle and config paths.
+# yaml and config take the handle and config paths. the path and file forms
+# at the end are handed a document and paths minted in the call, which the
+# decode releases once it is done with them.
 import std.json as json
+import std.fs as fs
+import std.os.path as os_path
 import std.toml as toml
 import std.yaml as yaml
 import std.config as config
@@ -47,6 +51,26 @@ fn take_note(i: Int) -> String?:
     if r.is_ok:
         return r.ok.note
     return none
+
+fn file_forms(key: String) -> Int!:
+    root := fs.make_temp_dir("pith-decode-optional-")!
+    assert(fs.write(os_path.join(root, "inner.json"), "\{\"label\":\"fl\",\"note\":\"fn\"\}")!)
+    assert(fs.write(os_path.join(root, "outer.json"), "\{\"inner\":\{\"label\":\"ol\"\}\}")!)
+    mut seen := 0
+    fd := json.decode_file[Inner](os_path.join(root, "inner.json"))
+    if fd.is_ok:
+        print("file {show_inner(fd.ok)}")
+        seen = seen + 1
+    fp := json.decode_file_path[Inner](os_path.join(root, "outer.json"), key + "")
+    if fp.is_ok:
+        print("file path {show_inner(fp.ok)}")
+        seen = seen + 1
+    gone := json.decode_file[Inner](os_path.join(root, "missing.json"))
+    if gone.is_err:
+        print("missing file refused")
+        seen = seen + 1
+    assert(fs.remove_tree(root))
+    return seen
 
 fn main():
     f := json.decode_text[Flat]("\{\"id\":1,\"count\":3,\"ratio\":1.5,\"flag\":true,\"note\":\"hello\",\"name\":\"p\"\}")
@@ -92,3 +116,10 @@ fn main():
     c := config.from_toml_typed[Srv]("host = \"h\"\nnote = \"config note\"\nport = 5\n")
     if c.is_ok:
         print("config {c.ok.host} {show_note(c.ok.note)} {c.ok.port}")
+
+    key := "inner"
+    pt := json.decode_text_path[Inner]("\{\"inner\":\{\"label\":\"pl\",\"note\":\"pn\"\}\}", key + "")
+    if pt.is_ok:
+        print("text path {show_inner(pt.ok)}")
+    files := file_forms(key) catch 0
+    print("file forms {files}")

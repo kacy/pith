@@ -10,7 +10,8 @@
 # every document is an interpolation handed straight to decode_text, and
 # SHAPE=concat hands it a concatenation. the decode released a text argument
 # only when a call minted it, so both kinds stranded the document, about 60
-# bytes per decode.
+# bytes per decode. SHAPE=path hands decode_text_path an interpolated document
+# and a concatenated path, neither of which it released at all.
 import std.json as json
 import leakprobe as probe
 
@@ -85,6 +86,10 @@ fn decode_present(shape: String, i: Int) -> Int:
         r := json.decode_text[Flat]("\{\"id\":" + i.to_string() + ",\"name\":\"p\"\}")
         if r.is_ok:
             return r.ok.name.len()
+    elif shape == "path":
+        r := json.decode_text_path[Inner]("\{\"a\":\{\"label\":\"l{i}\",\"note\":\"n{i}\"\}\}", "a" + "")
+        if r.is_ok:
+            return r.ok.label.len()
     return 0
 
 fn decode_absent(i: Int) -> Int:

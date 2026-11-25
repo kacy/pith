@@ -117,6 +117,26 @@ fn ir_decode_arg_expr_idx(node: Node, start_idx: Int) -> Int:
         return child
     return 0 - 1
 
+# whether the decode argument found from child `start_idx` on is minted by
+# the expression itself (a call, a method call, a concatenation or an
+# interpolation), so it is transferred to the decode and dies with it, rather
+# than a named local or field the caller keeps. a minted text or path the
+# lowering did not release was stranded once per decode, `decode_text[T]`
+# of an interpolated document among them.
+fn ir_decode_arg_is_minted(node: Node, start_idx: Int) -> Bool:
+    expr := ir_decode_arg_expr_idx(node, start_idx)
+    if expr < 0:
+        return false
+    kind := get_node(expr).kind
+    return kind == "call" or kind == "method_call" or kind == "binary" or kind == "string_interp"
+
+# release each string argument, at the given child positions (1 for the first
+# argument), that the call minted, once the decode is done with it.
+fn ir_release_minted_decode_args(node: Node, arg_regs: List[Int], positions: List[Int]):
+    for pos in positions:
+        if pos >= 1 and pos <= arg_regs.len() and ir_decode_arg_is_minted(node, pos):
+            ir_string_release_reg(arg_regs[pos - 1])
+
 # the two temp vars that hold a json node-pool mark across a lowered decode
 # body, so it can be reloaded and handed to pool_restore at every exit.
 struct IrJsonPoolMark:
@@ -2303,24 +2323,14 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         return ir_zero_reg()
     target_info := get_type_info(target_tid)
     mut input_r := arg_regs[0]
-    # an argument minted by a call (`decode[T](bytes.from_string_utf8(s))`, a
-    # body read, `decode_text[T](req.body())`), a concatenation or an
-    # interpolation is transferred to this expression and dies with the
-    # decode; a named local or field stays the caller's. a text argument's
+    # a minted argument (`decode[T](bytes.from_string_utf8(s))`, a body read,
+    # `decode_text[T](req.body())`) dies with the decode. a text argument's
     # conversion below mints the bytes this call frees either way; the text
     # itself is released here only when the argument minted it, which used to
-    # strand one string per `decode_text[T](f())` and per
-    # `decode_text[T]("...{i}...")`.
-    mut fresh_bytes_input := false
-    mut fresh_text_input := false
-    input_expr := ir_decode_arg_expr_idx(node, 1)
-    if input_expr >= 0:
-        input_kind := get_node(input_expr).kind
-        fresh_input := input_kind == "call" or input_kind == "method_call" or input_kind == "binary" or input_kind == "string_interp"
-        if text_input:
-            fresh_text_input = fresh_input
-        else:
-            fresh_bytes_input = fresh_input
+    # strand one string per `decode_text[T](f())`.
+    fresh_input := ir_decode_arg_is_minted(node, 1)
+    fresh_text_input := text_input and fresh_input
+    fresh_bytes_input := not text_input and fresh_input
     text_r := input_r
     owns_input := text_input or fresh_bytes_input
     has_optional_fields := ir_struct_has_optional_fields(target_info)
@@ -2758,8 +2768,11 @@ pub fn ir_emit_json_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
     final_handle_r := ir_emit_dotted_path_lookup(root_r, dotted_path_r, ir_resolve_json_call_name(node.children[0], "object_require_object"), lookup_type_id("Int"), current_name, parts_name, len_name, idx_name, temp_name, done_l)
     ir_emit_json_decode_object_value(target_info, final_handle_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
     ir_emit_label(done_l)
+    mut minted_args := [2]
     if text_input:
         ir_emit_json_pool_restore(mark, ir_resolve_json_call_name(node.children[0], "pool_restore"))
+        minted_args = [1, 2]
+    ir_release_minted_decode_args(node, arg_regs, minted_args)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -2792,6 +2805,7 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
         ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
         ir_emit_label(done_l)
         ir_emit_json_pool_restore(mark, ir_resolve_json_call_name(node.children[0], "pool_restore"))
+        ir_release_minted_decode_args(node, arg_regs, [1])
         r := ir_reg()
         ir_emit("load " + r.to_string() + " " + temp_name)
         return r
@@ -2828,6 +2842,7 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     ir_emit_json_decode_object_value(target_info, final_handle_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
     ir_emit_label(done_l)
     ir_emit_json_pool_restore(mark, ir_resolve_json_call_name(node.children[0], "pool_restore"))
+    ir_release_minted_decode_args(node, arg_regs, [1, 2])
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r

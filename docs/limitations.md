@@ -108,10 +108,11 @@ stale and a fix to it is welcome.
   parses as a generic method call, and the checker refuses it with E209. group
   the index: `(t.items[MAX])(y)`. see docs/generics.md.
 - **generic enum gaps**. `Chain[Int].Link(...)` does not work as a
-  constructor; let an annotated binding or the payload supply the instance. a
-  generic function does not infer `T` from a `Chain[T]` argument
-  (`head_of(pair)` is E222). a payload-free variant bound with no annotation
-  (`b := Opt.Nothing`) is E262.
+  constructor; the instance comes from the payload, or from the typed target
+  the value is stored into: an annotated binding, a return, an argument, an
+  assignment, a field or a list element. a generic function does not infer `T`
+  from a `Chain[T]` argument (`head_of(pair)` is E222). a payload-free variant
+  bound with no annotation (`b := Opt.Nothing`) is E262.
 - **a generic body is checked only at the types the program uses**. each
   specialization is type checked against its concrete types, so a body that is
   wrong for some type its bound admits is reported only when a caller reaches

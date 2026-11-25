@@ -1,0 +1,94 @@
+# typed decodes of optional fields present in the document, which now own
+# their payloads (#1144): each value has to read back intact, survive the
+# decoded struct being dropped when it was taken out first, and be released
+# with the struct on a decode that fails at a later field. json takes the
+# scalar-object path for the flat struct and the node path for the rest; toml,
+# yaml and config take the handle and config paths.
+import std.json as json
+import std.toml as toml
+import std.yaml as yaml
+import std.config as config
+
+pub struct Flat:
+    pub id: Int
+    pub count: Int?
+    pub ratio: Float?
+    pub flag: Bool?
+    pub note: String?
+    pub name: String
+
+pub struct Inner:
+    pub label: String
+    pub note: String?
+
+pub struct Outer:
+    pub code: String
+    pub inner: Inner
+    pub extra: Inner?
+    pub tags: List[String]?
+    pub items: List[Inner]?
+    pub attrs: Map[String, String]?
+
+pub struct Srv:
+    pub host: String
+    pub note: String?
+    pub port: Int
+
+fn show_note(n: String?) -> String:
+    if let v = n:
+        return v
+    return "none"
+
+fn show_inner(i: Inner) -> String:
+    return "{i.label}/{show_note(i.note)}"
+
+fn take_note(i: Int) -> String?:
+    r := json.decode_text[Flat]("\{\"id\":{i},\"note\":\"kept{i}\",\"name\":\"n\"\}")
+    if r.is_ok:
+        return r.ok.note
+    return none
+
+fn main():
+    f := json.decode_text[Flat]("\{\"id\":1,\"count\":3,\"ratio\":1.5,\"flag\":true,\"note\":\"hello\",\"name\":\"p\"\}")
+    if f.is_ok:
+        v := f.ok
+        print("flat {v.id} {v.count.unwrap_or(0)} {v.ratio.unwrap_or(0.0)} {v.flag.unwrap_or(false)} {show_note(v.note)} {v.name}")
+    g := json.decode_text[Flat]("\{\"id\":2,\"name\":\"q\"\}")
+    if g.is_ok:
+        print("flat absent {show_note(g.ok.note)} {g.ok.count.unwrap_or(0)}")
+    bad := json.decode_text[Flat]("\{\"id\":3,\"note\":\"x\",\"name\":4\}")
+    if bad.is_err:
+        print("flat bad: {bad.err.message}")
+
+    doc := "\{\"code\":\"c\",\"inner\":\{\"label\":\"l\",\"note\":\"in\"\},\"extra\":\{\"label\":\"e\"\},\"tags\":[\"t1\",\"t2\"],\"items\":[\{\"label\":\"a\",\"note\":\"x\"\},\{\"label\":\"b\"\}],\"attrs\":\{\"k\":\"v\"\}\}"
+    o := json.decode_text[Outer](doc)
+    if o.is_ok:
+        v := o.ok
+        print("outer {v.code} {show_inner(v.inner)}")
+        if let e = v.extra:
+            print("extra {show_inner(e)}")
+        if let t = v.tags:
+            print("tags {t.join(",")}")
+        if let items = v.items:
+            for it in items:
+                print("item {show_inner(it)}")
+        if let a = v.attrs:
+            print("attrs {a["k"]}")
+    p := json.decode_text[Outer]("\{\"code\":\"c\",\"inner\":\{\"label\":\"l\"\}\}")
+    if p.is_ok:
+        print("outer absent {show_inner(p.ok.inner)} {p.ok.extra == none} {p.ok.tags == none}")
+    q := json.decode_text[Outer]("\{\"code\":\"c\",\"inner\":\{\"label\":\"l\"\},\"extra\":\{\"label\":\"e\",\"note\":\"n\"\},\"tags\":[1]\}")
+    if q.is_err:
+        print("outer bad: {q.err.message}")
+
+    print("taken {show_note(take_note(7))}")
+
+    t := toml.decode_text[Srv]("host = \"h\"\nnote = \"toml note\"\nport = 3\n")
+    if t.is_ok:
+        print("toml {t.ok.host} {show_note(t.ok.note)} {t.ok.port}")
+    y := yaml.decode_text[Srv]("host: h\nnote: yaml note\nport: 4\n")
+    if y.is_ok:
+        print("yaml {y.ok.host} {show_note(y.ok.note)} {y.ok.port}")
+    c := config.from_toml_typed[Srv]("host = \"h\"\nnote = \"config note\"\nport = 5\n")
+    if c.is_ok:
+        print("config {c.ok.host} {show_note(c.ok.note)} {c.ok.port}")

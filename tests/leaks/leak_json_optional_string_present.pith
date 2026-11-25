@@ -1,0 +1,32 @@
+# typed json.decode of a flat struct with an optional String field that is
+# present in the document, the scalar-object path. the decode wrapped the
+# string in a Some that borrowed it, so the struct's destructor freed the
+# shell and left the string with its count: about 31 bytes per decode, 9160 kb
+# at 200000 rounds against 27912 kb at 800000, while the absent case stayed
+# flat (#1144).
+#
+# the gate once wrote its document's braces as `\{` while the backend kept the
+# backslash, so every decode failed on the first byte and it never reached the
+# optional field. it prints no peak now unless a decode succeeded.
+import std.json as json
+import leakprobe as probe
+
+pub struct Plain:
+    pub id: Int
+    pub note: String?
+    pub name: String
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut total := 0
+    while i < n:
+        doc := "\{\"id\":{i},\"note\":\"n\",\"name\":\"p{i}\"\}"
+        r := json.decode_text[Plain](doc)
+        if r.is_ok:
+            total = total + r.ok.name.len()
+        i = i + 1
+    if total == 0:
+        print("no decode succeeded")
+        return
+    print("{probe.peak_kb()}")

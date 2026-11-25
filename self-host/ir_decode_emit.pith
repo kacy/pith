@@ -15,7 +15,7 @@ from checker import c_get_expr_type
 from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_handle_require_full_name_for_type_name, ir_active_generic_params, ir_active_generic_concrete_types, ir_type_aliases
 from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_handle_require_helper_name, ir_json_struct_list_elem_tid, ir_json_list_elem_tid, ir_json_map_value_tid, ir_json_node_built_collection
 from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_state, ir_generic_preferred_name, ir_json_generic_name_with_state, ir_queue_generic_specialization, ir_resolve_generic_module_call_name, ir_handle_generic_name_with_state, ir_specialize_type_name_with_state
-from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_some_value
+from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_owned_some, ir_emit_optional_some_value
 from ir_ownership import ir_rc_release_reg, ir_string_release_reg
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
 from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_emit_result_flag_field, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
@@ -838,6 +838,18 @@ pub fn ir_decode_field_load_after_merge(branch: IrDecodeFieldBranch) -> Int:
     ir_emit("load " + loaded_r.to_string() + " " + branch.field_temp)
     return loaded_r
 
+# the Some a present optional field is stored as. the decode helper hands
+# back a fresh value with its own count, so a heap payload belongs to the
+# shell: the shell carries the destructor that drops it, and the struct's
+# destructor drops the shell. the borrowing shell this used to build freed
+# only its own two slots, so every present String, list, map or struct
+# field kept a count nobody released (#1144).
+fn ir_decode_optional_some(value_r: Int, inner_tid: Int) -> Int:
+    kind := ir_rc_kind(ir_type_from_tid(inner_tid))
+    if kind.len() == 0 or kind == "tuple":
+        return ir_emit_optional_some_value(value_r)
+    return ir_emit_optional_owned_some(value_r, kind)
+
 ## missing optional field: store none.
 pub fn ir_decode_field_store_missing_optional(branch: IrDecodeFieldBranch, default_idx: Int, emit_value: fn(Int, String) -> Int):
     if default_idx >= 0:
@@ -867,7 +879,7 @@ pub fn ir_emit_config_spec_optional_struct_field(cfg_r: Int, full_key_r: Int, de
     ir_decode_field_present(branch)
     field_result_r := ir_emit_config_nested_decode_prefix_specialized(cfg_r, full_key_r, optional_struct_tid)
     ir_emit_result_return_error_branch(field_result_r)
-    ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_struct_tid)))
+    ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_struct_tid), optional_struct_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
 ## emit the config spec nested struct field sequence.
@@ -900,7 +912,7 @@ pub fn ir_emit_config_spec_optional_scalar_field(cfg_r: Int, full_key_r: Int, de
     field_result_r := ir_reg()
     ir_emit_decode_result_call2(field_result_r, helper_name, cfg_r, full_key_r)
     ir_emit_result_return_error_branch(field_result_r)
-    ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+    ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
 ## emit the config spec scalar field sequence.
@@ -1001,7 +1013,7 @@ pub fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: 
             ir_decode_field_present(branch)
             field_result_r := ir_emit_config_nested_decode_prefix(cfg_r, full_key_r, optional_struct_tid, index_idx)
             ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_struct_tid)))
+            ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_struct_tid), optional_struct_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
             continue
@@ -1036,7 +1048,7 @@ pub fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: 
             field_result_r := ir_reg()
             ir_emit_decode_result_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), cfg_r, full_key_r)
             ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+            ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
             continue
@@ -1076,7 +1088,7 @@ pub fn ir_emit_handle_spec_optional_struct_field(handle_r: Int, key_r: Int, modu
     ir_decode_field_present(branch)
     field_result_r := ir_emit_handle_nested_decode_path_specialized(handle_r, key_r, optional_struct_tid, module_path)
     ir_emit_result_return_error_branch(field_result_r)
-    ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_struct_tid)))
+    ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_struct_tid), optional_struct_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
 ## emit the handle-pool spec nested struct field sequence.
@@ -1109,7 +1121,7 @@ pub fn ir_emit_handle_spec_optional_scalar_field(handle_r: Int, key_r: Int, modu
     field_result_r := ir_reg()
     ir_emit_decode_result_call2(field_result_r, helper_name, handle_r, key_r)
     ir_emit_result_return_error_branch(field_result_r)
-    ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+    ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
 ## emit the handle-pool spec scalar field sequence.
@@ -1345,7 +1357,7 @@ pub fn ir_emit_handle_decode_value(target_info: TypeInfo, handle_r: Int, index_i
             ir_decode_field_present(branch)
             field_result_r := ir_emit_handle_nested_decode_path(handle_r, key_r, optional_struct_tid, index_idx)
             ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_struct_tid)))
+            ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_struct_tid), optional_struct_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
             continue
@@ -1380,7 +1392,7 @@ pub fn ir_emit_handle_decode_value(target_info: TypeInfo, handle_r: Int, index_i
             field_result_r := ir_reg()
             ir_emit_decode_result_call2(field_result_r, ir_resolve_handle_decode_call_name(index_idx, helper_name), handle_r, key_r)
             ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+            ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
             continue
@@ -2077,7 +2089,7 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
             field_result_r := ir_reg()
             ir_emit_decode_result_call2(field_result_r, helper_name, fields_r, key_r)
             ir_emit_decode_field_error_branch(field_result_r, temp_name, fields_done_l)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+            ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
             continue
@@ -2142,7 +2154,7 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
             ir_decode_field_present(branch)
             field_result_r := ir_emit_json_nested_decode_path(handle_r, key_r, optional_struct_tid, index_idx)
             ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_struct_tid)))
+            ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_struct_tid), optional_struct_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
             continue
@@ -2181,7 +2193,7 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
                 ir_decode_field_present(branch)
                 field_result_r := ir_emit_json_struct_list_field(handle_r, key_r, struct_list_tid, list_helpers)
                 ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-                ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+                ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
                 field_regs.push(ir_decode_field_load_after_merge(branch))
                 ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
                 continue
@@ -2217,7 +2229,7 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
                 ir_decode_field_present(branch)
                 field_result_r := ir_emit_json_node_collection_field(handle_r, key_r, optional_inner_tid, node_helpers)
                 ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-                ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+                ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
                 field_regs.push(ir_decode_field_load_after_merge(branch))
                 ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
                 continue
@@ -2250,7 +2262,7 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
             field_result_r := ir_reg()
             ir_emit_decode_result_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), handle_r, key_r)
             ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+            ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
             continue
@@ -2446,7 +2458,7 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
             ir_decode_field_present(branch)
             field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, optional_struct_tid, module_path)
             ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_struct_tid)))
+            ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_struct_tid), optional_struct_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
             i = i + 1
@@ -2485,7 +2497,7 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
                 ir_decode_field_present(branch)
                 field_result_r := ir_emit_json_struct_list_field(handle_r, key_r, struct_list_tid, list_helpers)
                 ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-                ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+                ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
                 field_regs.push(ir_decode_field_load_after_merge(branch))
                 ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
                 i = i + 1
@@ -2522,7 +2534,7 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
                 ir_decode_field_present(branch)
                 field_result_r := ir_emit_json_node_collection_field(handle_r, key_r, optional_inner_tid, node_helpers)
                 ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-                ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+                ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
                 field_regs.push(ir_decode_field_load_after_merge(branch))
                 ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
                 i = i + 1
@@ -2559,7 +2571,7 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
             field_result_r := ir_reg()
             ir_emit_decode_result_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), handle_r, key_r)
             ir_emit_decode_field_error_branch(field_result_r, temp_name, done_l)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_take_json_ok(field_result_r, optional_inner_tid)))
+            ir_decode_field_store_and_merge(branch, ir_decode_optional_some(ir_take_json_ok(field_result_r, optional_inner_tid), optional_inner_tid))
             field_regs.push(ir_decode_field_load_after_merge(branch))
             ir_decode_partial_push(field_regs[field_regs.len() - 1], ir_decode_held_kind(field_tid))
             i = i + 1

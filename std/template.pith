@@ -159,9 +159,10 @@ struct Node:
     mode: Int
 
 # a parsed template. compile once, render many times; a `Template` holds no
-# per-render state and is safe to share.
+# per-render state and is safe to share, with other tasks too: its nodes are
+# frozen once compile builds them.
 pub struct Template:
-    nodes: List[Node]
+    frozen nodes: List[Node]
     # how `<%md %>` renders headings: with ids, and with links to themselves.
     markdown_ids: Bool = false
     markdown_anchors: Bool = false

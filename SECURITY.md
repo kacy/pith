@@ -115,7 +115,9 @@ task the handler spawned. see
   obsolete header folding is refused. oversized bodies, oversized
   headers and slow headers get 413, 431 and 408. in `std.web`, a
   request body has 60 s in total after its head, and a slower one gets
-  408.
+  408. a chunk size is checked against the body limit before it is read,
+  and a size near the largest Int gets 413 rather than overflowing; a
+  response with one fails the client's request the same way.
 - http/2: at most 128 concurrent streams per connection, capped
   header lists, and a stream past the cap is refused, so rapid stream
   resets cannot pile up handlers. see [docs/web.md](docs/web.md).

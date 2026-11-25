@@ -1155,6 +1155,35 @@ pub fn array_string(handle: Int, index: Int) -> String:
     return ""
 
 # ===============================================================
+# Public API — Reading a node directly
+# ===============================================================
+
+# The text of a string node, or "" for anything else. for an array element,
+# where there is no key to look the value up by, as std.yaml's is.
+pub fn scalar_string(handle: Int) -> String:
+    if node_kind(handle) == "string":
+        return node_strings[node_payload(handle)]
+    return ""
+
+# The value of an int node, or 0 for anything else.
+pub fn scalar_int(handle: Int) -> Int:
+    if node_kind(handle) == "int":
+        return node_payload(handle)
+    return 0
+
+# The value of a float node, or 0.0 for anything else.
+pub fn scalar_float(handle: Int) -> Float:
+    if node_kind(handle) == "float":
+        return float_from_bits(node_payload(handle))
+    return 0.0
+
+# The value of a bool node, or false for anything else.
+pub fn scalar_bool(handle: Int) -> Bool:
+    if node_kind(handle) == "bool":
+        return node_payload(handle) != 0
+    return false
+
+# ===============================================================
 # Public API — Table Introspection
 # ===============================================================
 
@@ -1390,6 +1419,16 @@ test "the scalar scanner refuses what it cannot represent exactly":
     assert(not scan_scalars("host\n").ok)
     # and the loud form says so
     assert(decode_scalars("[server]\n").is_err)
+
+test "array elements are read through their handles":
+    root := parse("mixed = [\"a\", 7, true, 2.5]\n")
+    items := get_array(root, "mixed")
+    assert_eq(scalar_string(array_get(items, 0)), "a")
+    assert_eq(scalar_int(array_get(items, 1)), 7)
+    assert_eq(scalar_bool(array_get(items, 2)), true)
+    assert_eq(scalar_float(array_get(items, 3)), 2.5)
+    assert_eq(scalar_int(array_get(items, 0)), 0)
+    assert_eq(scalar_string(array_get(items, 1)), "")
 
 test "the scalar scanner and the tree parser agree on a flat document":
     doc := "host = \"a.example\"\nport = 8080\ndebug = false\n"

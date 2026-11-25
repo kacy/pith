@@ -1,0 +1,98 @@
+# a generic enum constructor written through an import alias checks like the
+# bare-name form, and one with nothing of its own to infer the instance from
+# (`Opt.Some(Opt.Nothing)`, `Pair.Right(s)`) takes it from the typed target it
+# is stored into: a return, an argument, an assignment or a list element, as
+# well as an annotated binding. both used to type as the error wildcard, so
+# the box was built without the destructor for its payload and retained as if
+# it were borrowed.
+import clash_genum_a as a
+import clash_genum_b as b
+import genum_slot_helper as ev
+
+enum Opt[T]:
+    Some(T)
+    Nothing
+
+enum Pair[A, B]:
+    Left(A)
+    Right(B)
+
+struct Holder:
+    pub slot: ev.Slot[String]
+    pub nested: Opt[Opt[String]]
+
+fn depth(o: Opt[Opt[String]]) -> String:
+    match o:
+        Opt.Some(inner) =>
+            match inner:
+                Opt.Some(v) => return "some some {v}"
+                Opt.Nothing => return "some nothing"
+        Opt.Nothing => return "nothing"
+
+fn side(p: Pair[Int, String]) -> String:
+    match p:
+        Pair.Left(n) => "left {n}"
+        Pair.Right(s) => "right {s}"
+
+fn nested_return() -> Opt[Opt[String]]:
+    return Opt.Some(Opt.Nothing)
+
+fn right_return(s: String) -> Pair[Int, String]:
+    return Pair.Right(s)
+
+fn deep_return() -> Opt[Opt[Opt[Int]]]:
+    return Opt.Some(Opt.Some(Opt.Nothing))
+
+fn main():
+    # through an import alias
+    s: ev.Slot[String] := ev.Slot.Full("annotated")
+    print(ev.describe(s))
+    t := ev.Slot.Full("inferred")
+    print(ev.describe(t))
+    print(ev.describe(ev.Slot.Full("argument")))
+    e: ev.Slot[String] := ev.Slot.Empty
+    print(ev.describe(e))
+
+    # each module's own declaration, with the variants in a different order
+    print(a.read_a(a.Opt.Some(4)))
+    print(b.read_b(b.Opt.Some("x")))
+    an: a.Opt[Int] := a.Opt.Nothing
+    print(a.read_a(an))
+    bn: b.Opt[String] := b.Opt.Nothing
+    print(b.read_b(bn))
+    match b.Opt.Some("matched"):
+        b.Opt.Some(v) => print("b pattern {v}")
+        b.Opt.Nothing => print("b pattern nothing")
+    match bn:
+        b.Opt.Some(v) => print("b pattern {v}")
+        b.Opt.Nothing => print("b pattern nothing")
+    match a.Opt.Some(5):
+        a.Opt.Some(n) => print("a pattern {n}")
+        a.Opt.Nothing => print("a pattern nothing")
+
+    # the instance from the target
+    print(depth(nested_return()))
+    print(depth(Opt.Some(Opt.Nothing)))
+    mut o: Opt[Opt[String]] := Opt.Nothing
+    print(depth(o))
+    o = Opt.Some(Opt.Nothing)
+    print(depth(o))
+    o = Opt.Some(Opt.Some("reassigned"))
+    print(depth(o))
+    l: List[Opt[Opt[String]]] := [Opt.Some(Opt.Nothing), Opt.Some(Opt.Some("listed"))]
+    for x in l:
+        print(depth(x))
+    h := Holder(ev.Slot.Full("field"), Opt.Some(Opt.Nothing))
+    print("{ev.describe(h.slot)} {depth(h.nested)}")
+    print(side(right_return("returned")))
+    print(side(Pair.Right("argument")))
+    print(side(Pair.Left(3)))
+    match deep_return():
+        Opt.Some(mid) =>
+            match mid:
+                Opt.Some(inner) =>
+                    match inner:
+                        Opt.Some(n) => print("deep {n}")
+                        Opt.Nothing => print("deep nothing")
+                Opt.Nothing => print("mid nothing")
+        Opt.Nothing => print("outer nothing")

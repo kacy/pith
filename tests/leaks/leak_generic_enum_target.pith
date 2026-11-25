@@ -1,0 +1,75 @@
+# generic enum constructors the checker could not type, one shape per SHAPE.
+# SHAPE=qual, qual_infer and qual_arg construct through an import alias,
+# `ev.Slot.Full(s)`, which typed as the error wildcard: the box got no
+# destructor for its string and was taken for a borrow, so a binding retained
+# it and an argument was never released, about 94 bytes per round. the nested
+# shapes build `Opt.Some(Opt.Nothing)`, and SHAPE=right `Pair.Right(s)`,
+# which have nothing of their own to infer the instance from and took none
+# from the return, argument, assignment or list element they were stored
+# into: 31 to 125 bytes per round.
+import leakprobe as probe
+import genum_slot_mod as ev
+
+enum Opt[T]:
+    Some(T)
+    Nothing
+
+enum Pair[A, B]:
+    Left(A)
+    Right(B)
+
+fn depth(o: Opt[Opt[String]]) -> Int:
+    match o:
+        Opt.Some(inner) =>
+            match inner:
+                Opt.Some(v) => return v.len() + 2
+                Opt.Nothing => return 1
+        Opt.Nothing => return 0
+
+fn side(p: Pair[Int, String]) -> Int:
+    match p:
+        Pair.Left(n) => n
+        Pair.Right(s) => s.len()
+
+fn nested_return() -> Opt[Opt[String]]:
+    return Opt.Some(Opt.Nothing)
+
+fn right_return(i: Int) -> Pair[Int, String]:
+    return Pair.Right("r{i}")
+
+fn round(shape: String, i: Int) -> Int:
+    if shape == "qual":
+        s: ev.Slot[String] := ev.Slot.Full("a{i}")
+        return ev.width(s)
+    elif shape == "qual_infer":
+        s := ev.Slot.Full("a{i}")
+        return ev.width(s)
+    elif shape == "qual_arg":
+        return ev.width(ev.Slot.Full("a{i}"))
+    elif shape == "nested_return":
+        return depth(nested_return())
+    elif shape == "nested_arg":
+        return depth(Opt.Some(Opt.Nothing))
+    elif shape == "nested_assign":
+        mut o: Opt[Opt[String]] := Opt.Nothing
+        o = Opt.Some(Opt.Nothing)
+        return depth(o)
+    elif shape == "nested_list":
+        l: List[Opt[Opt[String]]] := [Opt.Some(Opt.Nothing)]
+        return depth(l[0])
+    elif shape == "right":
+        return side(right_return(i))
+    return 0
+
+fn main():
+    n := probe.rounds()
+    shape := env("SHAPE")
+    mut i := 0
+    mut total := 0
+    while i < n:
+        total = total + round(shape, i)
+        i = i + 1
+    if total == 0:
+        print("nothing ran")
+        return
+    print("{probe.peak_kb()}")

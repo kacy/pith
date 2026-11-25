@@ -145,6 +145,14 @@ cases=(
   tests/leaks/leak_owned_temp_field_read
   tests/leaks/leak_enum_bare_variant
   tests/leaks/leak_generic_enum_payload
+  "tests/leaks/leak_generic_enum_target SHAPE=qual"
+  "tests/leaks/leak_generic_enum_target SHAPE=qual_infer"
+  "tests/leaks/leak_generic_enum_target SHAPE=qual_arg"
+  "tests/leaks/leak_generic_enum_target SHAPE=nested_return"
+  "tests/leaks/leak_generic_enum_target SHAPE=nested_arg"
+  "tests/leaks/leak_generic_enum_target SHAPE=nested_assign"
+  "tests/leaks/leak_generic_enum_target SHAPE=nested_list"
+  "tests/leaks/leak_generic_enum_target SHAPE=right"
   tests/leaks/leak_optional_shell_arg
   tests/leaks/leak_optional_arg_unread_callee
   tests/leaks/leak_container_arg
@@ -266,7 +274,24 @@ cases=(
   tests/leaks/leak_json_fill_list
   tests/leaks/leak_json_fill_list_fail
   tests/leaks/leak_json_node_list
-  tests/leaks/leak_json_node_nested_optional
+  "tests/leaks/leak_json_node_nested_optional SHAPE=present"
+  "tests/leaks/leak_json_node_nested_optional SHAPE=absent"
+  tests/leaks/leak_json_optional_string_present
+  "tests/leaks/leak_json_optional_fields SHAPE=flat"
+  "tests/leaks/leak_json_optional_fields SHAPE=nested"
+  "tests/leaks/leak_json_optional_fields SHAPE=opt_struct"
+  "tests/leaks/leak_json_optional_fields SHAPE=opt_lists"
+  "tests/leaks/leak_json_optional_fields SHAPE=items"
+  "tests/leaks/leak_json_optional_fields SHAPE=opt_items"
+  "tests/leaks/leak_json_optional_fields SHAPE=opt_map"
+  "tests/leaks/leak_json_optional_fields SHAPE=concat"
+  "tests/leaks/leak_json_optional_fields SHAPE=path"
+  "tests/leaks/leak_json_optional_fields SHAPE=absent"
+  "tests/leaks/leak_decode_optional_present SHAPE=toml"
+  "tests/leaks/leak_decode_optional_present SHAPE=toml_nested"
+  "tests/leaks/leak_decode_optional_present SHAPE=yaml"
+  "tests/leaks/leak_decode_optional_present SHAPE=yaml_nested"
+  "tests/leaks/leak_decode_optional_present SHAPE=config"
   tests/leaks/leak_json_decode_fail_after_fields
   tests/leaks/leak_json_fill_collections
   tests/leaks/leak_json_fill_collections_fail

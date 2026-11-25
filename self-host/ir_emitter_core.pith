@@ -1674,7 +1674,7 @@ fn ir_field_access_is_bare_variant(idx: Int) -> Bool:
         ename = recv.value
     elif recv.kind == "field_access" and recv.children.len() > 0:
         if ir_ident_names_module(recv.children[0]):
-            ename = recv.value
+            ename = ir_qualified_enum_name(node.children[0])
     if ename.len() == 0 or not ir_boxed_enums.contains_key(ename):
         return false
     key := ename + "." + node.value
@@ -9378,14 +9378,27 @@ fn ir_emit_variant_ctor_method(idx: Int) -> Int:
                 return ir_emit_variant_construction(idx, node, ctor_recv.value, ctor_key)
         # a module-qualified variant, `mod.Enum.Variant(...)`: the receiver is a
         # field access `mod.Enum` where mod is an import alias and Enum is a
-        # boxed enum (registered by its base name across modules). resolve it the
-        # same as the local `Enum.Variant(...)` form.
+        # boxed enum. resolve it the same as the local `Enum.Variant(...)` form,
+        # under the name the aliased module's declaration is filed by.
         if ctor_recv.kind == "field_access" and ctor_recv.children.len() > 0:
-            if ir_ident_names_module(ctor_recv.children[0]) and ir_boxed_enums.contains_key(ctor_recv.value):
-                qual_key := ctor_recv.value + "." + mname
-                if ir_struct_field_index_lookup.contains_key(qual_key):
-                    return ir_emit_variant_construction(idx, node, ctor_recv.value, qual_key)
+            if ir_ident_names_module(ctor_recv.children[0]):
+                ename := ir_qualified_enum_name(node.children[0])
+                qual_key := ename + "." + mname
+                if ir_boxed_enums.contains_key(ename) and ir_struct_field_index_lookup.contains_key(qual_key):
+                    return ir_emit_variant_construction(idx, node, ename, qual_key)
     return 0 - 1
+
+# the name an alias-qualified enum receiver (`b.Opt` in `b.Opt.Some(x)`) is
+# filed under: its declaring module's identity when another module declares a
+# generic of the same name, as ir_collect_enum_decl files it, and the bare name
+# otherwise. the bare name means whichever declaration this module filed under
+# it, so `b.Opt.Some("x")` built its box with the tag of a.Opt's Some.
+fn ir_qualified_enum_name(recv_idx: Int) -> String:
+    name := node_value(recv_idx)
+    sname := ir_alias_generic_base_identity(recv_idx, name)
+    if ir_enum_variant_lists.contains_key(sname):
+        return sname
+    return name
 
 # methods whose lowering is chosen by the receiver's static type rather than by
 # name resolution: unsigned `to_string`, the `Result` combinators, and the
@@ -11569,7 +11582,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         # does. payload variants never reach here (they are calls).
         if recv_node.kind == "field_access" and recv_node.children.len() > 0:
             if ir_ident_names_module(recv_node.children[0]):
-                ename := recv_node.value
+                ename := ir_qualified_enum_name(node.children[0])
                 variant_key := ename + "." + fname
                 if ir_struct_field_index_lookup.contains_key(variant_key):
                     if ir_struct_field_lookup.contains_key(variant_key) and ir_struct_field_lookup[variant_key] == ename:

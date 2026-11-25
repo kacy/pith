@@ -6787,6 +6787,11 @@ fn generic_enum_construction_base(val_node: Node) -> String:
     if val_node.children.len() < 1:
         return ""
     recv := get_node(val_node.children[0])
+    qualified_idx := module_generic_enum_decl_index(val_node.children[0])
+    if qualified_idx >= 0:
+        if enum_decl_has_variant(get_node(qualified_idx), normalized_method_name(val_node.value)):
+            return generic_declaration_identity(qualified_idx)
+        return ""
     if recv.kind != "ident":
         return ""
     if has_generic_declaration(recv.value) == false:
@@ -6799,16 +6804,61 @@ fn generic_enum_construction_base(val_node: Node) -> String:
         return recv.value
     return ""
 
-# `Opt.Some(5)` — a variant constructor on a generic enum's bare name.
-# infer the instance from the payload arguments, instantiate it, and check
-# the arguments against the instantiated payload types. a constructor with
-# nothing to infer from (`Opt.Nothing`) returns the error type WITHOUT
-# reporting: a typed target supplies the instance in that case — the
-# annotated-binding path records it — and a generic function returning its
-# own enum (`return RecvResult.Closed`) has carried this shape since before
-# inference existed. only an unannotated binding turns the silence into an
-# error, in check_binding_statement.
-fn check_generic_enum_variant_construction(decl_idx: Int, variant_name: String, arg_indices: List[Int], scope_id: Int) -> Int:
+# the generic enum declaration a module-qualified receiver names, `ev.Slot`
+# where `ev` is an import alias and Slot a generic enum that module declares,
+# or -1. its bare name is not a value, so such a receiver checks as the error
+# wildcard, and the constructor has to be recognized before that.
+fn module_generic_enum_decl_index(recv_idx: Int) -> Int:
+    recv := get_node(recv_idx)
+    if recv.kind != "field_access" or recv.children.len() == 0:
+        return 0 - 1
+    if not names_module_alias(recv.children[0]):
+        return 0 - 1
+    key := module_generic_target_name(module_aliases[get_node(recv.children[0]).value], recv.value)
+    if not generic_declaration_map.contains_key(key):
+        return 0 - 1
+    decl_idx := generic_declaration_map[key]
+    if get_node(decl_idx).kind != "enum_decl":
+        return 0 - 1
+    return decl_idx
+
+# the instance of generic enum `decl_idx` a constructor call is stored into,
+# through a result or optional, or -1 when its target is not one. the
+# counterpart of generic_struct_target, read from the same literal_targets.
+fn generic_enum_target(call_idx: Int, decl_idx: Int) -> Int:
+    if not literal_targets.contains_key(call_idx):
+        return 0 - 1
+    mut target := literal_targets[call_idx]
+    if target >= 0 and get_type_info(target).kind == "result":
+        target = get_type_info(target).inner
+    if target >= 0 and get_type_info(target).kind == "optional":
+        target = get_type_info(target).inner
+    if target < 0 or not enum_instance_base_name.contains_key(target):
+        return 0 - 1
+    if enum_instance_base_name[target] != generic_declaration_identity(decl_idx):
+        return 0 - 1
+    return target
+
+# `Opt.Some(5)`: a variant constructor on a generic enum's bare name, or
+# through an import alias (`ev.Slot.Full(5)`). infer the instance from the
+# payload arguments, instantiate it, and check the arguments against the
+# instantiated payload types.
+#
+# a constructor with nothing to infer from (`Opt.Nothing`, or
+# `Opt.Some(Opt.Nothing)`, whose payload is one) takes the instance of the
+# typed target it is stored into: a binding, an assignment, a return, an
+# argument, a field or a collection element, whichever noted it in
+# literal_targets. its payload arguments are noted with the instance's payload
+# types first, so a constructor nested inside takes its instance the same way.
+# the emitter reads the instance back to give the box the destructor for its
+# payloads; error-typed, `return Opt.Some(Opt.Nothing)` built a box with none
+# and retained it as if it were borrowed, two counts that were never dropped.
+#
+# with no target either, the result is the error type WITHOUT reporting: a
+# generic function returning its own enum (`return RecvResult.Closed`) has
+# carried this shape since before inference existed. only an unannotated
+# binding turns the silence into an error, in check_binding_statement.
+fn check_generic_enum_variant_construction(call_idx: Int, decl_idx: Int, variant_name: String, arg_indices: List[Int], scope_id: Int) -> Int:
     decl := get_node(decl_idx)
     generic_params := collect_generic_parameter_names(decl)
     # the caller's enum_decl_has_variant guard is the gate, so the variant
@@ -6822,22 +6872,34 @@ fn check_generic_enum_variant_construction(decl_idx: Int, variant_name: String, 
     if arg_indices.len() != payload_nodes.len():
         report_error("E207", variant_name + " expects " + payload_nodes.len().to_string() + " arguments, got " + arg_indices.len().to_string())
         return TID_ERR
+    target := generic_enum_target(call_idx, decl_idx)
+    mut target_payloads: List[Int] := []
+    if target >= 0:
+        target_info := get_type_info(target)
+        for v, vi in target_info.variants:
+            if strings_equal(v, variant_name) and vi < target_info.variant_types.len():
+                target_payloads = target_info.variant_types[vi]
     mut arg_types: List[Int] := []
     mut arg_exprs: List[Int] := []
-    for ai in arg_indices:
+    for ai, i in arg_indices:
         a_expr := argument_expression_index(ai)
         arg_exprs.push(a_expr)
+        if i < target_payloads.len():
+            note_literal_target(a_expr, target_payloads[i])
         arg_types.push(c_check_expr(a_expr, scope_id))
     mut type_args: List[Int] := []
+    mut inferred := true
     for param in generic_params:
         mut bound := 0 - 1
         for pn, i in payload_nodes:
             if bound < 0:
                 bound = generic_enum_param_binding(pn, param, arg_types[i])
         if bound < 0:
-            return TID_ERR
+            inferred = false
         type_args.push(bound)
-    tid := instantiate_generic_type(decl_idx, type_args)
+    mut tid := target
+    if inferred:
+        tid = instantiate_generic_type(decl_idx, type_args)
     if tid < 0:
         return TID_ERR
     info := get_type_info(tid)
@@ -6952,10 +7014,22 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         gdecl := get_node(gdecl_idx)
         if gdecl.kind == "enum_decl":
             if enum_decl_has_variant(gdecl, method_name):
-                return check_generic_enum_variant_construction(gdecl_idx, method_name, arg_indices, scope_id)
+                return check_generic_enum_variant_construction(checker_current_node_index(), gdecl_idx, method_name, arg_indices, scope_id)
             if has_method_declaration(recv_node.value + "." + method_name) == false:
                 report_error_at_name(checker_current_node_index(), "E212", recv_node.value + " has no variant or method '" + method_name + "'")
                 return TID_ERR
+    # the same constructor through an import alias, `ev.Slot.Full("a")`. the
+    # receiver `ev.Slot` names no value either, and the call typed as the
+    # error wildcard without a word: `x: Int := ev.Slot.Full("a")` passed, and
+    # the emitter, with no instance to read, built the box without the
+    # destructor for its payload and retained it as a borrow.
+    qualified_enum_idx := module_generic_enum_decl_index(node.children[0])
+    if qualified_enum_idx >= 0:
+        if enum_decl_has_variant(get_node(qualified_enum_idx), method_name):
+            return check_generic_enum_variant_construction(checker_current_node_index(), qualified_enum_idx, method_name, arg_indices, scope_id)
+        if has_method_declaration(recv_node.value + "." + method_name) == false:
+            report_error_at_name(checker_current_node_index(), "E212", recv_node.value + " has no variant or method '" + method_name + "'")
+            return TID_ERR
 
     mut receiver_type := c_check_expr(node.children[0], scope_id)
     if is_error_type(receiver_type) and recv_node.kind == "ident":
@@ -7886,6 +7960,10 @@ fn check_field_access_expression(node_idx: Int, node: Node, scope_id: Int) -> In
         if gdecl.kind == "enum_decl" and enum_decl_has_variant(gdecl, field_name) == false:
             report_error_at_name(node_idx, "E212", obj_node.value + " has no variant '" + field_name + "'")
             return TID_ERR
+    qualified_enum_idx := module_generic_enum_decl_index(obj_node_idx)
+    if qualified_enum_idx >= 0 and enum_decl_has_variant(get_node(qualified_enum_idx), field_name) == false:
+        report_error_at_name(node_idx, "E212", obj_node.value + " has no variant '" + field_name + "'")
+        return TID_ERR
 
     obj_type := c_check_expr(obj_node_idx, scope_id)
     if is_error_type(obj_type):

@@ -1,0 +1,61 @@
+# typed toml, yaml and config decodes of a struct whose optional String field
+# is present in the document, flat and inside a nested and an optional nested
+# struct, one shape per SHAPE. the handle and config lowerings wrapped the
+# present value in a Some that borrowed it, the way the json one did (#1144),
+# so the string outlived the struct: about 31 bytes per flat decode and 219
+# per nested one.
+import std.toml as toml
+import std.yaml as yaml
+import std.config as config
+import leakprobe as probe
+
+pub struct Srv:
+    pub host: String
+    pub note: String?
+    pub port: Int
+
+pub struct Inner:
+    pub label: String
+    pub note: String?
+
+pub struct Outer:
+    pub host: String
+    pub inner: Inner
+    pub tag: Inner?
+
+fn main():
+    n := probe.rounds()
+    shape := env("SHAPE")
+    mut i := 0
+    mut total := 0
+    while i < n:
+        if shape == "toml":
+            doc := "host = \"h{i}\"\nnote = \"n{i}\"\nport = 3\n"
+            r := toml.decode_text[Srv](doc)
+            if r.is_ok:
+                total = total + r.ok.host.len()
+        elif shape == "toml_nested":
+            doc := "host = \"h{i}\"\n[inner]\nlabel = \"l{i}\"\nnote = \"n{i}\"\n[tag]\nlabel = \"t\"\nnote = \"x{i}\"\n"
+            r := toml.decode_text[Outer](doc)
+            if r.is_ok:
+                total = total + r.ok.host.len()
+        elif shape == "yaml":
+            doc := "host: h{i}\nnote: n{i}\nport: 3\n"
+            r := yaml.decode_text[Srv](doc)
+            if r.is_ok:
+                total = total + r.ok.host.len()
+        elif shape == "yaml_nested":
+            doc := "host: h{i}\ninner:\n  label: l{i}\n  note: n{i}\ntag:\n  label: t\n  note: x{i}\n"
+            r := yaml.decode_text[Outer](doc)
+            if r.is_ok:
+                total = total + r.ok.host.len()
+        elif shape == "config":
+            doc := "host = \"h{i}\"\nnote = \"n{i}\"\nport = 3\n"
+            r := config.from_toml_typed[Srv](doc)
+            if r.is_ok:
+                total = total + r.ok.host.len()
+        i = i + 1
+    if total == 0:
+        print("no decode succeeded")
+        return
+    print("{probe.peak_kb()}")

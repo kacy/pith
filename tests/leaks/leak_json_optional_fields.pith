@@ -1,0 +1,131 @@
+# typed json.decode of optional fields, one shape per SHAPE: the optional
+# scalars of a flat struct, an optional String inside a nested struct and
+# inside each element of a list of structs, and an optional struct, list,
+# list of structs and map, all present in the document, then all of them
+# absent. the decode wrapped each present value in a Some that borrowed it, so
+# the struct's destructor freed the shell and left the String, list, map or
+# struct with a count nobody dropped (#1144): 80 to 410 bytes per decode on
+# top of the document's own.
+#
+# every document is an interpolation handed straight to decode_text, and
+# SHAPE=concat hands it a concatenation. the decode released a text argument
+# only when a call minted it, so both kinds stranded the document, about 60
+# bytes per decode. SHAPE=path hands decode_text_path an interpolated document
+# and a concatenated path, neither of which it released at all.
+import std.json as json
+import leakprobe as probe
+
+pub struct Flat:
+    pub id: Int
+    pub count: Int?
+    pub ratio: Float?
+    pub flag: Bool?
+    pub note: String?
+    pub name: String
+
+pub struct Inner:
+    pub label: String
+    pub note: String?
+
+pub struct Outer:
+    pub code: String
+    pub inner: Inner
+    pub note: String?
+
+pub struct WithOptStruct:
+    pub code: String
+    pub inner: Inner?
+
+pub struct WithOptLists:
+    pub code: String
+    pub tags: List[String]?
+    pub nums: List[Int]?
+
+pub struct WithItems:
+    pub code: String
+    pub items: List[Inner]
+
+pub struct WithOptItems:
+    pub code: String
+    pub items: List[Inner]?
+
+pub struct WithOptMap:
+    pub code: String
+    pub attrs: Map[String, String]?
+
+fn decode_present(shape: String, i: Int) -> Int:
+    if shape == "flat":
+        r := json.decode_text[Flat]("\{\"id\":{i},\"count\":3,\"ratio\":1.5,\"flag\":true,\"note\":\"n{i}\",\"name\":\"p{i}\"\}")
+        if r.is_ok:
+            return r.ok.name.len()
+    elif shape == "nested":
+        r := json.decode_text[Outer]("\{\"code\":\"c{i}\",\"inner\":\{\"label\":\"l{i}\",\"note\":\"n{i}\"\},\"note\":\"o{i}\"\}")
+        if r.is_ok:
+            return r.ok.code.len()
+    elif shape == "opt_struct":
+        r := json.decode_text[WithOptStruct]("\{\"code\":\"c{i}\",\"inner\":\{\"label\":\"l{i}\",\"note\":\"n{i}\"\}\}")
+        if r.is_ok:
+            return r.ok.code.len()
+    elif shape == "opt_lists":
+        r := json.decode_text[WithOptLists]("\{\"code\":\"c{i}\",\"tags\":[\"a{i}\",\"b\"],\"nums\":[1,2,3]\}")
+        if r.is_ok:
+            return r.ok.code.len()
+    elif shape == "items":
+        r := json.decode_text[WithItems]("\{\"code\":\"c{i}\",\"items\":[\{\"label\":\"a{i}\",\"note\":\"x{i}\"\},\{\"label\":\"b\"\}]\}")
+        if r.is_ok:
+            return r.ok.code.len()
+    elif shape == "opt_items":
+        r := json.decode_text[WithOptItems]("\{\"code\":\"c{i}\",\"items\":[\{\"label\":\"a{i}\",\"note\":\"x{i}\"\}]\}")
+        if r.is_ok:
+            return r.ok.code.len()
+    elif shape == "opt_map":
+        r := json.decode_text[WithOptMap]("\{\"code\":\"c{i}\",\"attrs\":\{\"k\":\"v{i}\"\}\}")
+        if r.is_ok:
+            return r.ok.code.len()
+    elif shape == "concat":
+        r := json.decode_text[Flat]("\{\"id\":" + i.to_string() + ",\"name\":\"p\"\}")
+        if r.is_ok:
+            return r.ok.name.len()
+    elif shape == "path":
+        r := json.decode_text_path[Inner]("\{\"a\":\{\"label\":\"l{i}\",\"note\":\"n{i}\"\}\}", "a" + "")
+        if r.is_ok:
+            return r.ok.label.len()
+    return 0
+
+fn decode_absent(i: Int) -> Int:
+    mut total := 0
+    f := json.decode_text[Flat]("\{\"id\":{i},\"name\":\"p{i}\"\}")
+    if f.is_ok:
+        total = total + f.ok.name.len()
+    o := json.decode_text[Outer]("\{\"code\":\"c{i}\",\"inner\":\{\"label\":\"l{i}\"\}\}")
+    if o.is_ok:
+        total = total + o.ok.code.len()
+    s := json.decode_text[WithOptStruct]("\{\"code\":\"c{i}\"\}")
+    if s.is_ok:
+        total = total + s.ok.code.len()
+    l := json.decode_text[WithOptLists]("\{\"code\":\"c{i}\"\}")
+    if l.is_ok:
+        total = total + l.ok.code.len()
+    it := json.decode_text[WithOptItems]("\{\"code\":\"c{i}\"\}")
+    if it.is_ok:
+        total = total + it.ok.code.len()
+    m := json.decode_text[WithOptMap]("\{\"code\":\"c{i}\"\}")
+    if m.is_ok:
+        total = total + m.ok.code.len()
+    return total
+
+fn main():
+    n := probe.rounds()
+    shape := env("SHAPE")
+    mut i := 0
+    mut total := 0
+    while i < n:
+        if shape == "absent":
+            total = total + decode_absent(i)
+        else:
+            total = total + decode_present(shape, i)
+        i = i + 1
+    if total == 0:
+        print("no decode succeeded")
+        return
+    print("{probe.peak_kb()}")

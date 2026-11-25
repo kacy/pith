@@ -52,8 +52,9 @@
 #     starts with `.` (an encoded `..`, or a hidden file) gets 404. a NUL byte
 #     gets 400. symbolic links under `dir` are followed, as static files
 #     follow them.
-#   - at most MAX_PAGE_BYTES of markdown; a larger file, front matter that does
-#     not parse, or a layout that fails to render gets 500.
+#   - at most MAX_PAGE_BYTES of markdown. a larger file, front matter that
+#     does not parse, or a layout that fails to render gets 500, and the
+#     reason goes to the log.
 #   - `Last-Modified` and a strong `ETag`, with 304 and 412 for conditional
 #     requests, from `http.serve_content`. the time is the later of the file's
 #     modification time and the time the handler was made, since a new layout
@@ -105,10 +106,12 @@ fn serve(site: Site, req: web.Request) -> http.HttpResponse:
     request_path := req.path()
     if found.directory != request_path.ends_with("/"):
         return canonical_redirect(req, request_path, found.directory)
-    page := render_page(site, found.file) catch:
+    page := render_page(site.layout, found.file)
+    if page.is_err:
+        log.root().error().str("file", found.file).err(page.err).msg("could not render a markdown page")
         return http.server_error_response()
     modified := max(fs.modified(found.file) catch 0, site.made)
-    resp := http.serve_content(req.raw, "page.html", modified, bytes.from_string_utf8(page))
+    resp := http.serve_content(req.raw, "page.html", modified, bytes.from_string_utf8(page.ok))
     if resp.content_type == http.MIME_HTML:
         return resp.header("Content-Type", "text/html; charset=utf-8")
     return resp
@@ -157,19 +160,15 @@ fn canonical_redirect(req: web.Request, request_path: String, directory: Bool) -
         location = location + "?" + query
     return http.redirect_response(location)
 
-# the html of the page in `file`, rendered through the site's layout.
-fn render_page(site: Site, file: String) -> String!:
-    size := fs.size(file)!
-    if size > MAX_PAGE_BYTES:
-        fail "page {file} is larger than {MAX_PAGE_BYTES} bytes"
+# the html of the page in `file`, rendered through `layout`. the size is
+# checked before the read and again after, in case the file grew between.
+fn render_page(layout: template.Template, file: String) -> String!:
+    if fs.size(file)! > MAX_PAGE_BYTES:
+        fail "the page is larger than {MAX_PAGE_BYTES} bytes"
     source := fs.read(file)!
     if source.len() > MAX_PAGE_BYTES:
-        fail "page {file} is larger than {MAX_PAGE_BYTES} bytes"
-    result := render_source(site.layout, source)
-    if result.is_err:
-        log.root().error().str("file", file).err(result.err).msg("could not render a markdown page")
-        fail result.err
-    return result.ok
+        fail "the page is larger than {MAX_PAGE_BYTES} bytes"
+    return render_source(layout, source)!
 
 # the html of a page whose markdown is `source`.
 fn render_source(layout: template.Template, source: String) -> String!:

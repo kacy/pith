@@ -71,6 +71,7 @@ import std.log as log
 import std.markdown as markdown
 import std.net.http as http
 import std.os.path as path
+import std.pith.highlight as highlight
 import std.template as template
 import std.time as time
 import std.toml as toml
@@ -92,8 +93,15 @@ struct Site:
 #
 #   app.get("/docs/*path", pages.handler("docs", layout))
 pub fn handler(dir: String, layout: template.Template) -> fn(web.Request) -> http.HttpResponse:
-    site := Site(dir: dir, layout: layout.heading_ids(true), made: time.unix())
+    site := Site(dir: dir, layout: site_layout(layout), made: time.unix())
     return fn(req: web.Request) => serve(site, req)
+
+# the layout as pages render through it: heading ids on, and pith code blocks
+# highlighted unless the layout has a code highlighter of its own.
+fn site_layout(layout: template.Template) -> template.Template:
+    if layout.highlights_code():
+        return layout.heading_ids(true)
+    return layout.heading_ids(true).code_highlighter(highlight.code_block)
 
 # answer one request for a page.
 fn serve(site: Site, req: web.Request) -> http.HttpResponse:
@@ -274,7 +282,7 @@ LAYOUT := "<title><%= title %></title><nav><% for h in toc %><a href=\"#<%= h.id
 fn rendered(source: String) -> String:
     layout := template.compile(LAYOUT) catch:
         return "bad layout"
-    return render_source(layout.heading_ids(true), source) catch "error"
+    return render_source(site_layout(layout), source) catch "error"
 
 test "a page renders through the layout with its toc and front matter":
     page := rendered("---\ntitle: A <b> page\n---\n# Hello\n\n## Next step\n")
@@ -293,6 +301,22 @@ test "front matter cannot replace the body or the toc":
 test "raw html in a page is shown as text":
     page := rendered("<script>alert(1)</script>\n\n[x](javascript:alert(1))")
     assert(page.contains("<main><p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n<p><a href=\"\">x</a></p>\n</main>"))
+
+test "pith code blocks are highlighted and other code is escaped":
+    page := rendered("# code\n\n```pith\nx := \"</code><script>\"\n```\n\n```html\n<script>alert(1)</script>\n```\n")
+    assert(page.contains("<pre><code class=\"language-pith\"><span class=\"pith-var\">x</span> <span class=\"pith-op\">:=</span> <span class=\"pith-str\">&quot;&lt;/code&gt;&lt;script&gt;&quot;</span>\n</code></pre>\n"))
+    assert(page.contains("<pre><code class=\"language-html\">&lt;script&gt;alert(1)&lt;/script&gt;\n</code></pre>\n"))
+    assert(not page.contains("<script>"))
+
+# a layout's own highlighter for the test below: every block in capitals.
+fn upper_code(language: String, code: String) -> String?:
+    return "<pre>" + code.to_upper().replace("<", "&lt;") + "</pre>"
+
+test "a layout with a highlighter of its own keeps it":
+    layout := template.compile(LAYOUT) catch:
+        return
+    page := render_source(site_layout(layout.code_highlighter(upper_code)), "```pith\nx := 1\n```\n") catch "error"
+    assert(page.contains("<main><pre>X := 1\n</pre>\n</main>"))
 
 test "front matter that does not parse fails the page":
     assert_eq(rendered("---\na: [\n---\nbody"), "error")

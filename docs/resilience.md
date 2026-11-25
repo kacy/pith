@@ -51,7 +51,7 @@ is the point — the cap holds for the whole app, not per connection.
 ```pith
 limiter := resilience.rate_limiter(100, 20)   # 100/s, bursts to 20
 if not limiter.allow():
-    # a denied caller decides what denial means: 429, drop, fallback
+    ...   # a denied caller decides what denial means: 429, drop, fallback
 ```
 
 `allow` never waits. in a served app, wrap it as middleware:

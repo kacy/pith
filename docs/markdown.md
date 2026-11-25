@@ -146,10 +146,11 @@ html := markdown.render(readme_text, trusted)
 | `gfm(Bool)` | `true` | the github extensions: tables, strikethrough, task lists, extended autolinks, footnotes, and the tag filter on raw html |
 | `heading_ids(Bool)` | `false` | give each heading an `id` made from its text, as github does (see [heading ids](#heading-ids-and-tables-of-contents)) |
 | `heading_anchors(Bool)` | `false` | also start each heading with a link to itself. turns heading ids on |
+| `code_highlighter(hook)` | none | write each code block through `hook` (see [highlighting code](#highlighting-code)). what the hook returns is trusted like raw html |
 
-both escape hatches are spelled out as method names, so
-`grep -rn 'allow_html(true)\|allow_unsafe_urls(true)'` lists every place a
-program trusts its markdown.
+the escape hatches are spelled out as method names, so
+`grep -rn 'allow_html(true)\|allow_unsafe_urls(true)\|code_highlighter('`
+lists every place a program trusts its markdown or the code that renders it.
 
 ## events
 
@@ -243,6 +244,19 @@ the block structure is parsed when `events` is called, since a link may use a
 reference defined at the end of the document. inline content is parsed one
 paragraph or heading at a time as the iterator reaches it.
 
+`line()` on the iterator is the line, counted from 1, that the block of the
+last event starts on: a paragraph's first line, a list item's marker, a fenced
+code block's opening fence. an inline event reports its paragraph's line.
+`pith doc --check` finds each example's line this way:
+
+```pith
+stream := markdown.events(source, markdown.options())
+for event in stream:
+    if let Event.Start(opened) = event:
+        if let Tag.CodeBlock(info) = opened:
+            print("a block of {info} code at line {stream.line()}")
+```
+
 ## renderers
 
 `Renderer` is the interface a backend implements:
@@ -277,6 +291,37 @@ impl Renderer for TextLength:
 
 length := markdown.render_with(post, markdown.options(), TextLength(total: 0))
 ```
+
+## highlighting code
+
+`options().code_highlighter(hook)` makes the html renderer write each code
+block through a function. the hook gets the block's language, which is the
+first word of its info string, and its code. it returns the html for the whole
+block, or `none` to have the block written as usual. `std.pith.highlight` has
+one for pith:
+
+```pith
+import std.markdown as markdown
+import std.pith.highlight as highlight
+
+opts := markdown.options().code_highlighter(highlight.code_block)
+page := markdown.render("```pith\nx := 1\n```\n", opts)
+# "<pre><code class=\"language-pith\"><span class=\"pith-var\">x</span> ..."
+```
+
+`code_block` takes the blocks whose language is `pith`, colors them with the
+compiler's own lexer, and escapes all of the code, so nothing in a block can
+close the `<pre>` or open a tag. for any other language it returns `none`, and
+those blocks are escaped as before. it writes the classes `pith-kw`,
+`pith-str` and the rest, and `highlight.STYLESHEET` is a light and a dark theme
+for them.
+
+the renderer writes what a hook returns into the page unescaped. that makes a
+hook a trust boundary of the same kind as `allow_html(true)`. a hook of your
+own has to escape the code itself, and the grep under [options](#options)
+finds every program that sets one. `std.markdown` does not import the
+highlighter, so a program that renders markdown without one does not compile
+the lexer.
 
 ## heading ids and tables of contents
 
@@ -376,6 +421,19 @@ text. in an attribute value, a tag, a comment, `<script>`, `<style>`,
 compiled template turn on heading ids and anchors for its `<%md %>` tags.
 [docs/html.md](html.md) covers the rest of the template language.
 
+`page.code_highlighter(hook)` writes the code blocks of a template's `<%md %>`
+tags through a hook, as [highlighting code](#highlighting-code) describes:
+
+```pith
+page := template.compile("<article><%md post.body %></article>")!
+highlighted := page.code_highlighter(highlight.code_block)
+```
+
+a template trusts its hook's html the way it trusts `<%raw %>`, so the `<%raw`
+audit looks for `code_highlighter(` as well. `<%md %>` highlights nothing until
+a template is given a hook. `std.template` does not import the highlighter,
+because every program that uses templates would then compile the lexer.
+
 ## pages in std.web
 
 `std.web.pages` serves a directory of markdown files as html through a layout
@@ -408,6 +466,11 @@ with the safe defaults and with heading ids, so a layout needs no `<%raw %>`
 and nothing in a markdown file can write raw html or a `javascript:` url. pass
 `layout.heading_anchors(true)` for heading anchors.
 
+pith code blocks are highlighted with `highlight.code_block`, unless the layout
+already has a code highlighter of its own (`layout.highlights_code()`). the
+spans carry classes, so the page needs a stylesheet for them. serve
+`highlight.STYLESHEET` and link it from the layout, as the site below does.
+
 what it serves:
 
 - only markdown. a page is found by adding `.md` or `/index.md` to the path,
@@ -433,7 +496,7 @@ served this way on the development machine, this file (10 KB) takes about
 `std.toml` does not parse dates yet, so toml front matter with a bare date
 fails to parse. quote the date or use yaml.
 
-## a docs site in fifteen lines
+## a docs site in twenty-five lines
 
 `layout.html`:
 
@@ -441,6 +504,7 @@ fails to parse. quote the date or use yaml.
 <!doctype html>
 <meta charset="utf-8">
 <title><%= title %></title>
+<link rel="stylesheet" href="/pith.css">
 <nav><% for h in toc %><a class="h<%= h.level %>" href="#<%= h.id %>"><%= h.text %></a>
 <% end %></nav>
 <main><%md content %></main>
@@ -449,22 +513,89 @@ fails to parse. quote the date or use yaml.
 `site.pith`:
 
 ```pith
+import std.net.http as http
+import std.pith.highlight as highlight
 import std.template as template
 import std.web as web
 import std.web.pages as pages
+
+# the theme for the classes of highlighted pith code
+fn stylesheet(req: web.Request) -> http.HttpResponse:
+    return http.response(200).with_body_text(highlight.STYLESHEET).header("Content-Type", "text/css; charset=utf-8")
 
 fn main() -> Int!:
     layout := template.load("layout.html") catch:
         print("layout.html does not compile")
         return 1
-    app := web.new().get("/*path", pages.handler("docs", layout.heading_anchors(true)))
+    app := web.new().get("/pith.css", stylesheet).get("/*path", pages.handler("docs", layout.heading_anchors(true)))
     app.listen("0.0.0.0", 8080)!
     return 0
 ```
 
 with `docs/index.md` and `docs/guide/setup.md` in place, `/` serves the first
-and `/guide/setup` the second, each with its own table of contents. the routes
-`web.new()` adds, `/healthz` and `/metrics`, come first and keep working.
+and `/guide/setup` the second, each with its own table of contents and its
+pith code highlighted. the routes `web.new()` adds, `/healthz` and `/metrics`,
+come first and keep working.
+
+## in the terminal
+
+`std.markdown.terminal` lays a document out for a terminal. headings, lists,
+block quotes and tables become text, styles become ansi codes, pith code is
+highlighted, and every line is wrapped to the width:
+
+```pith
+import std.markdown as markdown
+import std.markdown.terminal as terminal
+
+print(terminal.render(source, 80))
+plain := markdown.render_with(source, markdown.options(), terminal.renderer(80).colors(false))
+```
+
+without colors, part of this file at 40 columns reads:
+
+```text
+## options
+
+`options()` returns the defaults. each
+builder method returns a changed copy
+and leaves the receiver alone, so a
+shared base can be specialized:
+
+    trusted := markdown.options().allow_
+    html(true)
+```
+
+- widths are counted in terminal columns with `std.text.width`, so 日 takes
+  two and a family emoji two. text wraps between words, a word wider than a
+  line breaks between graphemes, and a line of code breaks at the width.
+- a heading keeps its `#` marker. emphasis is italic, strong text bold,
+  strikethrough struck, and a code span has a color of its own. a link is
+  underlined, with its url after it in parentheses unless the text is the url.
+- code blocks are indented four columns, and a pith block is highlighted
+  from `highlight.spans`.
+- lists keep their bullets or numbers, task items show `[ ]` and `[x]`, block
+  quotes have a `│` bar, and footnotes follow a rule at the end.
+- each table column is as wide as its widest cell. when the table is wider
+  than the terminal, the widest columns are cut to the largest width that fits
+  and their cells wrap. a table with so many columns that one column each does
+  not fit runs past the width.
+- `renderer(columns)` writes styles unless NO_COLOR is set (see
+  `term.no_color()`), and `colors(false)` or `colors(true)` overrides that.
+  without colors, code spans keep their backticks and strikethrough keeps its
+  tildes.
+
+a terminal acts on the escape sequences it reads, so the renderer shows the
+control characters of the document in caret notation (`^[` for escape) and c1
+controls as U+FFFD. the only escape sequences in its output are the styles it
+writes, and each line closes its own.
+
+`pith doc <topic>` shows a guide this way, so `pith doc markdown` shows this
+file, and `pith doc <file.md>` shows any markdown file. on a terminal the text
+takes the terminal's width, up to 100 columns, and its colors, and a guide
+longer than the screen goes through `$PAGER`, or through `less` with `LESS=FRX`
+when `PAGER` is unset. sent anywhere else, it is plain text 80 columns wide.
+the guides come from the `docs/` directory of the checkout or the install the
+command belongs to, and the release packages include it.
 
 ## limits
 
@@ -550,5 +681,8 @@ parsed on its own.
 
 later work builds on the event stream and the options above:
 
-- a terminal renderer that writes ansi styles, and code highlighting hooks for
-  the html and terminal renderers.
+- highlighters for languages other than pith, through the same hook.
+- links in the terminal as osc 8 hyperlinks, once `std.term` can write them.
+  until then a link's url follows its text.
+- source positions for inline events. `line()` gives the line of an event's
+  block, which is as precise as `pith doc --check` needs.

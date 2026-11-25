@@ -131,7 +131,7 @@ off the handle:
 ports := yaml.get_array(root, "ports")
 mut i := 0
 while i < yaml.array_len(ports):
-    print(yaml.scalar_int(yaml.array_get(ports, i)))
+    print("{yaml.scalar_int(yaml.array_get(ports, i))}")
     i = i + 1
 ```
 

@@ -14,7 +14,7 @@ import std.text as text
 
 text.char_count("Ärger")     # 5, where "Ärger".len() is 6
 text.truncate("Ärger", 1)    # "Ä"
-text.is_valid(input)         # is this really utf-8?
+text.is_valid(raw)           # is this really utf-8?
 ```
 
 ## substring aborts rather than corrupt a character
@@ -151,7 +151,9 @@ comparisons, written with the only tool that was there:
 
 ```pith
 if header.to_lower() == "content-type":   # fine, headers are ascii
+    ...
 if username.to_lower() == stored:         # broken the moment a name is not
+    ...
 ```
 
 the second one is the bug. use `fold`:
@@ -211,7 +213,7 @@ bytes — so they hash differently, compare unequal, and land in a database as
 two rows.
 
 ```pith
-text.normalize(input)   # NFC, the composed form
+text.normalize(name)    # NFC, the composed form
 ```
 
 normalize at the edge, where text arrives, and store the result. for an

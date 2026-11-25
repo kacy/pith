@@ -1,0 +1,984 @@
+# std.markdown.terminal - markdown laid out for a terminal
+#
+# a std.markdown renderer that writes a document as text for a terminal of a
+# given width, with ansi styles:
+#
+#   import std.markdown as markdown
+#   import std.markdown.terminal as terminal
+#
+#   print(terminal.render(source, 80))
+#   plain := markdown.render_with(source, markdown.options(), terminal.renderer(80).colors(false))
+#
+# what it writes:
+#
+#   - headings in bold after their level marker, `#` to `######`.
+#   - emphasis in italics, strong text in bold, strikethrough struck through
+#     and code spans in a color of their own. a link is underlined, with its
+#     url after it in parentheses unless the text already is the url.
+#   - code blocks indented four columns. a block whose language is pith is
+#     highlighted with std.pith.highlight; any other keeps one color.
+#   - block quotes behind a `│` bar, lists with `•` bullets (`◦` and `▪`
+#     deeper) or numbers, task items with `[ ]` and `[x]`, and a blank line
+#     between the items of a loose list, as in the html.
+#   - tables with each column as wide as its widest cell, narrowed and
+#     wrapped to fit the width when they do not, and aligned as the
+#     delimiter row says. a table with more columns than the width has room
+#     for at one column each runs past it.
+#   - footnote references as `[1]`, and the definitions after a rule at the
+#     end.
+#
+# text is wrapped between words to the width, counted in terminal columns
+# with std.text.width, so a wide character such as 日 takes two and a family
+# emoji two. a word longer than a line is broken between graphemes, which is
+# also how a run of cjk text with no spaces wraps. code lines are broken at
+# the width rather than between words.
+#
+# ## colors
+#
+# `renderer(columns)` writes ansi styles unless the NO_COLOR environment
+# variable is set (see std.term's no_color). `colors(false)` turns them off
+# and `colors(true)` on whatever the environment says. without colors, code
+# spans keep their backticks and strikethrough its tildes, so the markup
+# still shows.
+#
+# ## escape sequences in the text
+#
+# a terminal acts on the escape sequences it reads, so text from the document
+# never reaches it as it is: every c0 control character in text, code, urls
+# and labels is written in caret notation (`^[` for escape, `^?` for delete)
+# and every c1 control as U+FFFD. the only escape sequences in the output are
+# the styles this module writes, and each line closes its own, so a style
+# never runs past the end of a line.
+
+import std.markdown as markdown
+import std.pith.highlight as highlight
+import std.strings as strings
+import std.term as term
+import std.text.graphemes as graphemes
+import std.text.width as display
+from std.markdown import Event, Tag, Alignment, Renderer
+
+# the narrowest a line's text is laid out, however deep the nesting.
+MIN_COLUMNS := 10
+
+# the sgr parameters of each style.
+STYLE_BOLD := "1"
+STYLE_DIM := "2"
+STYLE_ITALIC := "3"
+STYLE_STRIKE := "9"
+STYLE_LINK := "4;34"
+STYLE_CODE := "36"
+STYLE_NOTE := "36"
+
+# the bullets of unordered lists, by how deep the list is.
+BULLETS := ["•", "◦", "▪"]
+
+# the line between table columns.
+COLUMN_RULE := " │ "
+
+## a run of text in one style: the sgr parameters, "" for none. a piece with
+## `breaks` set is a hard line break and holds no text.
+struct Piece:
+    text: String
+    style: String
+    breaks: Bool = false
+
+# what a container adds in front of each line of its content: `first` for its
+# first line, once, and `rest` for the others.
+struct Frame:
+    first: String
+    rest: String
+    style: String
+    used: Bool = false
+
+# an open list: whether it is numbered, the number of its next item, and
+# whether it is tight.
+struct ListLevel:
+    ordered: Bool
+    next: Int
+    tight: Bool
+
+# a table row: one list of pieces per cell, and whether it is the header.
+struct Row:
+    cells: List[List[Piece]]
+    head: Bool
+
+## Lays a document's events out as terminal text. Get one from `renderer`.
+pub struct TerminalRenderer:
+    columns: Int
+    color: Bool
+    # the lines written so far.
+    lines: List[String] = []
+    frames: List[Frame] = []
+    # whether a blank line goes before the next block.
+    blank_due: Bool = false
+    # the inline content of the paragraph, heading or table cell being read,
+    # and whether it is the text of a tight list item, which has no
+    # paragraph events around it.
+    pieces: List[Piece] = []
+    inline_open: Bool = false
+    implicit: Bool = false
+    heading_level: Int = 0
+    bold: Int = 0
+    italic: Int = 0
+    strike: Int = 0
+    linked: Int = 0
+    # each open link's or image's url and the index of its first piece.
+    link_urls: List[String] = []
+    link_starts: List[Int] = []
+    lists: List[ListLevel] = []
+    # a code block is held until it ends: its info string and its code.
+    code_open: Bool = false
+    code_info: String = ""
+    code_text: String = ""
+    # the table being read: its alignments and rows.
+    table_open: Bool = false
+    alignments: List[Alignment] = []
+    rows: List[Row] = []
+    # footnote numbers by label, in the order of first reference.
+    footnotes: Map[String, Int] = {}
+    footnotes_written: Bool = false
+
+## A renderer for a terminal `columns` wide. it writes ansi styles unless the
+## NO_COLOR environment variable is set.
+pub fn renderer(columns: Int) -> TerminalRenderer:
+    return TerminalRenderer(columns: max(columns, MIN_COLUMNS), color: not term.no_color())
+
+## `source` laid out for a terminal `columns` wide with the safe default
+## options, styled unless NO_COLOR is set.
+pub fn render(source: String, columns: Int) -> String:
+    return markdown.render_with(source, markdown.options(), renderer(columns))
+
+impl TerminalRenderer:
+    ## A renderer that writes ansi styles when `enabled` is true and plain
+    ## text when it is false, whatever the environment says.
+    fn colors(enabled: Bool) -> TerminalRenderer:
+        self.color = enabled
+        return self
+
+impl Renderer for TerminalRenderer:
+    ## Lays out one event.
+    fn event(event: Event):
+        if self.code_open:
+            if let Event.Text(content) = event:
+                self.code_text = content
+                return
+            self.code_open = false
+            self.write_code(self.code_info, self.code_text)
+            return
+        match event:
+            Event.Start(tag) =>
+                self.open(tag)
+            Event.End(tag) =>
+                self.close(tag)
+            Event.Text(content) =>
+                self.add(content, self.style())
+            Event.Code(content) =>
+                if self.color:
+                    self.add(content, STYLE_CODE)
+                else:
+                    self.add("`" + content + "`", "")
+            Event.Html(content) =>
+                self.write_html(content)
+            Event.InlineHtml(content) =>
+                self.add(content, self.style())
+            Event.SoftBreak =>
+                self.add(" ", "")
+            Event.HardBreak =>
+                self.inline_begun()
+                self.pieces.push(Piece(text: "", style: "", breaks: true))
+            Event.Rule =>
+                self.begin_block()
+                self.emit(self.paint("─".repeat(self.room()), STYLE_DIM))
+                self.blank_due = true
+            Event.TaskMarker(checked) =>
+                mut marker := "[ ] "
+                if checked:
+                    marker = "[x] "
+                last := self.frames.len() - 1
+                self.frames[last].first = marker
+                self.frames[last].rest = "    "
+            Event.FootnoteReference(label) =>
+                mut number := self.footnotes.get(label).unwrap_or(0)
+                if number == 0:
+                    number = self.footnotes.len() + 1
+                    self.footnotes[label] = number
+                self.add("[{number}]", self.when_colored(STYLE_NOTE))
+
+    ## The text laid out so far, every line ended with a newline.
+    fn finish() -> String:
+        self.end_implicit()
+        if self.lines.len() == 0:
+            return ""
+        return self.lines.join("\n") + "\n"
+
+impl TerminalRenderer:
+    fn open(tag: Tag):
+        match tag:
+            Tag.Paragraph =>
+                self.begin_block()
+                self.begin_inline(false)
+            Tag.Heading(level, id) =>
+                self.begin_block()
+                self.begin_inline(false)
+                self.heading_level = level
+                self.pieces.push(Piece(text: "#".repeat(level) + " ", style: self.style()))
+            Tag.BlockQuote =>
+                self.begin_block()
+                self.frames.push(Frame(first: "│ ", rest: "│ ", style: STYLE_DIM))
+            Tag.CodeBlock(info) =>
+                self.code_open = true
+                self.code_info = info
+                self.code_text = ""
+            Tag.List(start, tight) =>
+                self.begin_block()
+                self.lists.push(ListLevel(ordered: start != none, next: start.unwrap_or(1), tight: tight))
+            Tag.Item =>
+                self.end_implicit()
+                self.frames.push(self.item_frame())
+            Tag.Emphasis =>
+                self.italic += 1
+            Tag.Strong =>
+                self.bold += 1
+            Tag.Strikethrough =>
+                self.strike += 1
+                if not self.color:
+                    self.add("~~", "")
+            Tag.Link(url, title) =>
+                self.inline_begun()
+                self.link_urls.push(url)
+                self.link_starts.push(self.pieces.len())
+                self.linked += 1
+            Tag.Image(url, title) =>
+                self.add("[image: ", self.when_colored(STYLE_DIM))
+                self.link_urls.push(url)
+                self.link_starts.push(-1)
+            Tag.Table(columns) =>
+                self.begin_block()
+                self.table_open = true
+                self.alignments = columns
+                self.rows = []
+            Tag.TableHead =>
+                self.rows.push(Row(cells: [], head: true))
+            Tag.TableRow =>
+                self.rows.push(Row(cells: [], head: false))
+            Tag.TableCell(alignment) =>
+                self.begin_inline(false)
+            Tag.FootnoteDefinition(label) =>
+                self.end_implicit()
+                if not self.footnotes_written:
+                    self.footnotes_written = true
+                    self.begin_block()
+                    self.emit(self.paint("─".repeat(min(self.room(), 20)), STYLE_DIM))
+                    self.blank_due = true
+                marker := "[{self.footnotes.get(label).unwrap_or(0)}] "
+                self.frames.push(Frame(first: marker, rest: " ".repeat(marker.len()), style: self.when_colored(STYLE_NOTE)))
+
+    fn close(tag: Tag):
+        match tag:
+            Tag.Paragraph =>
+                self.end_inline()
+                self.blank_due = true
+            Tag.Heading(level, id) =>
+                self.end_inline()
+                self.heading_level = 0
+                self.blank_due = true
+            Tag.BlockQuote =>
+                self.end_implicit()
+                self.frames.remove(self.frames.len() - 1)
+                self.blank_due = true
+            Tag.CodeBlock(info) =>
+                return
+            Tag.List(start, tight) =>
+                self.lists.remove(self.lists.len() - 1)
+                self.blank_due = true
+            Tag.Item =>
+                self.end_implicit()
+                self.frames.remove(self.frames.len() - 1)
+                # the items of a tight list follow each other directly
+                if self.lists.len() > 0 and self.lists[self.lists.len() - 1].tight:
+                    self.blank_due = false
+            Tag.Emphasis =>
+                self.italic -= 1
+            Tag.Strong =>
+                self.bold -= 1
+            Tag.Strikethrough =>
+                if not self.color:
+                    self.add("~~", "")
+                self.strike -= 1
+            Tag.Link(url, title) =>
+                self.linked -= 1
+                self.end_link()
+            Tag.Image(url, title) =>
+                self.add("]", self.when_colored(STYLE_DIM))
+                self.end_link()
+            Tag.Table(columns) =>
+                self.table_open = false
+                self.write_table()
+                self.blank_due = true
+            Tag.TableHead | Tag.TableRow =>
+                return
+            Tag.TableCell(alignment) =>
+                self.rows[self.rows.len() - 1].cells.push(self.pieces)
+                self.pieces = []
+                self.inline_open = false
+            Tag.FootnoteDefinition(label) =>
+                self.end_implicit()
+                self.frames.remove(self.frames.len() - 1)
+                self.blank_due = true
+
+    # the frame of a new list item: its bullet or number, then as many
+    # spaces on the lines after.
+    fn item_frame() -> Frame:
+        last := self.lists.len() - 1
+        level := self.lists[last]
+        if level.ordered:
+            marker := "{level.next}. "
+            self.lists[last].next = level.next + 1
+            return Frame(first: marker, rest: " ".repeat(marker.len()), style: "")
+        mut depth := 0
+        for i in 0..last:
+            if not self.lists[i].ordered:
+                depth += 1
+        return Frame(first: BULLETS[depth % BULLETS.len()] + " ", rest: "  ", style: "")
+
+    # the style of text at this point, from the headings and inline tags
+    # around it.
+    fn style() -> String:
+        if not self.color:
+            return ""
+        mut codes: List[String] := []
+        if self.heading_level == 1:
+            codes.push("1;35")
+        elif self.heading_level == 2:
+            codes.push("1;36")
+        elif self.heading_level > 2:
+            codes.push(STYLE_BOLD)
+        if self.bold > 0:
+            codes.push(STYLE_BOLD)
+        if self.italic > 0:
+            codes.push(STYLE_ITALIC)
+        if self.strike > 0:
+            codes.push(STYLE_STRIKE)
+        if self.linked > 0:
+            codes.push(STYLE_LINK)
+        return codes.join(";")
+
+    fn when_colored(style: String) -> String:
+        if self.color:
+            return style
+        return ""
+
+    # add text to the inline content, opening the text of a tight list item
+    # when nothing is open.
+    fn add(content: String, style: String):
+        self.inline_begun()
+        self.pieces.push(Piece(text: inline_text(content), style: style))
+
+    fn inline_begun():
+        if not self.inline_open:
+            self.begin_block()
+            self.begin_inline(true)
+
+    fn begin_inline(implicit: Bool):
+        self.pieces = []
+        self.inline_open = true
+        self.implicit = implicit
+
+    # a link's or an image's url after its text, unless the text says it.
+    fn end_link():
+        url := self.link_urls[self.link_urls.len() - 1]
+        start := self.link_starts[self.link_starts.len() - 1]
+        self.link_urls.remove(self.link_urls.len() - 1)
+        self.link_starts.remove(self.link_starts.len() - 1)
+        if url == "":
+            return
+        if start >= 0:
+            mut shown: List[String] := []
+            for i in start..self.pieces.len():
+                shown.push(self.pieces[i].text)
+            words := shown.join("")
+            if words == url or "mailto:" + words == url:
+                return
+        self.add(" (" + url + ")", self.when_colored(STYLE_DIM))
+
+    # lay out the inline content gathered since it opened.
+    fn end_inline():
+        if not self.inline_open:
+            return
+        self.inline_open = false
+        self.implicit = false
+        for line in wrap(self.pieces, self.room()):
+            self.emit(self.painted(line))
+        self.pieces = []
+
+    # close a tight list item's text before a block inside the item.
+    fn end_implicit():
+        if self.inline_open and self.implicit:
+            self.end_inline()
+
+    # a block starts: close a tight item's text, and write the blank line
+    # owed to the block before.
+    fn begin_block():
+        self.end_implicit()
+        if self.blank_due and self.lines.len() > 0:
+            self.emit_blank()
+        self.blank_due = false
+
+    # how many columns the text of a line has after the containers' marks.
+    fn room() -> Int:
+        mut used := 0
+        for frame in self.frames:
+            used += display.of(frame.rest)
+        return max(self.columns - used, MIN_COLUMNS)
+
+    # write a line of content behind the containers' marks: each container's
+    # first mark on its first line, its other mark after.
+    fn emit(content: String):
+        mut parts: List[String] := []
+        for i in 0..self.frames.len():
+            frame := self.frames[i]
+            mut mark := frame.rest
+            if not frame.used:
+                mark = frame.first
+                self.frames[i].used = true
+            parts.push(self.paint(mark, frame.style))
+        parts.push(content)
+        self.lines.push(trim_end(parts.join("")))
+
+    # a blank line inside the containers, which uses no container's first
+    # mark.
+    fn emit_blank():
+        mut parts: List[String] := []
+        for frame in self.frames:
+            parts.push(self.paint(trim_end(frame.rest), frame.style))
+        self.lines.push(trim_end(parts.join("")))
+
+    fn paint(content: String, style: String) -> String:
+        if not self.color or style == "" or content == "":
+            return content
+        return chr(27) + "[" + style + "m" + content + chr(27) + "[0m"
+
+    # a line of pieces as text, each run of one style painted once.
+    fn painted(line: List[Piece]) -> String:
+        mut out: List[String] := []
+        mut run: List[String] := []
+        mut style := ""
+        for piece in line:
+            if piece.style != style and run.len() > 0:
+                out.push(self.paint(run.join(""), style))
+                run = []
+            style = piece.style
+            run.push(piece.text)
+        if run.len() > 0:
+            out.push(self.paint(run.join(""), style))
+        return out.join("")
+
+    # a code block, indented and broken at the width. pith is highlighted
+    # when colors are on.
+    fn write_code(info: String, code: String):
+        self.begin_block()
+        language := first_word(info)
+        room := max(self.room() - 4, MIN_COLUMNS)
+        for line in code_lines(code, language == "pith" and self.color, self.when_colored(STYLE_CODE)):
+            for part in break_line(line, room):
+                self.emit("    " + self.painted(part))
+        self.blank_due = true
+
+    # a raw html block, which only arrives when the options allow html: its
+    # lines as text.
+    fn write_html(content: String):
+        self.begin_block()
+        for line in code_lines(content, false, ""):
+            for part in break_line(line, self.room()):
+                self.emit(self.painted(part))
+        self.blank_due = true
+
+    # the table read since it opened, laid out in columns.
+    fn write_table():
+        count := self.alignments.len()
+        if count == 0 or self.rows.len() == 0:
+            return
+        mut natural: List[Int] := []
+        for c in 0..count:
+            mut widest := 1
+            for row in self.rows:
+                if c < row.cells.len():
+                    widest = max(widest, pieces_width(row.cells[c]))
+            natural.push(widest)
+        sized := column_widths(natural, self.room() - display.of(COLUMN_RULE) * (count - 1))
+        rule := self.paint(COLUMN_RULE, self.when_colored(STYLE_DIM))
+        for row in self.rows:
+            mut cell_lines: List[List[List[Piece]]] := []
+            mut height := 1
+            for c in 0..count:
+                mut cell: List[Piece] := []
+                if c < row.cells.len():
+                    cell = row.cells[c]
+                if row.head and self.color:
+                    cell = emboldened(cell)
+                wrapped := wrap(cell, sized[c])
+                height = max(height, wrapped.len())
+                cell_lines.push(wrapped)
+            for k in 0..height:
+                mut parts: List[String] := []
+                for c in 0..count:
+                    mut line: List[Piece] := []
+                    if k < cell_lines[c].len():
+                        line = cell_lines[c][k]
+                    parts.push(aligned(self.painted(line), pieces_width(line), sized[c], self.alignments[c]))
+                self.emit(parts.join(rule))
+            if row.head:
+                mut dashes: List[String] := []
+                for c in 0..count:
+                    dashes.push("─".repeat(sized[c]))
+                self.emit(self.paint(dashes.join("─┼─"), self.when_colored(STYLE_DIM)))
+
+# ---------------------------------------------------------------
+# layout
+# ---------------------------------------------------------------
+
+# the words of inline content and the hard breaks between them. a word is
+# the pieces between two spaces, so it can change style partway.
+struct Word:
+    pieces: List[Piece]
+    cells: Int
+    spaced: Bool
+    breaks: Bool
+
+fn words_of(pieces: List[Piece]) -> List[Word]:
+    mut out: List[Word] := []
+    mut current: List[Piece] := []
+    mut spaced := false
+    mut space_due := false
+    for piece in pieces:
+        if piece.breaks:
+            add_word(out, current, spaced)
+            current = []
+            out.push(Word(pieces: [], cells: 0, spaced: false, breaks: true))
+            space_due = false
+            continue
+        parts := strings.split_keep_empty(piece.text, " ")
+        for part, k in parts:
+            if k > 0:
+                add_word(out, current, spaced)
+                current = []
+                space_due = true
+            if part != "":
+                if current.len() == 0:
+                    spaced = space_due
+                    space_due = false
+                current.push(Piece(text: part, style: piece.style))
+    add_word(out, current, spaced)
+    return out
+
+fn add_word(out: List[Word], pieces: List[Piece], spaced: Bool):
+    if pieces.len() > 0:
+        out.push(Word(pieces: pieces, cells: pieces_width(pieces), spaced: spaced, breaks: false))
+
+fn pieces_width(pieces: List[Piece]) -> Int:
+    mut texts: List[String] := []
+    for piece in pieces:
+        texts.push(piece.text)
+    return display.of(texts.join(""))
+
+## inline content filled into lines at most `room` columns wide, broken
+## between words, and inside a word only when it is wider than a line.
+fn wrap(pieces: List[Piece], room: Int) -> List[List[Piece]]:
+    mut lines: List[List[Piece]] := []
+    mut line: List[Piece] := []
+    mut used := 0
+    for word in words_of(pieces):
+        if word.breaks:
+            lines.push(line)
+            line = []
+            used = 0
+            continue
+        mut gap := 0
+        if used > 0 and word.spaced:
+            gap = 1
+        if used + gap + word.cells <= room:
+            if gap > 0:
+                line.push(Piece(text: " ", style: space_style(line, word)))
+            for piece in word.pieces:
+                line.push(piece)
+            used += gap + word.cells
+        elif word.cells <= room:
+            lines.push(line)
+            line = word.pieces
+            used = word.cells
+        else:
+            # wider than a line: start it here when a grapheme fits, and
+            # break it wherever the line is full
+            if gap > 0 and used + 1 < room:
+                line.push(Piece(text: " ", style: ""))
+                used += 1
+            for piece in word.pieces:
+                for g in graphemes.split(piece.text):
+                    cells := display.of_grapheme(g)
+                    if used + cells > room and used > 0:
+                        lines.push(line)
+                        line = []
+                        used = 0
+                    line.push(Piece(text: g, style: piece.style))
+                    used += cells
+    if line.len() > 0 or lines.len() == 0:
+        lines.push(line)
+    return lines
+
+# the style of the space before `word`: the style on both sides of it, so a
+# run of underlined or struck words has no gaps, and none otherwise.
+fn space_style(line: List[Piece], word: Word) -> String:
+    before := line[line.len() - 1].style
+    if before == word.pieces[0].style:
+        return before
+    return ""
+
+## a line of code broken into parts at most `room` columns wide, between
+## graphemes.
+fn break_line(line: List[Piece], room: Int) -> List[List[Piece]]:
+    mut parts: List[List[Piece]] := []
+    mut part: List[Piece] := []
+    mut used := 0
+    for piece in line:
+        if used + display.of(piece.text) <= room:
+            part.push(piece)
+            used += display.of(piece.text)
+            continue
+        for g in graphemes.split(piece.text):
+            cells := display.of_grapheme(g)
+            if used + cells > room and used > 0:
+                parts.push(part)
+                part = []
+                used = 0
+            part.push(Piece(text: g, style: piece.style))
+            used += cells
+    parts.push(part)
+    return parts
+
+## the lines of a code block as pieces: highlighted with std.pith.highlight
+## when `pith` is set, all in `style` otherwise. tabs become spaces and
+## control characters are made visible.
+fn code_lines(code: String, pith: Bool, style: String) -> List[List[Piece]]:
+    mut lines: List[List[Piece]] := [[]]
+    if pith:
+        for span in highlight.spans(code):
+            add_code(lines, code.substring(span.start, span.start + span.len), span_style(span.kind))
+    else:
+        add_code(lines, code, style)
+    # the newline that ends the block's last line starts no line of its own
+    if lines.len() > 1 and lines[lines.len() - 1].len() == 0:
+        lines.remove(lines.len() - 1)
+    return lines
+
+fn add_code(lines: List[List[Piece]], content: String, style: String):
+    parts := strings.split_keep_empty(content, "\n")
+    for part, k in parts:
+        if k > 0:
+            lines.push([])
+        if part != "":
+            lines[lines.len() - 1].push(Piece(text: visible(part.replace(chr(9), "    ")), style: style))
+
+## the terminal style of a highlight span's kind.
+fn span_style(kind: String) -> String:
+    if kind == "keyword":
+        return "35"
+    if kind == "type":
+        return "36"
+    if kind == "function":
+        return "34"
+    if kind == "string":
+        return "32"
+    if kind == "number":
+        return "33"
+    if kind == "comment":
+        return "90;3"
+    if kind == "operator":
+        return "91"
+    return ""
+
+## a cell's pieces in bold, for a header row.
+fn emboldened(pieces: List[Piece]) -> List[Piece]:
+    mut out: List[Piece] := []
+    for piece in pieces:
+        mut style := STYLE_BOLD
+        if piece.style != "":
+            style = piece.style + ";" + STYLE_BOLD
+        out.push(Piece(text: piece.text, style: style, breaks: piece.breaks))
+    return out
+
+## the widths of table columns whose cells need `natural` columns, in `room`
+## columns in all. columns fit whole when they can; otherwise every column
+## wider than some cap is cut to it, the cap as large as fits, and what is
+## left goes to the cut columns from the left.
+fn column_widths(natural: List[Int], room: Int) -> List[Int]:
+    mut total := 0
+    mut widest := 1
+    for w in natural:
+        total += w
+        widest = max(widest, w)
+    if total <= room:
+        return natural
+    mut low := 1
+    mut high := widest
+    while low < high:
+        cap := (low + high + 1) / 2
+        if capped_total(natural, cap) <= room:
+            low = cap
+        else:
+            high = cap - 1
+    mut out: List[Int] := []
+    mut left := room - capped_total(natural, low)
+    for w in natural:
+        if w > low and left > 0:
+            out.push(low + 1)
+            left -= 1
+        else:
+            out.push(min(w, low))
+    return out
+
+fn capped_total(natural: List[Int], cap: Int) -> Int:
+    mut total := 0
+    for w in natural:
+        total += min(w, cap)
+    return total
+
+## `content`, which is `cells` columns wide, padded to `room` columns the
+## way `alignment` says.
+fn aligned(content: String, cells: Int, room: Int, alignment: Alignment) -> String:
+    gap := max(room - cells, 0)
+    return match alignment:
+        Alignment.Right => " ".repeat(gap) + content
+        Alignment.Center => " ".repeat(gap / 2) + content + " ".repeat(gap - gap / 2)
+        _ => content + " ".repeat(gap)
+
+## inline text made safe for a terminal: a tab or a line break is a space,
+## and other control characters are visible.
+fn inline_text(content: String) -> String:
+    return visible(content.replace(chr(9), " ").replace(chr(10), " ").replace(chr(13), " "))
+
+## `content` with every c0 control character in caret notation,
+## `^[` for escape and `^?` for delete, and every c1 control as U+FFFD, so
+## no escape sequence in a document reaches the terminal.
+fn visible(content: String) -> String:
+    mut i := 0
+    while i < content.len():
+        c := ord(content[i])
+        if c < 32 or c == 127 or (c == 194 and i + 1 < content.len() and ord(content[i + 1]) >= 128 and ord(content[i + 1]) < 160):
+            break
+        i += 1
+    if i == content.len():
+        return content
+    mut out: List[String] := [content.substring(0, i)]
+    while i < content.len():
+        c := ord(content[i])
+        if c < 32:
+            out.push("^" + chr(c + 64))
+            i += 1
+        elif c == 127:
+            out.push("^?")
+            i += 1
+        elif c == 194 and i + 1 < content.len() and ord(content[i + 1]) >= 128 and ord(content[i + 1]) < 160:
+            out.push("�")
+            i += 2
+        else:
+            start := i
+            i += 1
+            while i < content.len() and ord(content[i]) >= 32 and ord(content[i]) != 127 and ord(content[i]) != 194:
+                i += 1
+            out.push(content.substring(start, i))
+    return out.join("")
+
+# the first word of an info string, which names the block's language.
+fn first_word(info: String) -> String:
+    words := info.replace(chr(9), " ").split(" ")
+    if words.len() == 0:
+        return ""
+    return words[0]
+
+fn trim_end(line: String) -> String:
+    mut end := line.len()
+    while end > 0 and ord(line[end - 1]) == 32:
+        end -= 1
+    return line.substring(0, end)
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+fn plain(source: String, columns: Int) -> String:
+    return markdown.render_with(source, markdown.options(), renderer(columns).colors(false))
+
+fn styled(source: String, columns: Int) -> String:
+    return markdown.render_with(source, markdown.options(), renderer(columns).colors(true))
+
+# every line of `out` is at most `columns` wide once its styles are taken out.
+fn fits(out: String, columns: Int) -> Bool:
+    for line in out.split("\n"):
+        if display.of(term.strip(line)) > columns:
+            return false
+    return true
+
+SAMPLE := "# Title *here*\n\nSome **strong**, *emphasized*, ~~struck~~ and `coded` words that wrap, with a [link](https://example.com/page) and <https://example.com>.\n\n- one\n- two\n  - deeper\n- [x] done\n\n3. three\n4. four\n\n> quoted text\n\n```pith\nx := 1 # one\n```\n\n| a | b |\n| :- | -: |\n| left | 2 |\n\n---\n\nA note[^n].\n\n[^n]: The note.\n"
+
+test "a document laid out without colors at 40 columns":
+    expected := [
+        "# Title here",
+        "",
+        "Some strong, emphasized, ~~struck~~ and",
+        "`coded` words that wrap, with a link",
+        "(https://example.com/page) and",
+        "https://example.com.",
+        "",
+        "• one",
+        "• two",
+        "  ◦ deeper",
+        "[x] done",
+        "",
+        "3. three",
+        "4. four",
+        "",
+        "│ quoted text",
+        "",
+        "    x := 1 # one",
+        "",
+        "a    │ b",
+        "─────┼──",
+        "left │ 2",
+        "",
+        "─".repeat(40),
+        "",
+        "A note[1].",
+        "",
+        "─".repeat(20),
+        "",
+        "[1] The note.",
+    ]
+    assert_eq(plain(SAMPLE, 40), expected.join("\n") + "\n")
+
+test "the width decides where lines wrap":
+    wide := plain(SAMPLE, 80)
+    assert(wide.contains("Some strong, emphasized, ~~struck~~ and `coded` words that wrap, with a link\n(https://example.com/page) and https://example.com.\n"))
+    assert(wide.contains("\n" + "─".repeat(80) + "\n"))
+    assert(fits(wide, 80))
+    assert(fits(plain(SAMPLE, 40), 40))
+
+test "styles are ansi sgr codes that close on every line":
+    esc := chr(27)
+    out := styled("# T *e*\n\n**b** `c` ~~d~~ [l](https://x.io)\n\n```pith\nfn f():\n```\n\n> q\n", 80)
+    expected := [
+        esc + "[1;35m# T" + esc + "[0m " + esc + "[1;35;3me" + esc + "[0m",
+        "",
+        esc + "[1mb" + esc + "[0m " + esc + "[36mc" + esc + "[0m " + esc + "[9md" + esc + "[0m " + esc + "[4;34ml" + esc + "[0m " + esc + "[2m(https://x.io)" + esc + "[0m",
+        "",
+        "    " + esc + "[35mfn" + esc + "[0m " + esc + "[34mf" + esc + "[0m():",
+        "",
+        esc + "[2m│ " + esc + "[0mq",
+    ]
+    assert_eq(out, expected.join("\n") + "\n")
+    assert_eq(term.strip(out), "# T e\n\nb c d l (https://x.io)\n\n    fn f():\n\n│ q\n")
+
+test "a style that wraps is closed and opened again on each line":
+    esc := chr(27)
+    out := styled("**one two three four**", 10)
+    assert_eq(out, esc + "[1mone two" + esc + "[0m\n" + esc + "[1mthree four" + esc + "[0m\n")
+
+test "pith code is highlighted, other code keeps one color":
+    esc := chr(27)
+    out := styled("```pith\ns := \"a\" + 2 # c\n```\n\n```go\nx := 1\n```\n", 80)
+    assert(out.contains("    s " + esc + "[91m:=" + esc + "[0m " + esc + "[32m\"a\"" + esc + "[0m " + esc + "[91m+" + esc + "[0m " + esc + "[33m2" + esc + "[0m " + esc + "[90;3m# c" + esc + "[0m\n"))
+    assert(out.contains("\n    " + esc + "[36mx := 1" + esc + "[0m\n"))
+    assert_eq(plain("```pith\ns := 1\n```\n", 80), "    s := 1\n")
+
+test "wide characters take two columns":
+    assert_eq(plain("日本語のテキストを折り返す", 10), "日本語のテ\nキストを折\nり返す\n")
+    assert_eq(plain("abcd 日本語 e", 10), "abcd\n日本語 e\n")
+    out := plain("go 🎉🎉 party 👨‍👩‍👧 now", 10)
+    assert_eq(out, "go 🎉🎉\nparty 👨‍👩‍👧\nnow\n")
+    assert(fits(out, 10))
+
+test "a table wider than the terminal is narrowed and wrapped":
+    source := "| name | description | n |\n| --- | --- | --: |\n| first | a long description that cannot fit in the width | 1 |\n| second | short | 22 |\n"
+    out := plain(source, 30)
+    assert(fits(out, 30))
+    expected := [
+        "name   │ description      │  n",
+        "───────┼──────────────────┼───",
+        "first  │ a long           │  1",
+        "       │ description that │",
+        "       │ cannot fit in    │",
+        "       │ the width        │",
+        "second │ short            │ 22",
+    ]
+    assert_eq(out, expected.join("\n") + "\n")
+    narrow := plain("| " + "x".repeat(30) + " | " + "y".repeat(30) + " |\n| - | - |\n| a | b |\n", 20)
+    assert(fits(narrow, 20))
+
+test "a table of wide characters lines up by display width":
+    out := plain("| a | b |\n| :-: | - |\n| 日本 | x |\n| y | 🎉 |\n", 40)
+    assert_eq(out, " a   │ b\n─────┼───\n日本 │ x\n y   │ 🎉\n")
+
+test "escape sequences in a document are shown, never sent":
+    esc := chr(27)
+    source := "a" + esc + "[2Jb " + chr(7) + " `c" + esc + "]8;;x" + esc + "\\` [d](https://x.io/" + chr(127) + ")\n\n```\nraw" + esc + "[31m" + chr(194) + chr(155) + "1m\n```\n"
+    out := plain(source, 80)
+    assert(not out.contains(esc))
+    assert(not out.contains(chr(7)))
+    assert(not out.contains(chr(194) + chr(155)))
+    assert(out.contains("a^[[2Jb ^G `c^[]8;;x^[\\`"))
+    assert(out.contains("raw^[[31m�1m"))
+    colored := styled(source, 80)
+    # the only escapes left are the renderer's own styles
+    assert_eq(term.strip(colored).contains(esc), false)
+    assert(colored.contains("a^[[2Jb"))
+
+test "NO_COLOR turns the styles off":
+    os_set_env("NO_COLOR", "1")
+    quiet := render("**bold**", 80)
+    os_unset_env("NO_COLOR")
+    loud := render("**bold**", 80)
+    assert_eq(quiet, "bold\n")
+    assert_eq(loud, chr(27) + "[1mbold" + chr(27) + "[0m\n")
+    os_set_env("NO_COLOR", "")
+    assert_eq(render("**bold**", 80), loud)
+    os_unset_env("NO_COLOR")
+
+test "lists, quotes and footnotes nest":
+    source := "> - a\n>   1. b\n>      > c\n\n- [ ] open\n  more\n\n  second paragraph\n"
+    expected := [
+        "│ • a",
+        "│   1. b",
+        "│      │ c",
+        "",
+        "[ ] open more",
+        "",
+        "    second paragraph",
+    ]
+    assert_eq(plain(source, 40), expected.join("\n") + "\n")
+
+test "every line fits at every width":
+    mut parts: List[String] := []
+    for i in 0..30:
+        parts.push(SAMPLE)
+        parts.push("> - nested " + "word ".repeat(i) + "\n>   - deeper still " + "日本".repeat(i) + "\n")
+        parts.push("```\n" + "x".repeat(i * 7) + "\n```\n")
+    source := parts.join("\n")
+    for columns in [20, 33, 40, 80]:
+        assert(fits(plain(source, columns), columns))
+        assert(fits(styled(source, columns), columns))
+
+test "an empty document is empty":
+    assert_eq(plain("", 80), "")
+    assert_eq(plain("\n\n", 80), "")
+
+test "large inputs lay out in linear time":
+    # a word far wider than a line, a long run of cjk text, many list
+    # items, a wide table and a long code line: each grows the work with
+    # its size and nothing more
+    assert(fits(plain("x".repeat(200000), 40), 40))
+    assert(fits(plain("日本".repeat(50000), 40), 40))
+    assert(fits(plain("- item\n".repeat(20000), 40), 40))
+    header := "|" + " h |".repeat(200) + "\n|" + " - |".repeat(200) + "\n"
+    assert(plain(header + ("|" + " c |".repeat(200) + "\n").repeat(200), 80).len() > 0)
+    assert(fits(plain("```\n" + "y".repeat(200000) + "\n```\n", 40), 40))
+    assert(fits(styled("```pith\n" + "z := 1 + ".repeat(20000) + "1\n```\n", 40), 40))

@@ -230,9 +230,13 @@ fn run_cached_pipeline(path: String) -> CheckOutcome!:
         return check_entry(path, root, import_roots, resolved)
 
     # a miss: walk the closure from index 0 with the entry's nodes lifted
-    # out, then put them back after the imports
+    # out, then put them back after the imports. the arena no longer holds
+    # the cached closure from here on, so the cache is dropped first: a walk
+    # that stops at an import it cannot find returns before a new one is
+    # taken, and the next run must not truncate the arena to the old prefix
     positions := import_positions(root, imports)
     taken := take_nodes_from(entry_start)
+    clear_closure_cache()
     reset_arena()
     begin_driver(path)
     import_roots := resolve_import_list(imports, positions.0, positions.1, path)!
@@ -498,6 +502,29 @@ test "closure cache misses when the entry's import list changes":
     assert_eq(second.diags.len(), 0)
     assert_eq(second.import_roots.len(), 2)
     assert_eq(file_for_node(second.import_roots[1]), "__cache3_b.pith")
+    clear_closure_cache()
+    clear_source_overlays()
+
+test "closure cache recovers after an import it cannot find":
+    # a module with more nodes than the entry file, so a stale prefix
+    # reaches past the arena the failed walk leaves behind
+    set_source_overlay("__cache5_util.pith", "pub fn seven() -> Int:\n    return 7\n" + "fn padding(a: Int, b: Int) -> Int:\n    return a * b + a - b\n".repeat(40))
+    set_source_overlay("__cache5_main.pith", "import __cache5_util\n\nfn main():\n    print(__cache5_util.seven().to_string())\n")
+    enable_closure_cache()
+    first := run_check_pipeline("__cache5_main.pith")!
+    assert_eq(first.diags.len(), 0)
+    # an import of a module that does not exist stops the walk before the
+    # module the cache holds
+    set_source_overlay("__cache5_main.pith", "import __cache5_missing\nimport __cache5_util\n\nfn main():\n    print(__cache5_util.seven().to_string())\n")
+    missing := run_check_pipeline("__cache5_main.pith")!
+    assert(not missing.import_ok)
+    # back to the first import list: the closure is walked again rather
+    # than restored over an arena that no longer holds it
+    set_source_overlay("__cache5_main.pith", "import __cache5_util\n\nfn main():\n    x := __cache5_util.seven()\n    print(x.to_string())\n")
+    again := run_check_pipeline("__cache5_main.pith")!
+    assert(again.parse_ok and again.import_ok)
+    assert_eq(again.diags.len(), 0)
+    assert_eq(file_for_node(again.import_roots[0]), "__cache5_util.pith")
     clear_closure_cache()
     clear_source_overlays()
 

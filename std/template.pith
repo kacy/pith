@@ -89,14 +89,18 @@
 # `<%md path %>` renders the value as markdown with std.markdown's safe
 # defaults and writes the html in place: raw html in the value is shown as
 # text, and link and image urls go through `html.safe_url`. there is no way to
-# let raw html through from a template, so `<%md` is safe wherever it compiles
-# and a `grep -rn '<%raw'` audit can skip it. text that should keep its raw
-# html is rendered with std.markdown in pith and written with `<%raw %>`.
+# let raw html through from the markdown, so `<%md` is safe wherever it
+# compiles and a `grep -rn '<%raw'` audit can skip it. text that should keep
+# its raw html is rendered with std.markdown in pith and written with
+# `<%raw %>`.
 #
 # the html it writes is block content, so compile accepts it only in element
 # text: not in an attribute, a tag, a comment, `<script>`, `<style>`,
 # `<title>` or `<textarea>`. `heading_ids` and `heading_anchors` on a compiled
-# template give the headings ids and links to themselves.
+# template give the headings ids and links to themselves. `code_highlighter`
+# writes code blocks through a hook, such as `std.pith.highlight`'s
+# `code_block`, whose html is trusted as `<%raw %>` is, so the audit looks
+# for `code_highlighter(` too.
 
 import std.fs as fs
 import std.html as html
@@ -163,9 +167,11 @@ struct Node:
 # frozen once compile builds them.
 pub struct Template:
     frozen nodes: List[Node]
-    # how `<%md %>` renders headings: with ids, and with links to themselves.
-    markdown_ids: Bool = false
-    markdown_anchors: Bool = false
+    # how `<%md %>` renders: the safe defaults, plus heading ids, anchors and
+    # a code highlighter when the builders below ask for them.
+    markdown_opts: markdown.Options = markdown.options()
+    # whether markdown_opts has a code highlighter.
+    highlighted: Bool = false
 
 # the values a template renders. a thin, typed front for a `std.json` object
 # node, so a context can be built by hand or adopted from parsed json.
@@ -749,12 +755,24 @@ impl Template:
     # text, as `markdown.options().heading_ids(true)` does. the ids are unique
     # within one `<%md %>`, not across several.
     fn heading_ids(enabled: Bool) -> Template:
-        return Template(nodes: self.nodes, markdown_ids: enabled, markdown_anchors: self.markdown_anchors)
+        return Template(nodes: self.nodes, markdown_opts: self.markdown_opts.heading_ids(enabled), highlighted: self.highlighted)
 
     # A copy whose `<%md %>` tags also start each heading with a link to
     # itself, as `markdown.options().heading_anchors(true)` does.
     fn heading_anchors(enabled: Bool) -> Template:
-        return Template(nodes: self.nodes, markdown_ids: self.markdown_ids, markdown_anchors: enabled)
+        return Template(nodes: self.nodes, markdown_opts: self.markdown_opts.heading_anchors(enabled), highlighted: self.highlighted)
+
+    # A copy whose `<%md %>` tags write code blocks through `hook`, as
+    # `markdown.options().code_highlighter(hook)` does. what the hook returns
+    # reaches the page unescaped, so a template given one is audited like
+    # `<%raw %>`: `std.pith.highlight`'s `code_block` escapes everything,
+    # and a hook of your own has to as well.
+    fn code_highlighter(hook: fn(String, String) -> String?) -> Template:
+        return Template(nodes: self.nodes, markdown_opts: self.markdown_opts.code_highlighter(hook), highlighted: true)
+
+    # Whether `<%md %>` writes code blocks through a highlighter.
+    fn highlights_code() -> Bool:
+        return self.highlighted
 
 # record the matching `end` on the node that opened the block.
 fn close_block(nodes: List[Node], opener: Int, closer: Int) -> List[Node]:
@@ -932,8 +950,7 @@ fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[Strin
             # parsed rather than after.
             if source.len() > MAX_OUTPUT_BYTES:
                 fail TemplateError("markdown at '{node.path}' is larger than {MAX_OUTPUT_BYTES} bytes", node.offset)
-            opts := markdown.options().heading_ids(t.markdown_ids).heading_anchors(t.markdown_anchors)
-            piece := markdown.render(source, opts)
+            piece := markdown.render(source, t.markdown_opts)
             add_rendered_bytes(budget, piece.len(), node.offset)!
             parts.push(piece)
             index = index + 1
@@ -1363,6 +1380,23 @@ test "a template can give markdown headings ids and anchors":
     anchored := render(page.heading_anchors(true), ctx)!
     assert_eq(anchored, markdown.render("# Hi there\n\n## Hi there", markdown.options().heading_anchors(true)))
     assert_eq(render(page, ctx)!, "<h1>Hi there</h1>\n<h2>Hi there</h2>\n")
+
+# a code highlighter for the tests: blocks in "loud" in capitals, escaped.
+fn loud_code(language: String, code: String) -> String?:
+    if language != "loud":
+        return none
+    return "<pre class=\"loud\">" + html.escape(code.to_upper()) + "</pre>\n"
+
+test "a template can write markdown code blocks through a highlighter":
+    ctx := context().set("body", "# t\n\n```loud\n<a>\n```\n\n```go\nx\n```\n")
+    page := compile("<main><%md body %></main>")!
+    assert_eq(render(page, ctx)!, "<main><h1>t</h1>\n<pre><code class=\"language-loud\">&lt;a&gt;\n</code></pre>\n<pre><code class=\"language-go\">x\n</code></pre>\n</main>")
+    assert(not page.highlights_code())
+    loud := page.code_highlighter(loud_code).heading_ids(true)
+    assert(loud.highlights_code())
+    assert_eq(render(loud, ctx)!, "<main><h1 id=\"t\">t</h1>\n<pre class=\"loud\">&lt;A&gt;\n</pre>\n<pre><code class=\"language-go\">x\n</code></pre>\n</main>")
+    # the builders leave the receiver alone
+    assert_eq(render(page, ctx)!, "<main><h1>t</h1>\n<pre><code class=\"language-loud\">&lt;a&gt;\n</code></pre>\n<pre><code class=\"language-go\">x\n</code></pre>\n</main>")
 
 test "md output counts against MAX_OUTPUT_BYTES":
     too_big := context().set("v", "a".repeat(MAX_OUTPUT_BYTES + 1))

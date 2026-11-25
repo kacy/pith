@@ -315,7 +315,7 @@ this one fell out of the survey rather than the brief. a `with`-style block
 binds a resource for a scope and calls its closer on every exit — the same
 rewrite `defer` already uses, spelled as one construct instead of two lines:
 
-```pith
+```pith no-check
 with config := tls.client_config()!:
     ...
 ```

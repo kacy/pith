@@ -31,6 +31,11 @@
 #   markdown.toc(text, opts)                   the headings and their ids
 #   markdown.split_front_matter(text)          yaml or toml front matter
 #
+# std.markdown.terminal is a renderer for terminals, and
+# `options().code_highlighter(hook)` writes code blocks through a function
+# such as std.pith.highlight's `code_block`. what a hook returns is written
+# as it is, so a hook is trusted the way `allow_html(true)` is.
+#
 # `events` yields `Start(tag)` and `End(tag)` around containers, and `Text`,
 # `Code`, `Html`, `InlineHtml`, `SoftBreak`, `HardBreak`, `Rule`,
 # `TaskMarker` and `FootnoteReference` for the rest. adjacent text arrives as
@@ -108,6 +113,11 @@ HREF_SAFE := "000000000000000000000000000000000101110011111111111111111111010111
 # options
 # ---------------------------------------------------------------
 
+# the hook of options with no code highlighter: every block is written the
+# usual way.
+fn no_highlighter(language: String, code: String) -> String?:
+    return none
+
 # How a document is parsed and rendered. Build one with `options()` and the
 # builder methods; each method returns a changed copy and leaves the receiver
 # alone, so a shared base can be specialized safely.
@@ -117,6 +127,9 @@ pub struct Options:
     gfm_extensions: Bool = true
     heading_anchor_ids: Bool = false
     heading_anchor_links: Bool = false
+    # the hook that writes code blocks, and whether one was given.
+    highlighter: fn(String, String) -> String? = no_highlighter
+    highlighting: Bool = false
 
 # The safe defaults: raw html escaped, unsafe urls refused, gfm on.
 pub fn options() -> Options:
@@ -162,8 +175,22 @@ impl Options:
         copy.heading_anchor_links = enabled
         return copy
 
+    # A copy whose html renderer writes each code block through `hook`. the
+    # hook gets the block's language, the first word of its info string ("" for
+    # none), and its code, and returns the html for the whole block, `<pre>`
+    # and all, or none to have the block written the usual way. what it
+    # returns goes into the page as it is, so the hook must escape the code
+    # itself: it is trusted the way raw html is. `std.pith.highlight`'s
+    # `code_block` is one that highlights pith and escapes everything.
+    #
+    # the copy is built whole rather than changed after: a function field
+    # that is ever reassigned keeps a template holding these options from
+    # being shared with other tasks.
+    fn code_highlighter(hook: fn(String, String) -> String?) -> Options:
+        return Options(raw_html: self.raw_html, unsafe_urls: self.unsafe_urls, gfm_extensions: self.gfm_extensions, heading_anchor_ids: self.heading_anchor_ids, heading_anchor_links: self.heading_anchor_links, highlighter: hook, highlighting: true)
+
     fn copy() -> Options:
-        return Options(raw_html: self.raw_html, unsafe_urls: self.unsafe_urls, gfm_extensions: self.gfm_extensions, heading_anchor_ids: self.heading_anchor_ids, heading_anchor_links: self.heading_anchor_links)
+        return Options(raw_html: self.raw_html, unsafe_urls: self.unsafe_urls, gfm_extensions: self.gfm_extensions, heading_anchor_ids: self.heading_anchor_ids, heading_anchor_links: self.heading_anchor_links, highlighter: self.highlighter, highlighting: self.highlighting)
 
     # whether headings get ids, asked for directly or through anchors.
     fn wants_ids() -> Bool:
@@ -260,6 +287,9 @@ pub fn to_html(source: String) -> String:
 pub fn render(source: String, opts: Options) -> String:
     renderer := html_renderer()
     renderer.anchors = opts.heading_anchor_links
+    if opts.highlighting:
+        renderer.highlighter = opts.highlighter
+        renderer.highlighting = true
     return drive(events(source, opts), renderer)
 
 # Feeds the events of `source` to `renderer` and returns what it produces.
@@ -3038,6 +3068,8 @@ pub struct Events:
     # the heading ids given out so far, each with how many times its plain
     # form has been taken, for numbering the repeats.
     ids_taken: Map[String, Int] = {}
+    # the line the block of the last step starts on (see line).
+    block_line: Int = 0
 
 impl Iterator for Events:
     type Item = Event
@@ -3055,6 +3087,14 @@ impl Iterator for Events:
         return event
 
 impl Events:
+    # The line, counted from 1, that the block holding the last event
+    # returned starts on: a paragraph's first line, a fenced code block's
+    # opening fence, a list item's marker. an inline event reports the line
+    # of its paragraph or heading, and the end of a container the line the
+    # container starts on.
+    fn line() -> Int:
+        return self.block_line
+
     # walk one step through the block tree, queueing its events. the walk
     # follows parent and sibling links, so it uses no stack however deep the
     # tree is.
@@ -3062,6 +3102,7 @@ impl Events:
         blocks := self.document.blocks
         index := self.node
         block := blocks[index]
+        self.block_line = block.start_line
         if not self.entering:
             if block.kind == BlockKind.Document or block.kind == BlockKind.Footnote:
                 self.next_footnote(block)
@@ -3568,6 +3609,13 @@ pub struct HtmlRenderer:
     # inside the last such paragraph.
     footnote_depth: Int
     paragraph_held: Bool
+    # a code highlighter from the options, and the code block it is
+    # collecting: its info string and its text, until the block ends.
+    highlighter: fn(String, String) -> String? = no_highlighter
+    highlighting: Bool = false
+    code_open: Bool = false
+    code_info: String = ""
+    code_text: String = ""
 
 # A renderer that writes html.
 pub fn html_renderer() -> HtmlRenderer:
@@ -3587,6 +3635,9 @@ impl Renderer for HtmlRenderer:
             self.write("</p>\n")
         if self.image_depth > 0:
             self.alt_text_event(event)
+            return
+        if self.code_open:
+            self.code_event(event)
             return
         match event:
             Event.Start(tag) =>
@@ -3710,6 +3761,13 @@ impl HtmlRenderer:
                 self.write("<blockquote>\n")
                 self.footnote_depth += 1
             Tag.CodeBlock(info) =>
+                if self.highlighting:
+                    # the hook needs the whole block, so the text is held
+                    # until the block ends
+                    self.code_open = true
+                    self.code_info = info
+                    self.code_text = ""
+                    return
                 self.newline()
                 language := first_word(info)
                 if language.len() == 0:
@@ -3862,6 +3920,30 @@ impl HtmlRenderer:
             if reference > 1:
                 self.write("<sup class=\"footnote-ref\">{reference}</sup>")
             self.write("</a>")
+
+    # inside a code block held for the highlighter: keep its text, and at its
+    # end write what the hook returns, or the block the usual way.
+    fn code_event(event: Event):
+        if let Event.Text(content) = event:
+            self.code_text = content
+            return
+        self.code_open = false
+        language := first_word(self.code_info)
+        written := self.highlighter(language, self.code_text)
+        self.newline()
+        if written == none:
+            if language.len() == 0:
+                self.write("<pre><code>")
+            else:
+                self.write("<pre><code class=\"language-")
+                self.write_escaped(language)
+                self.write("\">")
+            self.write_escaped(self.code_text)
+            self.write("</code></pre>\n")
+        else:
+            self.write(written.value())
+            self.newline()
+        self.code_text = ""
 
     # inside an image, text becomes the alt attribute and tags are dropped.
     fn alt_text_event(event: Event):
@@ -4174,6 +4256,33 @@ test "front matter is bounded":
     at_limit := "a".repeat(MAX_FRONT_MATTER_BYTES - 1) + "\n"
     assert_eq(split_front_matter("---\n" + at_limit + "---\nb")!.data.len(), MAX_FRONT_MATTER_BYTES)
     assert_eq(front("---\n" + at_limit + "x\n---\nb"), "error")
+
+test "events report the line their block starts on":
+    stream := events("# title\n\npara\ngraph\n\n- a\n- b\n\n```pith\ncode\n```\n", options())
+    mut seen: List[String] := []
+    for event in stream:
+        seen.push(describe(event) + "@{stream.line()}")
+    assert_eq(seen.join(" "), "+h1@1 text(title)@1 -h1@1 +p@3 text(para)@3 soft@3 text(graph)@3 -p@3 +list[none true]@6 +item@6 text(a)@6 -item@6 +item@7 text(b)@7 -item@7 -list[none true]@6 +code[pith]@9 text(code\n)@9 -code[pith]@9")
+
+# a code highlighter for the tests: it takes blocks in "shout" and writes
+# them in capitals, escaped.
+fn shouting(language: String, code: String) -> String?:
+    if language != "shout":
+        return none
+    return "<pre class=\"shout\">" + html.escape(code.to_upper()) + "</pre>"
+
+test "a code highlighter writes the blocks it takes":
+    opts := options().code_highlighter(shouting)
+    assert_eq(render("```shout extra\na < b\n```\n\n```go\nx < 1\n```\n\n    plain\n", opts), "<pre class=\"shout\">A &lt; B\n</pre>\n<pre><code class=\"language-go\">x &lt; 1\n</code></pre>\n<pre><code>plain\n</code></pre>\n")
+    assert_eq(render("```shout\n```\n\nafter", opts), "<pre class=\"shout\"></pre>\n<p>after</p>\n")
+    assert_eq(render("- a\n\n  ```shout\n  b\n  ```\n", opts), "<ul>\n<li>\n<p>a</p>\n<pre class=\"shout\">B\n</pre>\n</li>\n</ul>\n")
+    assert_eq(render("x[^1]\n\n[^1]: note\n\n    ```shout\n    c\n    ```\n", opts), render("x[^1]\n\n[^1]: note\n\n    ```other\n    c\n    ```\n", options()).replace("<pre><code class=\"language-other\">c\n</code></pre>", "<pre class=\"shout\">C\n</pre>"))
+
+test "without a highlighter code blocks are written as before":
+    source := "```shout\n<b>\n```\n\n```\nx\n```\n"
+    assert_eq(render(source, options()), "<pre><code class=\"language-shout\">&lt;b&gt;\n</code></pre>\n<pre><code>x\n</code></pre>\n")
+    assert_eq(render(source, options().code_highlighter(shouting).allow_html(false)), "<pre class=\"shout\">&lt;B&gt;\n</pre>\n<pre><code>x\n</code></pre>\n")
+    assert_eq(to_html(source), render(source, options()))
 
 test "render_with drives any renderer":
     counter := CountingRenderer(counted: 0, texts: [])

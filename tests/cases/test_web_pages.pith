@@ -1,0 +1,132 @@
+# std.web.pages over a real socket: a directory of markdown files served
+# through a layout, with front matter in yaml and toml, a table of contents,
+# conditional requests, and the requests that must not reach a file: a
+# traversal, a hidden file, a file that is not markdown, a NUL byte and a page
+# past the size cap. each answer prints its status line, its content type and
+# its body; the validators change from run to run, so only their presence is
+# printed.
+import std.fs as fs
+import std.net.tcp as tcp
+import std.template as template
+import std.web as web
+import std.web.pages as pages
+
+PORT := 20871
+
+LAYOUT := "<title><%= title %></title>\n<nav><% for h in toc %><a class=\"h<%= h.level %>\" href=\"#<%= h.id %>\"><%= h.text %></a><% end %></nav>\n<% if tags %><ul><% for t in tags %><li><%= t %></li><% end %></ul>\n<% end %><main><%md content %></main>\n"
+
+fn write_site(root: String) -> Bool!:
+    fs.make_dirs(root + "/docs/guide")
+    fs.write(root + "/docs/index.md", "---\ntitle: Home & away\ntags:\n  - intro\n  - <b>bold</b>\n---\n# Welcome\n\nSee [the guide](guide/setup).\n")!
+    fs.write(root + "/docs/guide/index.md", "# Guide\n\nThe guide's index.\n")!
+    fs.write(root + "/docs/guide/setup.md", "+++\ntitle = \"Setup\"\ntags = [\"how-to\"]\n+++\n# Install\n\n## Run it\n\n## Run it\n")!
+    fs.write(root + "/docs/notes.md", "# Notes\n\n<script>alert(1)</script>\n\n[click](javascript:alert(1))\n")!
+    fs.write(root + "/docs/broken.md", "---\nlist: [unclosed\n---\nbody\n")!
+    fs.write(root + "/docs/big.md", "x".repeat(pages.MAX_PAGE_BYTES + 1))!
+    fs.write(root + "/docs/plain.txt", "not markdown\n")!
+    fs.write(root + "/docs/.hidden.md", "# hidden\n")!
+    fs.write(root + "/outside.md", "# outside the docs directory\n")!
+    return true
+
+fn serve_site(root: String) -> Int:
+    layout := template.compile(LAYOUT) catch:
+        return 1
+    app := web.bare().get("/docs/*path", pages.handler(root + "/docs", layout))
+    return app.listen("127.0.0.1", PORT) catch 0
+
+fn wait_for_port(port: Int):
+    for i in 0..500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return
+        sleep(10)
+
+# send `head_lines` as a request and read the whole answer.
+fn exchange(head_lines: String) -> String:
+    connected := tcp.connect("127.0.0.1", PORT)
+    if connected.is_err:
+        return ""
+    fd := connected.ok
+    tcp.set_timeout(fd, 5000)
+    tcp.write_all(fd, head_lines + "Host: localhost\r\nConnection: close\r\n\r\n") catch 0
+    mut parts: List[String] := []
+    mut reading := true
+    while reading:
+        chunk := tcp.read(fd, 65536) catch ""
+        if chunk == "":
+            reading = false
+        else:
+            parts.push(chunk)
+    tcp.close(fd)
+    return parts.join("")
+
+fn header_of(reply: String, name: String) -> String:
+    head := reply.substring(0, max(reply.index_of("\r\n\r\n"), 0))
+    for line in head.split("\r\n"):
+        if line.to_lower().starts_with(name.to_lower() + ": "):
+            return line.substring(name.len() + 2, line.len())
+    return ""
+
+fn body_of(reply: String) -> String:
+    split := reply.index_of("\r\n\r\n")
+    if split < 0:
+        return ""
+    return reply.substring(split + 4, reply.len())
+
+fn show(label: String, reply: String):
+    print("== " + label)
+    print(reply.split("\r\n")[0])
+    content_type := header_of(reply, "Content-Type")
+    if content_type != "":
+        print("content-type: " + content_type)
+    location := header_of(reply, "Location")
+    if location != "":
+        print("location: " + location)
+
+fn show_page(label: String, path: String):
+    reply := exchange("GET " + path + " HTTP/1.1\r\n")
+    show(label, reply)
+    print(body_of(reply))
+
+fn main() -> Int!:
+    root := fs.make_temp_dir("pith-pages-")!
+    write_site(root)!
+    spawn serve_site(root)
+    wait_for_port(PORT)
+
+    show_page("the index of the directory", "/docs/")
+    show_page("a nested page with toml front matter", "/docs/guide/setup")
+    show_page("a nested directory's index", "/docs/guide/")
+    show("a directory without its trailing slash", exchange("GET /docs HTTP/1.1\r\n"))
+    show("a nested directory without its trailing slash, with a query", exchange("GET /docs/guide?x=1 HTTP/1.1\r\n"))
+    show("a page with a trailing slash", exchange("GET /docs/guide/setup/ HTTP/1.1\r\n"))
+    show_page("raw html and a script url stay inert", "/docs/notes")
+
+    first := exchange("GET /docs/guide/setup HTTP/1.1\r\n")
+    etag := header_of(first, "ETag")
+    print("== validators")
+    print("etag: " + (etag.starts_with("\"") and etag.ends_with("\"")).to_string())
+    print("last-modified: " + (header_of(first, "Last-Modified") != "").to_string())
+    show("a matching If-None-Match", exchange("GET /docs/guide/setup HTTP/1.1\r\nIf-None-Match: " + etag + "\r\n"))
+    show("a stale If-None-Match", exchange("GET /docs/guide/setup HTTP/1.1\r\nIf-None-Match: \"stale\"\r\n"))
+    show("a matching If-Modified-Since", exchange("GET /docs/guide/setup HTTP/1.1\r\nIf-Modified-Since: " + header_of(first, "Last-Modified") + "\r\n"))
+    head := exchange("HEAD /docs/guide/setup HTTP/1.1\r\n")
+    show("HEAD", head)
+    print("body bytes: {body_of(head).len()}, length matches: {header_of(head, "Content-Length") == body_of(first).len().to_string()}")
+
+    show("a missing page", exchange("GET /docs/nope HTTP/1.1\r\n"))
+    show("the markdown file by its own name", exchange("GET /docs/notes.md HTTP/1.1\r\n"))
+    show("a file that is not markdown", exchange("GET /docs/plain.txt HTTP/1.1\r\n"))
+    show("a hidden file", exchange("GET /docs/.hidden HTTP/1.1\r\n"))
+    show("a plain dot-dot", exchange("GET /docs/../outside HTTP/1.1\r\n"))
+    show("an encoded dot-dot", exchange("GET /docs/%2e%2e/outside HTTP/1.1\r\n"))
+    show("a dot-dot behind an encoded slash", exchange("GET /docs/..%2Foutside HTTP/1.1\r\n"))
+    show("a nested dot-dot behind an encoded slash", exchange("GET /docs/guide/..%2F..%2Foutside HTTP/1.1\r\n"))
+    show("a NUL byte", exchange("GET /docs/notes%00 HTTP/1.1\r\n"))
+    show("front matter that does not parse", exchange("GET /docs/broken HTTP/1.1\r\n"))
+    show("a page past the size cap", exchange("GET /docs/big HTTP/1.1\r\n"))
+    show("a POST", exchange("POST /docs/notes HTTP/1.1\r\nContent-Length: 0\r\n"))
+
+    fs.remove_all(root)
+    return 0

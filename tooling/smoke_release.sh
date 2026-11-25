@@ -24,7 +24,7 @@ fn main() -> Int!:
     return 0
 
 test "arithmetic":
-    assert 1 + 2 == 3
+    assert(1 + 2 == 3)
 PITH
 
 pith version

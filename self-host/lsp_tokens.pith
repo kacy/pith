@@ -1,9 +1,9 @@
 # lsp_tokens.pith — semantic tokens, signature help, and inlay hints
 #
 # three presentation features over two sources of truth. semantic
-# tokens re-lex the document alone — no checker state — and classify
-# each lexeme from its token kind, so highlighting works even while the
-# text does not parse. signature help and inlay hints read the compiler
+# tokens re-lex the document alone, with no checker state, through
+# std.pith.highlight, so highlighting works even while the text does not
+# parse. signature help and inlay hints read the compiler
 # state the last front-end run left behind, the same way completion
 # does: the binding tables name every function and local the run
 # defined, and the type table renders their types.
@@ -14,7 +14,6 @@
 # helpers — here applied per line, so a full-document scan stays linear
 # in the text.
 
-from lexer import lex_all
 from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
 from driver import file_for_node, dr_read_source
 from types import get_type_name, get_type_info
@@ -22,6 +21,7 @@ from ast import get_node
 from lsp_state import uri_to_path, document_text, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line, text_has_at
 from lsp_features import analysis_is_checked, find_decl_position
 import std.json as json
+import std.pith.highlight as highlight
 
 # ---------------------------------------------------------------
 # semantic tokens
@@ -36,10 +36,6 @@ TOKEN_TYPE_FUNCTION := 4
 TOKEN_TYPE_TYPE := 5
 TOKEN_TYPE_VARIABLE := 6
 TOKEN_TYPE_OPERATOR := 7
-
-# lexer kinds that highlight as operators, matched the way the lexer
-# matches its keyword list.
-OPERATOR_KINDS := ",plus,minus,star,slash,percent,eq,eq_eq,bang,bang_eq,less,less_eq,greater,greater_eq,arrow,fat_arrow,colon_eq,plus_eq,minus_eq,star_eq,slash_eq,question,dotdot,dotdoteq,"
 
 ## the semantic token legend in index order. the initialize capability
 ## advertises exactly this list, so the classifier and the client's
@@ -56,44 +52,26 @@ fn is_ident_byte(b: Int) -> Bool:
         return true
     return b == 95
 
-# the legend index for one lexer token, or -1 for a token that does not
-# highlight: layout, punctuation, and errors. an identifier is a type
-# when it starts uppercase, a function when a "(" follows it directly,
-# and a variable otherwise.
-fn classify_token(kind: String, value: String, line_text: String, col: Int, len: Int) -> Int:
-    if kind.starts_with("kw_"):
+# the legend index for a std.pith.highlight span kind, or -1 for a kind
+# with no token: plain text and punctuation.
+fn legend_index(kind: String) -> Int:
+    if kind == "keyword":
         return TOKEN_TYPE_KEYWORD
-    if kind == "string_lit" or kind == "string_start":
+    if kind == "string":
         return TOKEN_TYPE_STRING
-    if kind == "int_lit" or kind == "float_lit":
+    if kind == "number":
         return TOKEN_TYPE_NUMBER
     if kind == "comment":
         return TOKEN_TYPE_COMMENT
-    if kind == "identifier":
-        if value == "locked" and locked_heads_block(line_text, col, len):
-            return TOKEN_TYPE_KEYWORD
-        first := ord(value[0])
-        if first >= 65 and first <= 90:
-            return TOKEN_TYPE_TYPE
-        after := col - 1 + len
-        if after < line_text.len() and ord(line_text[after]) == 40:
-            return TOKEN_TYPE_FUNCTION
+    if kind == "function":
+        return TOKEN_TYPE_FUNCTION
+    if kind == "type":
+        return TOKEN_TYPE_TYPE
+    if kind == "variable":
         return TOKEN_TYPE_VARIABLE
-    if OPERATOR_KINDS.contains("," + kind + ","):
+    if kind == "operator":
         return TOKEN_TYPE_OPERATOR
     return 0 - 1
-
-# `locked` is a keyword only where it opens a block: first on its line and
-# followed by a space and the mutex, the same test the parser makes.
-fn locked_heads_block(line_text: String, col: Int, len: Int) -> Bool:
-    mut i := 0
-    while i < col - 1 and i < line_text.len():
-        b := ord(line_text[i])
-        if b != 32 and b != 9:
-            return false
-        i = i + 1
-    after := col - 1 + len
-    return after + 1 < line_text.len() and ord(line_text[after]) == 32 and is_ident_byte(ord(line_text[after + 1]))
 
 # the document split into lines once, so per-token position conversion
 # works on the token's line instead of rescanning the whole text.
@@ -114,92 +92,36 @@ fn split_lines(text: String) -> List[String]:
 ## [deltaLine, deltaStartChar, length, tokenTypeIndex, modifierBits] —
 ## with lengths and characters in the negotiated encoding's units.
 ## lexer-based on purpose: highlighting keeps working mid-edit, when
-## the text would not parse. an interpolated string highlights as one
-## string token spanning the whole literal.
+## the text would not parse. the classification is std.pith.highlight's,
+## the one html highlighting uses, so an editor and a rendered page color
+## code alike; the expressions inside an interpolated string come back as
+## code between the pieces of the string.
 pub fn semantic_tokens_full(uri: String) -> Int:
     text := document_text(uri)
     mode := get_position_encoding()
     lines := split_lines(text)
-
-    # every classifiable lexer token, in source order. synthesized
-    # tokens (indent, newline, queued interpolation pieces) carry a
-    # zero length and drop out here.
-    mut e_lines: List[Int] := []
-    mut e_cols: List[Int] := []
-    mut e_lens: List[Int] := []
-    mut e_types: List[Int] := []
-    mut lexed_lines: Map[Int, Bool] := {}
-    for tok in lex_all(text):
-        line0 := tok.current_line - 1
-        if line0 < 0 or line0 >= lines.len():
-            continue
-        if tok.kind != "eof":
-            lexed_lines.insert(line0, true)
-        if tok.len <= 0 or tok.value.len() == 0:
-            continue
-        type_idx := classify_token(tok.kind, tok.value, lines[line0], tok.current_column, tok.len)
-        if type_idx < 0:
-            continue
-        e_lines.push(tok.current_line)
-        e_cols.push(tok.current_column)
-        e_lens.push(tok.len)
-        e_types.push(type_idx)
-
-    # the lexer treats a line holding only a comment as blank and skips
-    # it wholesale, so those comments are recovered with a direct scan.
-    # a line the lexer produced any token for is left alone — its
-    # trailing comment already came through.
-    mut c_lines: List[Int] := []
-    mut c_cols: List[Int] := []
-    mut c_lens: List[Int] := []
-    mut scan0 := 0
-    while scan0 < lines.len():
-        if not lexed_lines.contains_key(scan0):
-            lt := lines[scan0]
-            mut first := 0
-            while first < lt.len() and (ord(lt[first]) == 32 or ord(lt[first]) == 9):
-                first = first + 1
-            if first < lt.len() and ord(lt[first]) == 35:
-                c_lines.push(scan0 + 1)
-                c_cols.push(first + 1)
-                c_lens.push(lt.len() - first)
-        scan0 = scan0 + 1
-
-    # merge the two position-sorted runs and delta-encode. a recovered
-    # comment line never carries lexer tokens, so plain line order is a
-    # total order across the runs.
     data := json.make_array()
     mut prev_line0 := 0
     mut prev_char := 0
-    mut a := 0
-    mut b := 0
-    while a < e_lines.len() or b < c_lines.len():
-        mut take_comment := a >= e_lines.len()
-        if not take_comment and b < c_lines.len() and c_lines[b] < e_lines[a]:
-            take_comment = true
-        mut line1 := 0
-        mut col1 := 0
-        mut span := 0
-        mut type_idx := 0
-        if take_comment:
-            line1 = c_lines[b]
-            col1 = c_cols[b]
-            span = c_lens[b]
-            type_idx = TOKEN_TYPE_COMMENT
-            b = b + 1
-        else:
-            line1 = e_lines[a]
-            col1 = e_cols[a]
-            span = e_lens[a]
-            type_idx = e_types[a]
-            a = a + 1
-        lt := lines[line1 - 1]
+    # the line the spans have reached and the byte offset it starts at.
+    # spans come in source order and only a plain one holds a line break,
+    # so every span with a token sits on one line and the walk is linear.
+    mut line0 := 0
+    mut line_start := 0
+    for span in highlight.spans(text):
+        type_idx := legend_index(span.kind)
+        if type_idx < 0:
+            continue
+        while line0 + 1 < lines.len() and span.start > line_start + lines[line0].len():
+            line_start = line_start + lines[line0].len() + 1
+            line0 = line0 + 1
+        lt := lines[line0]
+        col1 := span.start - line_start + 1
         start := line_col_to_lsp_pos(lt, 1, col1, mode)
-        finish := line_col_to_lsp_pos(lt, 1, col1 + span, mode)
+        finish := line_col_to_lsp_pos(lt, 1, col1 + span.len, mode)
         units := finish.character - start.character
         if units <= 0:
             continue
-        line0 := line1 - 1
         mut delta_line := line0 - prev_line0
         mut delta_char := start.character
         if delta_line == 0:

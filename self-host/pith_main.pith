@@ -15,7 +15,8 @@
 #   pith lint --json <file>...  lint with JSON output
 #   pith doc <file.pith>        generate documentation
 #   pith doc --json <file>    documentation as JSON
-#   pith doc --check <file>   check all pub items documented
+#   pith doc --check <file>...  check all pub items documented, or for a
+#                             .md file that its pith code blocks type check
 #   pith doc search <query>   search stdlib docs
 #   pith package check        type check package root from pith.toml
 #   pith package test         run package root tests
@@ -46,6 +47,7 @@ from sharing_lint import lint_shared_globals
 from lock_order import lint_lock_order
 from errors import render_diagnostics, render_diagnostics_for_path, render_diagnostics_json, has_errors, unreadable_source_message
 from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_search
+from doc_examples import check_examples
 from package_cli import package_root_path, cmd_package_deps, cmd_package_lock, cmd_package_install, cmd_package_inspect, cmd_package_context, cmd_new
 from lsp_server import run_lsp_server
 import std.os as os
@@ -302,23 +304,38 @@ fn cmd_lint(path: String, json_mode: Bool) -> Bool:
 # doc command
 # ---------------------------------------------------------------
 
-fn cmd_doc(path: String, check_mode: Bool, json_mode: Bool) -> String!:
+fn cmd_doc(path: String, json_mode: Bool) -> String!:
     source := read_source_or_exit(path)
     doc_extract(source)
-
-    if check_mode:
-        missing := doc_check()
-        if missing > 0:
-            print(missing.to_string() + " undocumented pub item(s)")
-            exit(1)
-        print("ok")
-        return ""
-
     if json_mode:
         print(doc_format_json())
     else:
         print(doc_format())
     return ""
+
+# `doc --check` on one file: for a .md file, that its pith code blocks
+# type check (see doc_examples.pith); for a pith file, that every pub item
+# has a doc comment. false when the check fails.
+fn cmd_doc_check(path: String) -> Bool:
+    source := read_file(path) catch:
+        print_err(unreadable_source_message(path))
+        return false
+    if path.ends_with(".md"):
+        report := check_examples(path, source)
+        for line in report.errors:
+            print(line)
+        if report.failed > 0:
+            print("{path}: {report.failed} of {report.checked} pith blocks do not check")
+            return false
+        print("{path}: ok ({report.checked} pith blocks checked, {report.skipped} skipped)")
+        return true
+    doc_extract(source)
+    missing := doc_check()
+    if missing > 0:
+        print(missing.to_string() + " undocumented pub item(s)")
+        return false
+    print("ok")
+    return true
 
 fn cmd_doc_search(query: String) -> String!:
     result := doc_search(query, ".")!
@@ -340,7 +357,7 @@ fn cmd_package(action: String, args_list: List[String]) -> String!:
             exit(1)
         return ""
     if action == "doc":
-        return cmd_doc(root, false, false)
+        return cmd_doc(root, false)
     if action == "deps":
         return cmd_package_deps()
     if action == "lock":
@@ -439,7 +456,7 @@ fn print_help():
     print("  lint --json <file>...  lint (JSON output)")
     print("  doc <file.pith>          generate documentation")
     print("  doc --json <file>      documentation (JSON output)")
-    print("  doc --check <file>     check all pub items documented")
+    print("  doc --check <file>...  check all pub items documented, or the pith code in a .md file")
     print("  doc search <query>     search stdlib documentation")
     print("  package check          type check package root")
     print("  package test           run package root tests")
@@ -541,14 +558,16 @@ fn run_cli() -> String!:
             if a.len() < 4:
                 print("usage: pith doc --json <file.pith>")
                 exit(1)
-            _result := cmd_doc(a[3], false, true)!
+            _result := cmd_doc(a[3], true)!
         elif a[2] == "--check":
-            if a.len() < 4:
-                print("usage: pith doc --check <file.pith>")
+            mut ok := true
+            for path in file_operands(a, "doc", "--check"):
+                if not cmd_doc_check(path):
+                    ok = false
+            if not ok:
                 exit(1)
-            _result := cmd_doc(a[3], true, false)!
         else:
-            _result := cmd_doc(a[2], false, false)!
+            _result := cmd_doc(a[2], false)!
         return ""
 
     if command == "package":

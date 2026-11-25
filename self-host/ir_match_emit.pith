@@ -175,12 +175,26 @@ pub fn ir_variant_pattern_key(value: String) -> String:
         i = i - 1
     return value
 
+## the ir key of the variant a pattern matches: the key the enum it matches
+## is filed under, when that differs from the written one. a generic enum that
+## another module also declares is filed under its declaring module's
+## identity, which a written `b.Opt.Some` cannot name, and with only the
+## written key a pattern on it compared against nothing and matched nothing.
+fn ir_variant_pattern_key_for(pat_idx: Int, fallback_tid: Int) -> String:
+    key := ir_variant_pattern_key(get_node(pat_idx).value)
+    tid := ir_pattern_tid(pat_idx, fallback_tid)
+    if tid >= 0 and get_type_info(tid).kind == "enum":
+        typed := ir_struct_base_name(get_type_info(tid).name) + "." + ir_variant_pattern_variant_name(key)
+        if ir_struct_field_index_lookup.contains_key(typed):
+            return typed
+    return key
+
 ## the payload kinds of a variant pattern's slots, resolved against the enum
 ## instance the pattern matches (see ir_pattern_tid), or an empty list for a
 ## variant without a payload. fallback_tid stands in for a pattern the checker
 ## recorded no type for.
 pub fn ir_variant_pattern_kinds_for(pat_idx: Int, fallback_tid: Int) -> List[String]:
-    key := ir_variant_pattern_key(get_node(pat_idx).value)
+    key := ir_variant_pattern_key_for(pat_idx, fallback_tid)
     mut kinds: List[String] := []
     if ir_enum_payload_kinds.contains_key(key):
         kinds = ir_resolved_variant_kinds_for_tid(ir_pattern_tid(pat_idx, fallback_tid), key, ir_enum_payload_kinds[key].split(","))
@@ -344,7 +358,7 @@ pub fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
         return r
     if pat.kind == "pat_variant":
         r := ir_reg()
-        key := ir_variant_pattern_key(pat.value)
+        key := ir_variant_pattern_key_for(pat_idx, ir_match_subject_tid)
         if ir_struct_field_index_lookup.contains_key(key):
             enum_name := ir_variant_enum_name(key)
             lit_r := ir_reg()

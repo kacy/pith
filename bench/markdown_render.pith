@@ -1,0 +1,61 @@
+# markdown rendering throughput: std.markdown over the repository's own docs.
+#
+# concatenates docs/*.md, in name order, and repeats the result until it
+# reaches the requested size, then renders it to html `rounds` times with the
+# safe defaults. the document is built outside the timed section. the checksum
+# is the html length folded with a sample of its bytes, so an arm that renders
+# differently cannot look fast. run it from the repository root:
+#
+#   pith build bench/markdown_render.pith
+#   ./bench/markdown_render <megabytes> <rounds>
+import std.fs as fs
+import std.glob as glob
+import std.markdown as markdown
+
+fn arg_or(index: Int, fallback: Int) -> Int:
+    argv := args()
+    if argv.len() > index:
+        parsed := parse_int(argv[index])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return fallback
+
+fn load_docs() -> String!:
+    paths := glob.find(".", ["docs/*.md"])!
+    paths.sort()
+    mut parts: List[String] := []
+    for path in paths:
+        parts.push(fs.read(path)!)
+        parts.push("\n")
+    return parts.join("")
+
+fn main() -> Int!:
+    megabytes := arg_or(1, 10)
+    rounds := arg_or(2, 3)
+    docs := load_docs()!
+    target := megabytes * 1048576
+    mut copies: List[String] := []
+    mut size := 0
+    while size < target:
+        copies.push(docs)
+        size += docs.len()
+    source := copies.join("")
+
+    start := time()
+    mut checksum := 0
+    for round in 0..rounds:
+        page := markdown.to_html(source)
+        checksum += page.len()
+        mut i := round % 7
+        while i < page.len():
+            checksum += ord(page[i])
+            i += 4099
+    elapsed := max(time() - start, 1)
+    bytes := source.len() * rounds
+    print("markdown render benchmark")
+    print("input_bytes=" + source.len().to_string())
+    print("rounds=" + rounds.to_string())
+    print("elapsed_ms=" + elapsed.to_string())
+    print("mb_per_s=" + (bytes * 1000 / elapsed / 1048576).to_string())
+    print("checksum=" + checksum.to_string())
+    return 0

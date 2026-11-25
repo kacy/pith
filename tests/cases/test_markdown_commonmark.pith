@@ -1,0 +1,42 @@
+# runs every example of the commonmark 0.31.2 spec through std.markdown and
+# compares the html with the spec's.
+#
+# the examples run with raw html and every url scheme allowed, since the spec
+# shows html passing through and links such as `<irc://foo.bar:2233/baz>`.
+# gfm is off so the extensions cannot change what commonmark specifies.
+#
+# the comparison is exact after one normalization: std.markdown writes `'` in
+# text and attributes as `&#39;`, the escape std.html uses, where cmark writes
+# it bare in text and as `&#x27;` in urls. all three mean the same character,
+# so each side has them rewritten to `'` first. the spec's own test script
+# normalizes far more than this.
+
+import std.fs as fs
+import std.json as json
+import std.markdown as markdown
+
+fn normalize(page: String) -> String:
+    return page.replace("&#39;", "'").replace("&#x27;", "'")
+
+fn main() -> Int!:
+    body := fs.read("tests/markdown/commonmark-0.31.2.json")!
+    root := json.parse(body)
+    opts := markdown.options().allow_html(true).allow_unsafe_urls(true).gfm(false)
+    total := json.array_len(root)
+    mut passed := 0
+    mut failures: List[String] := []
+    for i in 0..total:
+        example := json.array_get(root, i)
+        source := json.object_get_string(example, "markdown")
+        expected := json.object_get_string(example, "html")
+        actual := markdown.render(source, opts)
+        if normalize(actual) == normalize(expected):
+            passed += 1
+            continue
+        number := json.object_get_int(example, "example")
+        section := json.object_get_string(example, "section")
+        failures.push("example {number} ({section})")
+    print("commonmark: {passed}/{total} passed")
+    for failure in failures:
+        print("failed: {failure}")
+    return 0

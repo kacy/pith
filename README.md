@@ -260,7 +260,7 @@ everything rebuilds from source.
 
 ## the standard library
 
-128 modules, all pith. the areas, with the doc that goes deepest:
+130 modules, all pith. the areas, with the doc that goes deepest:
 
 | area | modules | read |
 |---|---|---|
@@ -271,7 +271,7 @@ everything rebuilds from source.
 | exact numbers | bigint, decimal | [numbers](docs/numbers.md) |
 | bytes and crypto | hash, checksum, encoding, crypto, bits, binary | [auth](docs/auth.md) |
 | compression | gzip, zlib, zstd, tar, zip | |
-| text | regex, scanner, fmt, html, template, text, strings | [unicode](docs/unicode.md), [html](docs/html.md) |
+| text | regex, scanner, fmt, html, template, markdown, text, strings | [unicode](docs/unicode.md), [html](docs/html.md), [markdown](docs/markdown.md) |
 | i18n | locales, message catalogs, cldr plural rules | [i18n](docs/i18n.md) |
 | app plumbing | log, metrics, cli, env, testing, time, datetime, rand, uuid, math | [logging](docs/logging.md) |
 | resilience | retry, rate limiting, circuit breaking | [resilience](docs/resilience.md) |

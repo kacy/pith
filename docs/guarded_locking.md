@@ -188,6 +188,7 @@ fn store_document(handle: Int, text: String):
     parsed_keys.remove(handle)
     jwks_mu.unlock()
 
+impl Cache:
     fn shared_keys() -> KeySet!:
         jwks_mu.lock()
         if parsed_keys.contains_key(self.handle) and time.unix() - cached_at[self.handle] < self.ttl_v:
@@ -218,6 +219,7 @@ fn store_document(handle: Int, text: String):
         cached_at.insert(handle, time.unix())
         parsed_keys.remove(handle)
 
+impl Cache:
     fn shared_keys() -> KeySet!:
         locked jwks_mu:
             if parsed_keys.contains_key(self.handle) and time.unix() - cached_at[self.handle] < self.ttl_v:

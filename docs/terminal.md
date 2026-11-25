@@ -98,13 +98,14 @@ sequence until more bytes arrive.
 
 ```pith
 import std.term.input as input
+from std.term.input import Event
 
 p := input.parser()
 for ev in input.feed(p, chunk):
     match ev:
-        input.Event.KeyPress(k) =>
+        Event.KeyPress(k) =>
             handle(input.key_name(k))   # "a", "ctrl+c", "shift+tab", "f5"
-        input.Event.Paste(s) =>
+        Event.Paste(s) =>
             insert(s)
         _ =>
             pass_on(ev)
@@ -138,7 +139,9 @@ mouse and focus reporting opt-in), the hardware cursor hidden, the resize
 signal armed, and two tasks feeding one ordered event stream.
 
 ```pith
+import std.term.input as input
 import std.term.session as session
+from std.term.input import Event
 
 fn main() -> Int!:
     t := session.open()!

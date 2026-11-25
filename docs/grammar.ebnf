@@ -48,8 +48,15 @@ FLOAT_LIT     = digit , { digit | "_" } , "." , digit , { digit | "_" }
 (* string literals with escape sequences and interpolation *)
 STRING_LIT    = '"' , { string_char | escape_seq | brace_escape | interpolation } , '"' ;
 string_char   = (* any unicode char except '"', '\', '{', or newline *) ;
-escape_seq    = "\" , ( "n" | "r" | "t" | "\" | '"' | "{" | "0" ) ;
-interpolation = "{" , expression , "}" ;
+(* any other escape is an error (E243). \{ and \} write a brace. *)
+escape_seq    = "\" , ( "n" | "r" | "t" | "\" | '"' | "{" | "}" | "0" ) ;
+(* spaces just inside the braces are allowed, around a format spec too: *)
+(* `{ a + b }`, `{ price:08.2 }`. the braces hold one expression.      *)
+interpolation = "{" , expression , [ ":" , format_spec ] , "}" ;
+(* alignment, a width (a leading 0 pads with zeros) and a precision.   *)
+(* a suffix that is not a spec is not split off, and is read as code.  *)
+format_spec   = [ "<" | ">" | "^" ] , ( digit , { digit } , [ "." , digit , { digit } ]
+                                       | "." , digit , { digit } ) ;
 
 (* doubled braces are literal braces, not interpolation: "{{" -> "{",     *)
 (* "}}" -> "}". this lets interpolated strings carry literal braces.       *)
@@ -261,18 +268,22 @@ continue_stmt = "continue" ;
 (* 5. patterns                                                         *)
 (* ------------------------------------------------------------------ *)
 
-(* a match arm may list alternatives with `|`; the alternatives must not bind. *)
+(* a match arm, a payload slot and a tuple element may list alternatives  *)
+(* with `|`. an alternative may not be a bare binding or a wildcard, and   *)
+(* the alternatives must bind the same names with the same types.         *)
 arm_pattern   = pattern , { "|" , pattern } ;
 
 pattern       = "_"                                   (* wildcard *)
               | literal                               (* literal match *)
               | INT , ( ".." | "..=" ) , INT          (* integer range *)
               | IDENT                                 (* binding; may not name a variant of the subject's enum *)
-              | IDENT , "." , IDENT , [ "(" , pattern_list , ")" ]  (* qualified enum variant *)
-              | "(" , pattern , { "," , pattern } , ")"   (* tuple *)
+              | [ IDENT , "." ] , IDENT , "." , IDENT , [ "(" , pattern_list , ")" ]
+                                                      (* enum variant, optionally through a module alias *)
+              | "(" , pattern_list , ")"              (* tuple *)
               ;
 
-pattern_list  = pattern , { "," , pattern } ;
+(* sub-patterns nest to any depth *)
+pattern_list  = arm_pattern , { "," , arm_pattern } ;
 
 
 (* ------------------------------------------------------------------ *)

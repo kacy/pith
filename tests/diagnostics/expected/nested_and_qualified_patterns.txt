@@ -1,0 +1,20 @@
+tests/diagnostics/cases/nested_and_qualified_patterns.pith:17:9: error[E202]: unknown type: nope.Event
+  17 |         nope.Event.Text(t) => return "text"
+               ^
+
+tests/diagnostics/cases/nested_and_qualified_patterns.pith:18:18: error[E212]: pe.Event has no variant 'Missing'
+  18 |         pe.Event.Missing => return "missing"
+                        ^
+
+tests/diagnostics/cases/nested_and_qualified_patterns.pith:22:12: error[E204]: non-exhaustive match: no arm matches Outer.Wrap(Inner.B)
+  22 |     return match o:
+                  ^
+  fix: add an arm for it, or a wildcard (_) arm
+
+tests/diagnostics/cases/nested_and_qualified_patterns.pith:28:33: error[E228]: or-pattern alternatives must bind the same names with the same types
+  28 |         Outer.Wrap(Inner.A(n) | Inner.B) => return n
+                                       ^
+
+tests/diagnostics/cases/nested_and_qualified_patterns.pith:33:28: error[E228]: none pattern cannot match Int
+  33 |         Outer.Wrap(Inner.A(none)) => return "never"
+                                  ^

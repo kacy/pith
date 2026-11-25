@@ -1,0 +1,167 @@
+# patterns nest: a variant payload or a tuple element can hold any pattern
+# (a variant, a tuple, a literal, a range, `none`, an or-pattern, a binding or
+# a wildcard) to any depth, in match, if let and while let. bindings at every
+# depth own their payloads, and a payload is only read once its variant's tag
+# matched.
+
+enum Inner:
+    A(Int)
+    B
+    Name(String)
+
+enum Outer:
+    Wrap(Inner)
+    Pair(Inner, Inner)
+    Other
+
+enum Deep:
+    Box(Outer)
+    Empty
+
+enum Reading:
+    Value(Int)
+    Missing
+
+enum Slot:
+    Filled(Int?)
+    Coords((Int, String))
+
+enum Opt[T]:
+    Some(T)
+    Nothing
+
+fn describe(o: Outer) -> String:
+    return match o:
+        Outer.Wrap(Inner.A(0)) => "wrap a zero"
+        Outer.Wrap(Inner.A(n)) => "wrap a {n}"
+        Outer.Wrap(Inner.B) => "wrap b"
+        Outer.Wrap(Inner.Name(s)) => "wrap name {s}"
+        Outer.Pair(Inner.Name(x), Inner.Name(y)) => "two names {x} {y}"
+        Outer.Pair(Inner.A(_) | Inner.B, _) => "pair starting a or b"
+        Outer.Pair(_, _) => "other pair"
+        Outer.Other => "other"
+
+fn deep(d: Deep) -> String:
+    match d:
+        Deep.Box(Outer.Wrap(Inner.Name(s))) => return "deep name " + s
+        Deep.Box(Outer.Wrap(Inner.A(n))) => return "deep a {n}"
+        Deep.Box(_) => return "deep box"
+        Deep.Empty => return "empty"
+
+# issue 1492: a range used as a payload sub-pattern matched nothing
+fn label(r: Reading) -> String:
+    return match r:
+        Reading.Value(1..=5) => "low"
+        Reading.Value(-5..0) => "negative"
+        Reading.Value(n) => "other {n}"
+        Reading.Missing => "missing"
+
+fn slot(s: Slot) -> String:
+    return match s:
+        Slot.Filled(none) => "filled with none"
+        Slot.Filled(v) => "filled {v.unwrap_or(0)}"
+        Slot.Coords((0, name)) => "origin " + name
+        Slot.Coords((x, name)) => "at {x} " + name
+
+fn make_name(i: Int) -> Outer:
+    return Outer.Wrap(Inner.Name("n" + i.to_string()))
+
+# a tuple subject whose elements hold variants
+fn both(t: (Inner, Bool)) -> String:
+    return match t:
+        (Inner.A(n), true) => "a {n} yes"
+        (Inner.Name(s), _) => "name " + s
+        (_, false) => "anything no"
+        (Inner.A(_) | Inner.B, true) => "a or b yes"
+
+fn unwrap_nested(o: Opt[Outer]) -> String:
+    return match o:
+        Opt.Some(Outer.Wrap(Inner.Name(s))) => "some name " + s
+        Opt.Some(Outer.Wrap(_)) => "some wrap"
+        Opt.Some(_) => "some other"
+        Opt.Nothing => "nothing"
+
+# a generic enum nested in itself: the inner pattern's payload kind comes from
+# its own instance (Opt[String]), not from the subject's (Opt[Opt[String]])
+fn inner_values[T](items: List[Opt[Opt[T]]]) -> List[T]:
+    mut out: List[T] := []
+    for it in items:
+        match it:
+            Opt.Some(Opt.Some(v)) =>
+                out.push(v)
+            _ =>
+                continue
+    return out
+
+fn some_nothing() -> Opt[Opt[String]]:
+    inner: Opt[String] := Opt.Nothing
+    return Opt.Some(inner)
+
+fn main():
+    nested: List[Opt[Opt[String]]] := [Opt.Some(Opt.Some("x")), Opt.Nothing, some_nothing(), Opt.Some(Opt.Some("y"))]
+    for v in inner_values(nested):
+        print("inner " + v)
+    print(describe(Outer.Wrap(Inner.A(0))))
+    print(describe(Outer.Wrap(Inner.A(7))))
+    print(describe(Outer.Wrap(Inner.B)))
+    print(describe(Outer.Wrap(Inner.Name("x"))))
+    print(describe(Outer.Pair(Inner.Name("p"), Inner.Name("q"))))
+    print(describe(Outer.Pair(Inner.B, Inner.Name("q"))))
+    print(describe(Outer.Pair(Inner.Name("p"), Inner.B)))
+    print(describe(Outer.Other))
+
+    print(deep(Deep.Box(Outer.Wrap(Inner.Name("leaf")))))
+    print(deep(Deep.Box(Outer.Wrap(Inner.A(4)))))
+    print(deep(Deep.Box(Outer.Other)))
+    print(deep(Deep.Empty))
+
+    print(label(Reading.Value(3)))
+    print(label(Reading.Value(-2)))
+    print(label(Reading.Value(9)))
+    print(label(Reading.Missing))
+
+    print(slot(Slot.Filled(none)))
+    print(slot(Slot.Filled(8)))
+    print(slot(Slot.Coords((0, "home"))))
+    print(slot(Slot.Coords((3, "away"))))
+
+    print(both((Inner.A(1), true)))
+    print(both((Inner.Name("t"), false)))
+    print(both((Inner.B, false)))
+    print(both((Inner.B, true)))
+
+    print(unwrap_nested(Opt.Some(Outer.Wrap(Inner.Name("g")))))
+    print(unwrap_nested(Opt.Some(Outer.Wrap(Inner.B))))
+    print(unwrap_nested(Opt.Some(Outer.Other)))
+    print(unwrap_nested(Opt.Nothing))
+
+    # if let and while let take nested patterns too
+    if let Outer.Wrap(Inner.Name(s)) = make_name(5):
+        print("if let name " + s)
+    if let Outer.Wrap(Inner.A(n)) = make_name(6):
+        print("unexpected {n}")
+    else:
+        print("if let fell through")
+    maybe: Outer? := Outer.Wrap(Inner.A(11))
+    if let Outer.Wrap(Inner.A(n)) = maybe:
+        print("if let on optional {n}")
+    mut items: List[Outer] := [make_name(1), make_name(2), Outer.Other, make_name(3)]
+    mut i := 0
+    while let Outer.Wrap(Inner.Name(s)) = items[i]:
+        print("while let " + s)
+        i = i + 1
+    print("stopped at {i}")
+
+    # a fresh subject per call, with counted bindings at depth, many times
+    mut total := 0
+    mut k := 0
+    while k < 2000:
+        match make_name(k):
+            Outer.Wrap(Inner.Name(s)) =>
+                total = total + s.len()
+            _ =>
+                total = total - 1
+        if let Deep.Box(Outer.Wrap(Inner.Name(s))) = Deep.Box(make_name(k)):
+            total = total + s.len()
+        k = k + 1
+    print("total {total}")

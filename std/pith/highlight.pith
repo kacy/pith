@@ -35,7 +35,7 @@
 # and invalid utf-8 all highlight, and the work is linear in the input.
 
 import std.html as html
-from std.pith.lexer import Token, lex_with_comments, unescape_interp_expr, interp_raw_offsets, split_format_spec
+from std.pith.lexer import Token, lex_with_comments, lex_interpolation, unescape_interp_expr, interp_raw_offsets, split_format_spec
 
 # ---------------------------------------------------------------
 # spans
@@ -151,6 +151,11 @@ fn walk_string(code: String, b: Builder, frame: Frame, toks: List[Token], i: Int
     mut j := i + 1
     while j < toks.len() and is_string_piece(toks[j].kind) and toks[j].offset < region_end:
         piece := toks[j]
+        if piece.kind == "bad_escape":
+            # an unknown escape in the literal text, queued among the pieces;
+            # its bytes belong to the string around it
+            j = j + 1
+            continue
         string_delimiters(code, b, frame.at(piece.offset))
         if piece.kind == "interpolation_expr":
             walk_interpolation(code, b, frame, piece, depth)
@@ -161,7 +166,7 @@ fn walk_string(code: String, b: Builder, frame: Frame, toks: List[Token], i: Int
     return j
 
 fn is_string_piece(kind: String) -> Bool:
-    return kind == "interpolation_expr" or kind == "string_mid" or kind == "string_end"
+    return kind == "interpolation_expr" or kind == "string_mid" or kind == "string_end" or kind == "bad_escape"
 
 # the bytes between the pieces of an interpolated string, up to `end`: the
 # braces around each expression and the closing quote
@@ -186,7 +191,7 @@ fn walk_interpolation(code: String, b: Builder, frame: Frame, piece: Token, dept
         for r in rel:
             offsets.push(frame.at(piece.offset + r))
         text := unescape_interp_expr(split.0)
-        walk_tokens(code, b, Frame(text, offsets), lex_with_comments(text), depth + 1)
+        walk_tokens(code, b, Frame(text, offsets), lex_interpolation(text, true), depth + 1)
     # space before the closing brace or the spec's colon is plain
     b.put(b.cursor, frame.at(expr_end), "plain")
     if split.1.len() > 0:
@@ -423,6 +428,17 @@ test "a format spec reads as part of the string":
     assert_eq(render("\"{{v:.2}} {{n:08}}\""), "[string \"][punctuation {{][variable v][punctuation :][string .2][punctuation }}][string  ][punctuation {{][variable n][punctuation :][string 08][punctuation }}][string \"]")
     # a suffix that is not a spec stays code
     assert_eq(render("\"{{x:y}}\""), "[string \"][punctuation {{][variable x][punctuation :][variable y][punctuation }}][string \"]")
+
+test "spaces inside the braces highlight like the tight form":
+    assert_eq(render("\"{{  a  }}\""), "[string \"][punctuation {{]  [variable a]  [punctuation }}][string \"]")
+    assert_eq(render("\"{{ x :>8 }}\""), "[string \"][punctuation {{] [variable x] [punctuation :][string >8 ][punctuation }}][string \"]")
+    assert_eq(render("\"{{ f(a) }}é\""), "[string \"][punctuation {{] [function f][punctuation (][variable a][punctuation )] [punctuation }}][string é\"]")
+
+test "an unknown escape stays part of its string":
+    assert_eq(render("\"a\\vb\""), "[string \"a\\vb\"]")
+    assert_eq(render("\"a\\v{{x}}b\\q\""), "[string \"a\\v][punctuation {{][variable x][punctuation }}][string b\\q\"]")
+    for code in ["\"\\v", "\"\\v{{", "\"{{a}}\\", "\"{{a}}\\q", "\"\\é\"", "\"\\" + chr(255) + "\""]:
+        check_spans(code)
 
 test "a string stops at the end of its line":
     assert_eq(render("s := \"one\ntwo\"\n"), "[variable s] [operator :=] [string \"one]\n[variable two][string \"]\n")

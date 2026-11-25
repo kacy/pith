@@ -110,7 +110,17 @@ a match expression doesn't cover all possible values. includes a fix
 suggestion listing the missing patterns. a guarded arm never counts toward
 coverage, since its guard can be false: `_ if n > 0 => ...` alone is not
 exhaustive. a binding on an optional subject covers the present values only,
-so the match also needs a `none` arm.
+so the match also needs a `none` arm. nested patterns count in full: an arm
+whose payload holds a sub-pattern that can fail (`Outer.Wrap(Inner.A(n))`,
+`Shape.Circle(0.0)`) does not cover its variant alone, and the error names
+one value no arm matches.
+
+```
+error[E204]: non-exhaustive match: no arm matches Outer.Wrap(Inner.B)
+  5 |     return match o:
+                 ^
+  fix: add an arm for it, or a wildcard (_) arm
+```
 
 ```
 error[E204]: non-exhaustive match: missing variant 'Circle'
@@ -377,6 +387,9 @@ a method call references a method that doesn't exist on the type.
 a pattern in a match arm doesn't match the type being matched on. a bare
 name that equals a variant of the matched enum is also E228: a bare name is a
 binding that matches every value, so the variant has to be written qualified.
+so is `none` against a value that is not optional, and an or-pattern whose
+alternatives bind different names or types (`Shape.Size(n) | Shape.Dot`
+would leave `n` unset when `Dot` matched).
 
 ```
 error[E228]: 'Red' is a variant of Color, but a bare name in a pattern is a binding that matches every value
@@ -522,6 +535,17 @@ more than 1,000 deep. see the compiler input limits in `SECURITY.md`.
 the lexer produced an invalid token — an unterminated string literal, a
 stray character that starts no valid token, a bad indentation change, or a
 `0x`, `0b` or `0o` prefix with no digits after it.
+an escape a string literal does not define is E243 too, at its backslash. the
+escapes are `\n`, `\r`, `\t`, `\0`, `\\`, `\"`, `\{` and `\}`; anything else,
+such as `\v` or `\x41`, used to keep its backslash without a word. write a
+control byte with `chr`.
+
+```
+error[E243]: unknown escape sequence '\v' in a string literal
+  6 |     plain := "a\vb"
+                     ^
+```
+
 every lexer error is reported, even one that lands between two otherwise
 valid tokens (`1 € + 2`), so an invalid character can never be silently
 dropped.

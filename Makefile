@@ -1442,6 +1442,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_drop_hook \
 	tests/cases/test_markdown_commonmark \
 	tests/cases/test_markdown_gfm \
+	tests/cases/test_nested_patterns \
 	tests/cases/test_byte_buffer_ownership \
 	tests/cases/test_drop_lend \
 	tests/cases/test_drop_generic \

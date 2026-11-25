@@ -176,16 +176,18 @@ pub fn ir_variant_pattern_key(value: String) -> String:
     return value
 
 ## the ir key of the variant a pattern matches: the key the enum it matches
-## is filed under, when that differs from the written one. a generic enum that
-## another module also declares is filed under its declaring module's
-## identity, which a written `b.Opt.Some` cannot name, and with only the
-## written key a pattern on it compared against nothing and matched nothing.
+## is filed under, when that is the written enum under its declaring module's
+## identity. a generic enum that another module also declares is filed that
+## way, which a written `b.Opt.Some` cannot name, and with only the written key
+## a pattern on it compared against nothing and matched nothing.
 fn ir_variant_pattern_key_for(pat_idx: Int, fallback_tid: Int) -> String:
     key := ir_variant_pattern_key(get_node(pat_idx).value)
     tid := ir_pattern_tid(pat_idx, fallback_tid)
     if tid >= 0 and get_type_info(tid).kind == "enum":
-        typed := ir_struct_base_name(get_type_info(tid).name) + "." + ir_variant_pattern_variant_name(key)
-        if ir_struct_field_index_lookup.contains_key(typed):
+        written := ir_variant_enum_name(key)
+        base := ir_struct_base_name(get_type_info(tid).name)
+        typed := base + "." + ir_variant_pattern_variant_name(key)
+        if base.ends_with("_" + written) and ir_struct_field_index_lookup.contains_key(typed):
             return typed
     return key
 

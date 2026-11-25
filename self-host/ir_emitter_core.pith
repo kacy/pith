@@ -39,7 +39,7 @@
 
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, node_count, Node
-from checker import c_interface_coercion, wrapping_conversion_target, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_argument_widens_to_result, c_result_widening_target, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from checker import c_interface_coercion, c_ident_is_shadowed_alias, wrapping_conversion_target, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_argument_widens_to_result, c_result_widening_target, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, lookup_entry_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
@@ -47,7 +47,7 @@ from ir_names import ir_import_target_name, ir_global_storage_symbol, ir_base_de
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_by_symbol, ir_queue_generic_specialization_for_tids, ir_generic_specialization_subst_tids, ir_decode_generic_spec_subst_tids, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_generic_method_owner_param_counts, ir_generic_owner_param_count, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
-from ir_match_emit import ir_match_pattern_keeps_subject_free, ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_set_match_pin, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid
+from ir_match_emit import ir_match_pattern_keeps_subject_free, ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_set_match_pin, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid, ir_variant_pattern_kinds_for, ir_match_tuple_element_kinds
 from ir_decode_emit import ir_decode_last_args, ir_json_intern_nested_specs, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
@@ -199,7 +199,7 @@ fn ir_match_alias_release(node: Node, subj_owned: Bool) -> String:
                     if not ir_tuple_uses_all_safe(arm.children[j], pat.value, is_result):
                         return ""
                     j = j + 1
-            elif not ir_match_pattern_keeps_subject_free(pat, false):
+            elif not ir_match_pattern_keeps_subject_free(arm.children[0], false):
                 return ""
         i = i + 1
     if not is_result and not has_bare:
@@ -1653,6 +1653,13 @@ fn ir_emit_owned_branch_value(expr_idx: Int) -> Int:
 fn ir_branches_take_counts(idx: Int) -> Bool:
     return ir_branch_retain_kind(idx).len() > 0 and ir_branch_values_are_owned(idx)
 
+# whether the identifier at `idx` names a module the file imports. a local
+# spelled like the alias is a value there instead (the checker records which,
+# see c_ident_is_shadowed_alias).
+fn ir_ident_names_module(idx: Int) -> Bool:
+    node := get_node(idx)
+    return node.kind == "ident" and ir_module_aliases.contains_key(node.value) and not c_ident_is_shadowed_alias(idx)
+
 # true when a field-access node is really a payload-free variant
 # construction: the receiver names a boxed enum (directly, or through a
 # module alias) and the member is one of its variants. mirrors the two
@@ -1666,8 +1673,7 @@ fn ir_field_access_is_bare_variant(idx: Int) -> Bool:
     if recv.kind == "ident":
         ename = recv.value
     elif recv.kind == "field_access" and recv.children.len() > 0:
-        base := get_node(recv.children[0])
-        if base.kind == "ident" and ir_module_aliases.contains_key(base.value):
+        if ir_ident_names_module(recv.children[0]):
             ename = recv.value
     if ename.len() == 0 or not ir_boxed_enums.contains_key(ename):
         return false
@@ -3329,6 +3335,26 @@ fn ir_prepass_track_or_poison(name: String, kind: String, names: List[String], p
     elif not poisoned.contains(name):
         poisoned.push(name)
 
+# a tuple nested in a variant payload binds its elements with counts of their
+# own (ir_emit_pattern_bindings in ir_match_emit), so its bindings are tracked
+# like the payload bindings around them. a variant nested further down has its
+# own bindings tracked when the walk reaches it.
+fn ir_prepass_track_payload_tuple_binds(pat_idx: Int, names: List[String], poisoned: List[String]):
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_or":
+        for alt in pat.children:
+            ir_prepass_track_payload_tuple_binds(alt, names, poisoned)
+        return
+    if pat.kind != "pat_tuple":
+        return
+    elems := ir_match_tuple_element_kinds(pat_idx, pat.children.len())
+    for sub_idx, i in pat.children:
+        sub := get_node(sub_idx)
+        if sub.kind == "pat_binding":
+            ir_prepass_track_or_poison(sub.value, ir_rc_kind(elems[i]), names, poisoned)
+        else:
+            ir_prepass_track_payload_tuple_binds(sub_idx, names, poisoned)
+
 # pre-pass: names of rc-typed binds anywhere in the body. an
 # under-approximation is safe (a missed name is never released, a leak),
 # while emission-time classification only widens, never narrows, so every
@@ -3408,17 +3434,18 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
     # retains each rc payload, so track them here for the exit cleanup to
     # release (or transfer on escape), same as any other owned local.
     if node.kind == "pat_variant" and node.children.len() > 0:
-        mut variant_kinds: List[String] := []
-        if ir_enum_payload_kinds.contains_key(node.value):
-            variant_kinds = ir_enum_payload_kinds[node.value].split(",")
-            # a generic enum's declaration records parameter names here; the
-            # enclosing match's subject names the instance whose concrete kinds
-            # decide whether a binding is tracked. ir_emit_match_bindings
-            # retains by those resolved kinds, so tracking by the declared ones
-            # left every generic rc payload binding retained and never
-            # released.
-            if ir_prepass_subject_tids.len() > 0:
-                variant_kinds = ir_resolved_variant_kinds_for_tid(ir_prepass_subject_tids[ir_prepass_subject_tids.len() - 1], node.value, variant_kinds)
+        # a generic enum's declaration records parameter names as payload
+        # kinds; the instance the pattern matches (the checker records it on
+        # the pattern, falling back to the enclosing match's subject) has the
+        # concrete kinds that decide whether a binding is tracked.
+        # ir_emit_match_bindings retains by those resolved kinds, so tracking
+        # by the declared ones left every generic rc payload binding retained
+        # and never released. a pattern nested in a payload resolves against
+        # its own slot's enum, not the subject's.
+        mut fallback_tid := 0 - 1
+        if ir_prepass_subject_tids.len() > 0:
+            fallback_tid = ir_prepass_subject_tids[ir_prepass_subject_tids.len() - 1]
+        variant_kinds := ir_variant_pattern_kinds_for(idx, fallback_tid)
         for sub_idx, pi in node.children:
             sub := get_node(sub_idx)
             if sub.kind == "pat_binding":
@@ -3430,6 +3457,8 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
                 # Beta(Int, _) sharing x0), and releasing the rc kind at exit
                 # would dereference whatever integer the last-run arm stored.
                 ir_prepass_track_or_poison(sub.value, payload_kind, names, poisoned)
+            else:
+                ir_prepass_track_payload_tuple_binds(sub_idx, names, poisoned)
     # a match whose arms bind uncounted views of a borrowed subject owns a
     # hidden slot that pins the subject (ir_match_pin_kind)
     if node.kind == "match_expr" and node.children.len() > 1:
@@ -3483,7 +3512,8 @@ fn ir_match_pin_name(match_idx: Int) -> String:
     return "__match_pin_" + match_idx.to_string()
 
 # true for a pattern that binds a name to the subject itself or to a tuple
-# element, which ir_emit_match_bindings binds without a count
+# element, which ir_emit_match_bindings binds without a count. everything
+# below a variant payload binds with a count, so the walk stops there.
 fn ir_pattern_binds_view(pat_idx: Int) -> Bool:
     pat := get_node(pat_idx)
     if pat.kind == "pat_binding":
@@ -9351,8 +9381,7 @@ fn ir_emit_variant_ctor_method(idx: Int) -> Int:
         # boxed enum (registered by its base name across modules). resolve it the
         # same as the local `Enum.Variant(...)` form.
         if ctor_recv.kind == "field_access" and ctor_recv.children.len() > 0:
-            qual_mod := get_node(ctor_recv.children[0])
-            if qual_mod.kind == "ident" and ir_module_aliases.contains_key(qual_mod.value) and ir_boxed_enums.contains_key(ctor_recv.value):
+            if ir_ident_names_module(ctor_recv.children[0]) and ir_boxed_enums.contains_key(ctor_recv.value):
                 qual_key := ctor_recv.value + "." + mname
                 if ir_struct_field_index_lookup.contains_key(qual_key):
                     return ir_emit_variant_construction(idx, node, ctor_recv.value, qual_key)
@@ -10253,8 +10282,7 @@ fn ir_expr_is_named_function_value(idx: Int) -> Bool:
     if node.kind == "ident":
         return ir_ident_is_function_value(idx, node.value)
     if node.kind == "field_access" and node.children.len() > 0:
-        recv_node := get_node(node.children[0])
-        if not (recv_node.kind == "ident" and ir_module_aliases.contains_key(recv_node.value)):
+        if not ir_ident_names_module(node.children[0]):
             return false
         expr_tid := c_get_expr_type(idx)
         if expr_tid < 0 or get_type_info(expr_tid).kind != "function":
@@ -11515,7 +11543,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         # function name. this must run before the receiver is evaluated: a
         # module alias is not a loadable value.
         recv_node := get_node(node.children[0])
-        if recv_node.kind == "ident" and ir_module_aliases.contains_key(recv_node.value):
+        if ir_ident_names_module(node.children[0]):
             expr_tid := c_get_expr_type(idx)
             if expr_tid >= 0 and get_type_info(expr_tid).kind == "function":
                 callee := ir_resolve_static_callee(idx)
@@ -11540,8 +11568,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         # evaluated. emit the same construction the bare Phase.Alpha path
         # does. payload variants never reach here (they are calls).
         if recv_node.kind == "field_access" and recv_node.children.len() > 0:
-            base_node := get_node(recv_node.children[0])
-            if base_node.kind == "ident" and ir_module_aliases.contains_key(base_node.value):
+            if ir_ident_names_module(recv_node.children[0]):
                 ename := recv_node.value
                 variant_key := ename + "." + fname
                 if ir_struct_field_index_lookup.contains_key(variant_key):

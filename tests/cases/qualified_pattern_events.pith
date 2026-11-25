@@ -1,0 +1,29 @@
+# the module test_qualified_variant_patterns imports under an alias, so its
+# patterns name these enums as `ev.Event.Text(...)`.
+
+pub enum Tag:
+    Heading(Int)
+    Paragraph
+    Link(String)
+
+pub enum Event:
+    Start(Tag)
+    End(Tag)
+    Text(String)
+    Rule
+
+pub enum Slot[T]:
+    Full(T)
+    Empty
+
+## a short stream of events covering each variant.
+pub fn sample() -> List[Event]:
+    return [Event.Start(Tag.Heading(2)), Event.Text("title"), Event.End(Tag.Heading(2)), Event.Rule, Event.Start(Tag.Link("u")), Event.Text("body"), Event.End(Tag.Paragraph)]
+
+## a slot holding `s`.
+pub fn full_slot(s: String) -> Slot[String]:
+    return Slot.Full(s)
+
+## a slot holding nothing.
+pub fn empty_slot() -> Slot[String]:
+    return Slot.Empty

@@ -268,18 +268,22 @@ continue_stmt = "continue" ;
 (* 5. patterns                                                         *)
 (* ------------------------------------------------------------------ *)
 
-(* a match arm may list alternatives with `|`; the alternatives must not bind. *)
+(* a match arm, a payload slot and a tuple element may list alternatives  *)
+(* with `|`. an alternative may not be a bare binding or a wildcard, and   *)
+(* the alternatives must bind the same names with the same types.         *)
 arm_pattern   = pattern , { "|" , pattern } ;
 
 pattern       = "_"                                   (* wildcard *)
               | literal                               (* literal match *)
               | INT , ( ".." | "..=" ) , INT          (* integer range *)
               | IDENT                                 (* binding; may not name a variant of the subject's enum *)
-              | IDENT , "." , IDENT , [ "(" , pattern_list , ")" ]  (* qualified enum variant *)
-              | "(" , pattern , { "," , pattern } , ")"   (* tuple *)
+              | [ IDENT , "." ] , IDENT , "." , IDENT , [ "(" , pattern_list , ")" ]
+                                                      (* enum variant, optionally through a module alias *)
+              | "(" , pattern_list , ")"              (* tuple *)
               ;
 
-pattern_list  = pattern , { "," , pattern } ;
+(* sub-patterns nest to any depth *)
+pattern_list  = arm_pattern , { "," , arm_pattern } ;
 
 
 (* ------------------------------------------------------------------ *)

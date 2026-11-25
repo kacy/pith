@@ -1190,15 +1190,7 @@ fn parse_match_expr() -> Int:
 
 fn parse_match_arm() -> Int:
     mark := current_token_position
-    mut pattern := parse_pattern()
-
-    # or-pattern: `a | b | c => ...` matches any of the alternatives.
-    if check("pipe"):
-        mut alts: List[Int] := [pattern]
-        while match_tok("pipe"):
-            alts.push(parse_pattern())
-        pattern = add_node_from_mark("pat_or", "", alts, mark)
-
+    pattern := parse_pattern_alternatives()
     mut children: List[Int] := [pattern]
 
     # guard
@@ -1503,6 +1495,19 @@ fn parse_pattern() -> Int:
     recursion_depth = recursion_depth - 1
     return result
 
+# a pattern that may list alternatives, `a | b | c`, matching any of them: an
+# arm's pattern, and a sub-pattern of a variant payload or a tuple element
+# (`Outer.Wrap(Inner.A(_) | Inner.B)`).
+fn parse_pattern_alternatives() -> Int:
+    mark := current_token_position
+    pattern := parse_pattern()
+    if not check("pipe"):
+        return pattern
+    mut alts: List[Int] := [pattern]
+    while match_tok("pipe"):
+        alts.push(parse_pattern())
+    return add_node_from_mark("pat_or", "", alts, mark)
+
 fn parse_pattern_nested() -> Int:
     # token via _cur_tok_kind/_cur_tok_value
     mark := current_token_position
@@ -1567,23 +1572,30 @@ fn parse_pattern_nested() -> Int:
 
     if _cur_tok_kind() == "identifier":
         type_tok := advance_token()
-        # variant pattern: Type.Variant or Type.Variant(fields)
+        # variant pattern: Type.Variant or Type.Variant(fields), with the
+        # enum optionally named through a module alias: alias.Type.Variant
         if check("dot"):
             advance_token()
-            variant_tok := expect("identifier")
+            mut variant_tok := expect("identifier")
             # a pattern names its enum bare, so an enum imported under
             # another name is matched under its own
             mut enum_name := type_tok.value
-            if from_import_renames.contains_key(enum_name):
+            if check("dot"):
+                # the first name was a module alias: keep it on the enum, so
+                # the checker resolves the enum through that import
+                advance_token()
+                enum_name = type_tok.value + "." + variant_tok.value
+                variant_tok = expect("identifier")
+            elif from_import_renames.contains_key(enum_name):
                 enum_name = from_import_renames[enum_name]
 
             if check("lparen"):
                 advance_token()
                 mut fields: List[Int] := []
                 if not check("rparen"):
-                    fields.push(parse_pattern())
+                    fields.push(parse_pattern_alternatives())
                     while match_tok("comma"):
-                        fields.push(parse_pattern())
+                        fields.push(parse_pattern_alternatives())
                 expect("rparen")
                 pat := add_node_from_mark("pat_variant", enum_name + "." + variant_tok.value, fields, mark)
                 set_node_name_position(pat, variant_tok.line, variant_tok.column)
@@ -1600,9 +1612,9 @@ fn parse_pattern_nested() -> Int:
         advance_token()
         mut patterns: List[Int] := []
         if not check("rparen"):
-            patterns.push(parse_pattern())
+            patterns.push(parse_pattern_alternatives())
             while match_tok("comma"):
-                patterns.push(parse_pattern())
+                patterns.push(parse_pattern_alternatives())
         expect("rparen")
         return add_node_from_mark("pat_tuple", "", patterns, mark)
 

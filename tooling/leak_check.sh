@@ -323,6 +323,7 @@ cases=(
   tests/leaks/leak_aliased_collection
   tests/leaks/leak_result_local_shared_box
   tests/leaks/leak_alias_optional_tuple
+  tests/leaks/leak_nested_pattern_payload
 )
 
 # a case file that never made it into the list above measures nothing and says

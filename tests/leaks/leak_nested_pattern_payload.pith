@@ -1,0 +1,79 @@
+# nested patterns bind counted payloads at every depth: a string two
+# variants down takes a count of its own, the subject's box (and the inner
+# boxes it owns) is released as usual, and a tuple nested in a payload keeps
+# its views alive through the subject. churned over call subjects, bound
+# locals, if let and while let.
+import leakprobe as probe
+
+enum Inner:
+    Name(String)
+    Num(Int)
+
+enum Outer:
+    Wrap(Inner)
+    Pair((String, Int))
+    Nothing
+
+fn mk(i: Int) -> Outer:
+    if i % 3 == 0:
+        return Outer.Wrap(Inner.Name("n-" + i.to_string()))
+    if i % 3 == 1:
+        return Outer.Pair(("p-" + i.to_string(), i))
+    return Outer.Wrap(Inner.Num(i))
+
+# a fresh call subject, released inside the match once the arm has bound
+fn call_subject(i: Int) -> Int:
+    return match mk(i):
+        Outer.Wrap(Inner.Name(s)) => s.len()
+        Outer.Wrap(Inner.Num(n)) => n % 7
+        Outer.Pair((s, n)) => s.len() + n % 5
+        Outer.Nothing => 0
+
+# the bound-local twin, cleaned up through the local
+fn local_subject(i: Int) -> Int:
+    o := mk(i)
+    match o:
+        Outer.Wrap(Inner.Name(s)) => return s.len()
+        Outer.Pair((s, _)) => return s.len()
+        _ => return 1
+
+fn if_let_subject(i: Int) -> Int:
+    if let Outer.Wrap(Inner.Name(s)) = mk(i):
+        return s.len()
+    return 0
+
+fn while_let_subject(i: Int) -> Int:
+    mut items: List[Outer] := [mk(i * 3), mk(i * 3 + 3), mk(i * 3 + 1)]
+    mut k := 0
+    mut total := 0
+    while let Outer.Wrap(Inner.Name(s)) = items[k]:
+        total = total + s.len()
+        k = k + 1
+    return total
+
+enum Opt[T]:
+    Some(T)
+    Nothing
+
+# a generic enum nested in itself: the inner binding is counted by the inner
+# instance's payload kind
+fn generic_subject[T](o: Opt[Opt[T]], fallback: T) -> T:
+    return match o:
+        Opt.Some(Opt.Some(v)) => v
+        _ => fallback
+
+fn round(i: Int) -> Int:
+    g := generic_subject(Opt.Some(Opt.Some("g-" + i.to_string())), "none")
+    return call_subject(i) + local_subject(i) + if_let_subject(i) + while_let_subject(i) + g.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

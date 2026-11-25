@@ -286,6 +286,11 @@ cases=(
   "tests/leaks/leak_json_optional_fields SHAPE=opt_map"
   "tests/leaks/leak_json_optional_fields SHAPE=concat"
   "tests/leaks/leak_json_optional_fields SHAPE=absent"
+  "tests/leaks/leak_decode_optional_present SHAPE=toml"
+  "tests/leaks/leak_decode_optional_present SHAPE=toml_nested"
+  "tests/leaks/leak_decode_optional_present SHAPE=yaml"
+  "tests/leaks/leak_decode_optional_present SHAPE=yaml_nested"
+  "tests/leaks/leak_decode_optional_present SHAPE=config"
   tests/leaks/leak_json_decode_fail_after_fields
   tests/leaks/leak_json_fill_collections
   tests/leaks/leak_json_fill_collections_fail

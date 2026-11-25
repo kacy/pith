@@ -1,6 +1,7 @@
 # ir_callees.pith - static callee resolution helpers
 
 from ast import get_node
+from checker import c_ident_is_shadowed_alias
 from ir_names import ir_import_target_name, ir_global_storage_symbol
 
 # what a written call name turned into, and whether the answer came
@@ -82,8 +83,10 @@ pub fn ir_resolve_module_alias_call_name_with_state(idx: Int, module_aliases: Ma
     node := get_node(idx)
     if node.kind != "field_access" or node.children.len() == 0:
         return ""
+    # a local spelled like an alias is a value, not the module (see
+    # local_alias_receivers in the checker)
     recv := get_node(node.children[0])
-    if recv.kind != "ident":
+    if recv.kind != "ident" or c_ident_is_shadowed_alias(node.children[0]):
         return ""
     return ir_module_alias_member_name_with_state(recv.value, node.value, module_aliases, import_declared_functions, import_declared_globals)
 
@@ -98,7 +101,7 @@ pub fn ir_resolve_module_alias_method_call_name_with_state(idx: Int, module_alia
     if node.kind != "method_call" or node.children.len() == 0:
         return ""
     recv := get_node(node.children[0])
-    if recv.kind != "ident":
+    if recv.kind != "ident" or c_ident_is_shadowed_alias(node.children[0]):
         return ""
     return ir_module_alias_member_name_with_state(recv.value, ir_plain_method_name(node.value), module_aliases, import_declared_functions, import_declared_globals)
 

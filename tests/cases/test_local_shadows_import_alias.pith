@@ -1,0 +1,107 @@
+# a parameter, local, loop variable, payload binding or lambda parameter
+# spelled like an import alias is the local inside its scope, as a receiver
+# too: `text.len()` calls String.len on it. the module stays reachable
+# wherever no such local is in scope.
+import std.text as text
+import std.strings as strings
+
+struct Doc:
+    title: String
+    words: List[String]
+
+impl Doc:
+    fn measure(text: String) -> Int:
+        return text.len() + self.title.len()
+
+enum Packet:
+    Body(String)
+    Empty
+
+fn param(text: String) -> Int:
+    return text.len()
+
+fn local() -> String:
+    text := "abc"
+    return text.to_upper()
+
+fn loop_variable(items: List[String]) -> Int:
+    mut total := 0
+    for text in items:
+        total = total + text.len()
+    for text, i in items:
+        total = total + text.len() * i
+    return total
+
+fn payload(p: Packet) -> Int:
+    match p:
+        Packet.Body(text) => return text.len()
+        Packet.Empty => return 0
+
+fn if_let(o: String?) -> Int:
+    if let text = o:
+        return text.len()
+    return 0
+
+fn while_let(items: List[String?]) -> Int:
+    mut i := 0
+    mut total := 0
+    while let text = items[i]:
+        total = total + text.len()
+        i = i + 1
+    return total
+
+fn lambda_param() -> Int:
+    f := fn(text: String) -> Int => text.len()
+    return f("hello")
+
+fn captured(text: String) -> Int:
+    f := fn() -> Int => text.len() + 1
+    return f()
+
+fn fails(s: String) -> Int!:
+    if s == "":
+        fail "empty input"
+    return s.len()
+
+fn caught() -> Int:
+    n := fails("") catch text:
+        return text.len()
+    return n
+
+fn received() -> Int!:
+    ch := Channel[String](1)
+    ch.send("sent")
+    got := select:
+        text := ch.recv() => text?.len()
+        default => 0
+    return got
+
+fn field_and_method(text: Doc) -> String:
+    return text.title.to_upper() + " {text.words.len()} {text.measure("ab")}"
+
+# the module before the local exists, after the block that held it, and in a
+# function with no local of that name
+fn module_around(flag: Bool) -> String:
+    before := text.is_valid("ok")
+    if flag:
+        text := "inner"
+        return "{before} " + text.to_upper()
+    return "{before} {text.max_code_point()}"
+
+fn module_elsewhere() -> Bool:
+    return strings.is_digit("7") and text.is_valid("x")
+
+fn main() -> Int!:
+    print("{param("abcd")}")
+    print(local())
+    print("{loop_variable(["a", "bb", "ccc"])}")
+    print("{payload(Packet.Body("12345"))} {payload(Packet.Empty)}")
+    print("{if_let("xy")} {if_let(none)}")
+    print("{while_let(["a", "bc", none])}")
+    print("{lambda_param()} {captured("four")}")
+    print("{caught()} {received()!}")
+    print(field_and_method(Doc("title", ["a", "b"])))
+    print(module_around(true))
+    print(module_around(false))
+    print("{module_elsewhere()}")
+    return 0

@@ -14,6 +14,8 @@
 #   pith lint <file.pith>...    lint for convention violations
 #   pith lint --json <file>...  lint with JSON output
 #   pith doc <file.pith>        generate documentation
+#   pith doc <topic>            show docs/<topic>.md in the terminal
+#   pith doc <file.md>          show a markdown file in the terminal
 #   pith doc --json <file>    documentation as JSON
 #   pith doc --check <file>...  check all pub items documented, or for a
 #                             .md file that its pith code blocks type check
@@ -50,8 +52,13 @@ from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_sear
 from doc_examples import check_examples
 from package_cli import package_root_path, cmd_package_deps, cmd_package_lock, cmd_package_install, cmd_package_inspect, cmd_package_context, cmd_new
 from lsp_server import run_lsp_server
+import std.fs as fs
+import std.markdown as markdown
+import std.markdown.terminal as terminal
 import std.os as os
 import std.os.path as paths
+import std.term as term
+import std.term.tty as tty
 
 # ---------------------------------------------------------------
 # native backend passthrough
@@ -337,6 +344,77 @@ fn cmd_doc_check(path: String) -> Bool:
     print("ok")
     return true
 
+# the widest a guide is laid out, however wide the terminal: longer lines
+# are harder to read.
+MAX_GUIDE_COLUMNS := 100
+
+# the docs directory of the toolchain this executable belongs to: the
+# checkout's docs/ or the install's. "" when neither has one.
+fn guides_dir() -> String:
+    for root in [own_root(), env("PITH_HOME")]:
+        if root != "" and dir_exists(paths.join(root, "docs")):
+            return paths.join(root, "docs")
+    return ""
+
+# the guides in `dir`, by name, for a message that lists them.
+fn guide_names(dir: String) -> String:
+    mut names: List[String] := []
+    if dir != "":
+        for name in list_dir(dir):
+            if name.ends_with(".md"):
+                names.push(name.substring(0, name.len() - 3))
+    names = names.sort()
+    return names.join(", ")
+
+# `pith doc <topic>` and `pith doc <file.md>`: a guide from the toolchain's
+# docs/, or any markdown file, laid out for the terminal with
+# std.markdown.terminal. on a terminal the text takes its width and colors
+# (unless NO_COLOR is set) and goes through the pager; anywhere else it is
+# plain text 80 columns wide. false when there is nothing to show.
+fn cmd_doc_page(name: String) -> Bool:
+    mut path := name
+    if not name.ends_with(".md"):
+        dir := guides_dir()
+        path = paths.join(dir, name + ".md")
+        if dir == "" or not file_exists(path):
+            print_err("error: no guide named '" + name + "'; the guides are " + guide_names(dir))
+            return false
+    source := read_file(path) catch:
+        print_err(unreadable_source_message(path))
+        return false
+    on_terminal := tty.is_tty(1)
+    mut columns := 80
+    mut rows := 0
+    if on_terminal:
+        found := tty.size() catch (80, 0)
+        columns = min(found.0, MAX_GUIDE_COLUMNS)
+        rows = found.1
+    renderer := terminal.renderer(columns).colors(on_terminal and not term.no_color())
+    text := markdown.render_with(source, markdown.options(), renderer)
+    if on_terminal and text.split("\n").len() >= rows and paged(text):
+        return true
+    print(text.substring(0, max(text.len() - 1, 0)))
+    return true
+
+# show `text` through the pager, PAGER or else `less`, the way version
+# control tools do: with LESS set to FRX unless it is set already, so less
+# passes the colors through and quits at once when the text fits on the
+# screen. false when there is no pager to run, so the caller prints the text
+# instead.
+fn paged(text: String) -> Bool:
+    pager := env_opt("PAGER").unwrap_or("less")
+    if pager.trim() == "":
+        return false
+    file := fs.make_temp_file("pith-doc-", ".txt") catch:
+        return false
+    defer fs.remove(file)
+    written := fs.write(file, text) catch false
+    if not written or file.contains(" "):
+        return false
+    if env("LESS") == "":
+        _set := os.set_env("LESS", "FRX")
+    return exec(pager + " " + file) != 0 - 1
+
 fn cmd_doc_search(query: String) -> String!:
     result := doc_search(query, ".")!
     print(result)
@@ -457,6 +535,8 @@ fn print_help():
     print("  doc <file.pith>          generate documentation")
     print("  doc --json <file>      documentation (JSON output)")
     print("  doc --check <file>...  check all pub items documented, or the pith code in a .md file")
+    print("  doc <topic>            show a guide from docs/ in the terminal, such as markdown")
+    print("  doc <file.md>          show a markdown file in the terminal")
     print("  doc search <query>     search stdlib documentation")
     print("  package check          type check package root")
     print("  package test           run package root tests")
@@ -546,7 +626,10 @@ fn run_cli() -> String!:
     if command == "doc":
         if a.len() < 3:
             print("usage: pith doc [--json|--check] <file.pith>")
+            print("       pith doc --check <file.md>...")
+            print("       pith doc <topic>|<file.md>")
             print("       pith doc search <query>")
+            print("topics: " + guide_names(guides_dir()))
             exit(1)
         if a[2] == "search":
             if a.len() < 4:
@@ -565,6 +648,9 @@ fn run_cli() -> String!:
                 if not cmd_doc_check(path):
                     ok = false
             if not ok:
+                exit(1)
+        elif a[2].ends_with(".md") or (not a[2].ends_with(".pith") and not file_exists(a[2])):
+            if not cmd_doc_page(a[2]):
                 exit(1)
         else:
             _result := cmd_doc(a[2], false)!

@@ -2178,6 +2178,34 @@ cli-regressions-self-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -eq 1 ] && echo "$$out" | grep -q "PITH_NATIVE is set to $$tmpdir/no_backend, which does not exist"; then pass=$$((pass+1)); echo "ok   a missing PITH_NATIVE is named"; else echo "FAIL a missing PITH_NATIVE is named"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf '# doc\n\n```pith\nx := 1\n```\n\ntext\n\n```pith\nimport std.markdown as markdown\n\npage := markdown.to_htm("a")\n```\n\n```pith no-check\nnot pith at all\n```\n' > "$$tmpdir/stale.md"; \
+	set +e; \
+	out=$$(./self-host/pith_main doc --check "$$tmpdir/stale.md" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 1 ] && echo "$$out" | grep -q "stale.md:12:9: error\[E201\]: undefined function: markdown.to_htm" && echo "$$out" | grep -q "1 of 2 pith blocks do not check"; then pass=$$((pass+1)); echo "ok   doc --check reports a stale markdown example at its line"; else echo "FAIL doc --check reports a stale markdown example at its line"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf '```pith\nimport std.markdown as markdown\n\npage := markdown.to_html("a")\n```\n' > "$$tmpdir/fresh.md"; \
+	set +e; \
+	out=$$(./self-host/pith_main doc --check "$$tmpdir/fresh.md" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && echo "$$out" | grep -q "fresh.md: ok (1 pith blocks checked, 0 skipped)"; then pass=$$((pass+1)); echo "ok   doc --check passes a markdown file that checks"; else echo "FAIL doc --check passes a markdown file that checks"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(NO_COLOR= ./self-host/pith_main doc markdown 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$(echo "$$out" | head -1)" = "# markdown" ] && ! echo "$$out" | grep -q "$$(printf '\033')"; then pass=$$((pass+1)); echo "ok   doc shows a guide as plain text off a terminal"; else echo "FAIL doc shows a guide as plain text off a terminal"; echo "$$out" | head -5; fail=$$((fail+1)); fi; \
+	printf '# Title\n\n| a | b |\n| - | - |\n| 1 | 2 |\n' > "$$tmpdir/page.md"; \
+	set +e; \
+	out=$$(./self-host/pith_main doc "$$tmpdir/page.md" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$out" = "$$(printf '# Title\n\na │ b\n──┼──\n1 │ 2')" ]; then pass=$$((pass+1)); echo "ok   doc shows a markdown file"; else echo "FAIL doc shows a markdown file"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./self-host/pith_main doc no_such_guide 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 1 ] && echo "$$out" | grep -q "no guide named 'no_such_guide'; the guides are .*markdown"; then pass=$$((pass+1)); echo "ok   doc names the guides when one is missing"; else echo "FAIL doc names the guides when one is missing"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host cli regressions passed"

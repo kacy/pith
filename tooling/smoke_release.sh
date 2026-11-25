@@ -34,4 +34,5 @@ pith build hello.pith
 test "$(./hello)" = "hello, PITH"
 pith test hello.pith
 pith fmt hello.pith > /dev/null
+test "$(pith doc markdown | head -n 1)" = "# markdown"
 echo "smoke ok"

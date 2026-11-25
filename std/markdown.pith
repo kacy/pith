@@ -3038,6 +3038,8 @@ pub struct Events:
     # the heading ids given out so far, each with how many times its plain
     # form has been taken, for numbering the repeats.
     ids_taken: Map[String, Int] = {}
+    # the line the block of the last step starts on (see line).
+    block_line: Int = 0
 
 impl Iterator for Events:
     type Item = Event
@@ -3055,6 +3057,14 @@ impl Iterator for Events:
         return event
 
 impl Events:
+    # The line, counted from 1, that the block holding the last event
+    # returned starts on: a paragraph's first line, a fenced code block's
+    # opening fence, a list item's marker. an inline event reports the line
+    # of its paragraph or heading, and the end of a container the line the
+    # container starts on.
+    fn line() -> Int:
+        return self.block_line
+
     # walk one step through the block tree, queueing its events. the walk
     # follows parent and sibling links, so it uses no stack however deep the
     # tree is.
@@ -3062,6 +3072,7 @@ impl Events:
         blocks := self.document.blocks
         index := self.node
         block := blocks[index]
+        self.block_line = block.start_line
         if not self.entering:
             if block.kind == BlockKind.Document or block.kind == BlockKind.Footnote:
                 self.next_footnote(block)
@@ -4174,6 +4185,13 @@ test "front matter is bounded":
     at_limit := "a".repeat(MAX_FRONT_MATTER_BYTES - 1) + "\n"
     assert_eq(split_front_matter("---\n" + at_limit + "---\nb")!.data.len(), MAX_FRONT_MATTER_BYTES)
     assert_eq(front("---\n" + at_limit + "x\n---\nb"), "error")
+
+test "events report the line their block starts on":
+    stream := events("# title\n\npara\ngraph\n\n- a\n- b\n\n```pith\ncode\n```\n", options())
+    mut seen: List[String] := []
+    for event in stream:
+        seen.push(describe(event) + "@{stream.line()}")
+    assert_eq(seen.join(" "), "+h1@1 text(title)@1 -h1@1 +p@3 text(para)@3 soft@3 text(graph)@3 -p@3 +list[none true]@6 +item@6 text(a)@6 -item@6 +item@7 text(b)@7 -item@7 -list[none true]@6 +code[pith]@9 text(code\n)@9 -code[pith]@9")
 
 test "render_with drives any renderer":
     counter := CountingRenderer(counted: 0, texts: [])

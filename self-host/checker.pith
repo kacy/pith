@@ -22,7 +22,7 @@ from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_loc
 from ast import Node, get_node, node_kind, node_value, node_child_count, node_child, append_node_child, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, render_diagnostics_json
 from lexer import int_literal_magnitude
-from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
+from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name, split_variant_pattern_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types, builtin_scope_id, set_builtin_scope_id
 from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, checker_reported_at, report_error_at, report_error_at_name, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_is_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot, checker_note_alias_module
@@ -4254,6 +4254,14 @@ pub fn c_get_expr_type(node_idx: Int) -> Int:
         return expression_type_cache[node_idx]
     return TID_ERR
 
+## the type a pattern node matches against: the subject's for an arm's own
+## pattern, the slot's for a sub-pattern of a payload or a tuple element. -1
+## when the checker recorded none.
+pub fn c_pattern_type(pat_idx: Int) -> Int:
+    if expression_type_cache.contains_key(pat_idx):
+        return expression_type_cache[pat_idx]
+    return 0 - 1
+
 fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     node := get_node(node_idx)
     tid_int := lookup_type_id("Int")
@@ -8348,6 +8356,8 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
         return TID_ERR
     mut result_type := TID_ERR
     mut arm_values: List[String] := []
+    # the pattern of every unguarded arm, for the nested exhaustiveness check
+    mut arm_patterns: List[Int] := []
     mut branch_exprs: List[Int] := []
     mut branch_types: List[Int] := []
     subject_is_optional := get_type_info(subject_type).kind == "optional"
@@ -8369,6 +8379,7 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
             # each of its alternatives. a guarded arm covers nothing, since
             # its guard can be false.
             if arm_node.children.len() > 0 and not match_arm_has_guard(arm_node):
+                arm_patterns.push(arm_node.children[0])
                 pat := get_node(arm_node.children[0])
                 if pat.kind == "pat_or":
                     for alt in pat.children:
@@ -8401,7 +8412,7 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
                                 result_type = unified
     mark_widened_branches(branch_exprs, branch_types, result_type)
     # exhaustiveness checking
-    check_match_exhaustiveness(subject_type, arm_values, node_idx)
+    check_match_exhaustiveness(subject_type, arm_values, arm_patterns)
     return result_type
 
 fn match_arm_has_guard(arm: Node) -> Bool:
@@ -8451,6 +8462,11 @@ fn check_match_arm(arm: Node, subject_type: Int, scope_id: Int) -> Int:
 
 fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     pat := get_node(pat_idx)
+    # the emitter reads back the type each pattern matches against: a
+    # sub-pattern nested in a payload or a tuple element works on its own
+    # slot's type, not the subject's (see c_pattern_type)
+    if expected_type >= 0:
+        expression_type_cache.insert(pat_idx, expected_type)
     if pat.kind == "pat_wildcard":
         return
     if pat.kind == "pat_binding":
@@ -8475,8 +8491,6 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
             return
         for bound in pat.children:
             check_int_literal_range(bound, node_value(bound), expected_type)
-        # the emitter compares an unsigned subject with the unsigned forms
-        expression_type_cache.insert(pat_idx, expected_type)
         return
     if pat.kind == "pat_float":
         if expected_type != TID_FLOAT:
@@ -8491,6 +8505,10 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
             report_error("E228", "bool pattern cannot match " + get_type_name(expected_type))
         return
     if pat.kind == "pat_none":
+        # the emitter tests an optional's flag, which a value of any other
+        # type does not have
+        if expected_type >= 0 and not is_error_type(expected_type) and get_type_info(expected_type).kind != "optional":
+            report_error_at(pat_idx, "E228", "none pattern cannot match " + get_type_name(expected_type))
         return
     if pat.kind == "pat_variant":
         check_variant_pattern_match(pat_idx, pat, expected_type, scope_id)
@@ -8523,6 +8541,10 @@ fn reject_variant_named_binding(pat_idx: Int, name: String, subject_type: Int):
 # Each alternative of an or-pattern must match the same type. Alternatives may
 # not bind names (the arms can't tell which alternative matched), so a binding
 # or wildcard alternative is rejected.
+#
+# alternatives that bind inside a payload (`Cmd.Add(n) | Cmd.Sub(n)`) must bind
+# the same names with the same types: the arm reads every name whichever
+# alternative matched, so a name only one of them binds would be read unset.
 fn check_or_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     for alt in pat.children:
         alt_node := get_node(alt)
@@ -8530,30 +8552,71 @@ fn check_or_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
             report_error("E228", "or-pattern alternatives cannot bind; use a separate arm")
         else:
             check_pattern_match(alt, expected_type, scope_id)
+    if pat.children.len() < 2:
+        return
+    mut first: List[Int] := []
+    collect_pattern_bindings(pat.children[0], first)
+    for alt, ai in pat.children:
+        if ai == 0:
+            continue
+        mut these: List[Int] := []
+        collect_pattern_bindings(alt, these)
+        mut differs := these.len() != first.len()
+        for b in first:
+            mut matched := false
+            for other in these:
+                if node_value(other) == node_value(b) and c_pattern_type(other) == c_pattern_type(b):
+                    matched = true
+            if not matched:
+                differs = true
+        if differs:
+            report_error_at(alt, "E228", "or-pattern alternatives must bind the same names with the same types")
+            return
+
+# the binding nodes a pattern introduces, at any depth
+fn collect_pattern_bindings(pat_idx: Int, out: List[Int]):
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_binding":
+        out.push(pat_idx)
+        return
+    for child in pat.children:
+        collect_pattern_bindings(child, out)
 
 # whether a pattern's written enum name means the generic base an instance
 # was named from. the base is the bare name unless two modules declare it,
 # and then it is the declaring module's key, which the written name reaches
 # through the module's own generic declaration.
+# a name written through a module alias (`lib.Opt`) means that module's
+# declaration and nothing else.
 fn generic_pattern_names_base(type_name: String, base: String) -> Bool:
     if base == type_name:
         return true
-    decl_idx := get_generic_declaration_index(type_name)
+    mut decl_idx := 0 - 1
+    parts := split_qualified_name(type_name)
+    if parts.1.len() > 0 and module_aliases.contains_key(parts.0):
+        key := module_generic_target_name(module_aliases[parts.0], parts.1)
+        if generic_declaration_map.contains_key(key):
+            decl_idx = generic_declaration_map[key]
+    else:
+        decl_idx = get_generic_declaration_index(type_name)
     if decl_idx < 0:
         return false
     return generic_declaration_identity(decl_idx) == base
 
 fn check_variant_pattern_match(pat_idx: Int, pat: Node, expected_type: Int, scope_id: Int):
-    # value: "EnumName.VariantName"
+    # value: "EnumName.VariantName", or "alias.EnumName.VariantName" for an
+    # enum named through a module import
     # children: sub-patterns for variant fields
-    parts := split_qualified_name(pat.value)
+    parts := split_variant_pattern_name(pat.value)
     if parts.1.len() == 0:
         return
     type_name := parts.0
     variant_name := parts.1
     mut enum_tid := resolve_type_name_module_scoped(type_name)
-    if enum_tid < 0:
+    if enum_tid < 0 and not type_name.contains("."):
         enum_tid = lookup_type_id(type_name)
+    if enum_tid < 0 and type_name.contains("."):
+        enum_tid = resolve_type_by_module_basename(type_name)
     # a generic enum registers only its instances (Opt[Int]), never the bare
     # base, so a pattern's `Opt.Some` finds nothing by name and used to die
     # here with "unknown type". the subject already names the instance, and
@@ -8566,14 +8629,14 @@ fn check_variant_pattern_match(pat_idx: Int, pat: Node, expected_type: Int, scop
         if einfo.kind == "enum" and generic_pattern_names_base(type_name, extract_base_type_name(einfo.name)):
             enum_tid = expected_type
     if enum_tid < 0:
-        report_error("E202", "unknown type: " + type_name)
+        report_error_at(pat_idx, "E202", "unknown type: " + type_name)
         return
     if enum_tid != expected_type:
-        report_error("E228", "variant pattern type " + type_name + " does not match expected type " + get_type_name(expected_type))
+        report_error_at(pat_idx, "E228", "variant pattern type " + type_name + " does not match expected type " + get_type_name(expected_type))
         return
     enum_info := get_type_info(enum_tid)
     if enum_info.kind != "enum":
-        report_error("E228", type_name + " is not an enum")
+        report_error_at(pat_idx, "E228", type_name + " is not an enum")
         return
     # find the variant
     mut found := false
@@ -8585,27 +8648,13 @@ fn check_variant_pattern_match(pat_idx: Int, pat: Node, expected_type: Int, scop
             if vidx < enum_info.variant_types.len():
                 variant_fields := enum_info.variant_types[vidx]
                 if pat.children.len() != variant_fields.len():
-                    report_error("E213", variant_name + " has " + variant_fields.len().to_string() + " fields, but pattern has " + pat.children.len().to_string())
+                    report_error_at(pat_idx, "E213", variant_name + " has " + variant_fields.len().to_string() + " fields, but pattern has " + pat.children.len().to_string())
                     return
                 # check each sub-pattern
                 mut fidx := 0
                 for sub_pat in pat.children:
                     if fidx < variant_fields.len():
-                        sub := get_node(sub_pat)
-                        if sub.kind == "pat_binding":
-                            # a payload binding holds the slot exactly as
-                            # declared: the runtime binds the raw payload, so
-                            # an optional payload stays optional here. the
-                            # unwrap rule in check_pattern_match is for a
-                            # binding arm on an optional SUBJECT, where the
-                            # match itself unwraps — applying it to a payload
-                            # typed the box as its inner and interpolating
-                            # the binding printed a heap address.
-                            note_nested_binding_name(sub.value, sub_pat, scope_id)
-                            reject_variant_named_binding(sub_pat, sub.value, variant_fields[fidx])
-                            define_binding_at(scope_id, sub.value, variant_fields[fidx], false, sub_pat)
-                        else:
-                            check_pattern_match(sub_pat, variant_fields[fidx], scope_id)
+                        check_nested_pattern_match(sub_pat, variant_fields[fidx], scope_id)
                     fidx = fidx + 1
         vidx = vidx + 1
     if found == false:
@@ -8622,8 +8671,26 @@ fn check_tuple_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     mut i := 0
     for sub_pat in pat.children:
         if i < info.elements.len():
-            check_pattern_match(sub_pat, info.elements[i], scope_id)
+            check_nested_pattern_match(sub_pat, info.elements[i], scope_id)
         i = i + 1
+
+# a sub-pattern of a variant payload or a tuple element. a binding there holds
+# the slot exactly as declared: the emitter binds the raw slot, so an optional
+# payload or element stays optional. the unwrap rule in check_pattern_match is
+# for a binding arm on an optional SUBJECT, where the match itself unwraps;
+# applying it to a slot typed the box as its inner, and interpolating the
+# binding printed a heap address. any other sub-pattern is checked against the
+# slot's type like a pattern of its own.
+fn check_nested_pattern_match(sub_pat: Int, slot_type: Int, scope_id: Int):
+    sub := get_node(sub_pat)
+    if sub.kind != "pat_binding":
+        check_pattern_match(sub_pat, slot_type, scope_id)
+        return
+    if slot_type >= 0:
+        expression_type_cache.insert(sub_pat, slot_type)
+    note_nested_binding_name(sub.value, sub_pat, scope_id)
+    reject_variant_named_binding(sub_pat, sub.value, slot_type)
+    define_binding_at(scope_id, sub.value, slot_type, false, sub_pat)
 
 # ---------------------------------------------------------------
 # exhaustiveness checking
@@ -8638,7 +8705,7 @@ fn collect_arm_pattern_bindings(pat: Node) -> String:
         return pat.value
     if pat.kind == "pat_variant":
         # extract variant name from "EnumName.VariantName"
-        parts := split_qualified_name(pat.value)
+        parts := split_variant_pattern_name(pat.value)
         if parts.1.len() > 0:
             return parts.1
         return parts.0
@@ -8657,7 +8724,12 @@ fn collect_arm_pattern_bindings(pat: Node) -> String:
         return "None"
     return ""
 
-fn check_match_exhaustiveness(subject_type: Int, arm_values: List[String], node_idx: Int):
+# `arm_patterns` holds the pattern of every unguarded arm. the per-variant
+# test below reads only each arm's outer pattern; the nested check after it
+# reads the whole pattern, so an arm whose payload sub-patterns can fail
+# (`Outer.Wrap(Inner.A(n))`, `Shape.Circle(0.0)`) does not cover its variant
+# on its own.
+fn check_match_exhaustiveness(subject_type: Int, arm_values: List[String], arm_patterns: List[Int]):
     # if any wildcard or binding pattern, it's exhaustive
     for v in arm_values:
         if v == "_":
@@ -8668,7 +8740,11 @@ fn check_match_exhaustiveness(subject_type: Int, arm_values: List[String], node_
         return
     subj_info := get_type_info(subject_type)
     if subj_info.kind == "enum":
-        check_enum_exhaustiveness(subj_info, arm_values)
+        if check_enum_exhaustiveness(subj_info, arm_values):
+            check_nested_exhaustiveness(subject_type, arm_patterns)
+        return
+    if subj_info.kind == "tuple":
+        check_nested_exhaustiveness(subject_type, arm_patterns)
         return
     if subj_info.kind == "optional":
         # Optional needs both Some and None patterns (or wildcard)
@@ -8704,7 +8780,8 @@ fn check_bool_exhaustiveness(arm_values: List[String]):
     if has_false == false:
         report_error("E204", "non-exhaustive match: missing 'false' case")
 
-fn check_enum_exhaustiveness(info: TypeInfo, arm_values: List[String]):
+# true when every variant has an arm; reports the ones without one otherwise.
+fn check_enum_exhaustiveness(info: TypeInfo, arm_values: List[String]) -> Bool:
     mut missing: List[String] := []
     for variant in info.variants:
         mut found := false
@@ -8715,6 +8792,168 @@ fn check_enum_exhaustiveness(info: TypeInfo, arm_values: List[String]):
             missing.push(variant)
     if missing.len() > 0:
         report_error("E204", "non-exhaustive match: missing variants: " + missing.join(", "))
+        return false
+    return true
+
+# the exhaustiveness check over whole patterns, nested ones included: reports
+# a value no arm matches, spelled as a pattern.
+fn check_nested_exhaustiveness(subject_type: Int, arm_patterns: List[Int]):
+    mut rows: List[List[Int]] := []
+    for pat in arm_patterns:
+        mut row: List[Int] := [pat]
+        rows.push(row)
+    mut types: List[Int] := [subject_type]
+    gap := uncovered_pattern_values(rows, types)
+    if gap.0 and gap.1.len() > 0:
+        report_error_with_fix("E204", "non-exhaustive match: no arm matches " + gap.1[0], "add an arm for it, or a wildcard (_) arm")
+
+# the usefulness walk behind check_nested_exhaustiveness. each row is one arm,
+# holding one pattern node per column, with -1 for a wildcard the walk filled
+# in; `types` holds each column's type. answers (true, witness) when some value
+# of the column types matches no row, where the witness spells that value as
+# one pattern per column, and (false, []) when the rows cover every value.
+#
+# a column of an enum, Bool or tuple type is split by constructor: the rows
+# that can match one variant (or `true`, or the tuple) go on with that
+# constructor's sub-patterns as new columns. a column no row tests with a
+# constructor, and a column of any other type, is covered only by its wildcard
+# rows. splitting only where a pattern does keeps the walk as deep as the
+# patterns, so a recursive enum ends.
+fn uncovered_pattern_values(rows: List[List[Int]], types: List[Int]) -> (Bool, List[String]):
+    mut witness: List[String] := []
+    if types.len() == 0:
+        return (rows.len() == 0, witness)
+    head := types[0]
+    mut rest: List[Int] := []
+    for t, ti in types:
+        if ti > 0:
+            rest.push(t)
+    info := get_type_info(head)
+    mut form := ""
+    if head == TID_BOOL:
+        form = "bool"
+    elif info.kind == "tuple":
+        form = "tuple"
+    elif info.kind == "enum":
+        form = "variant"
+    if form.len() == 0 or not pattern_column_tests_constructor(rows):
+        inner := uncovered_pattern_values(specialize_pattern_rows(rows, "default", "", 0), rest)
+        if inner.0:
+            witness.push("_")
+            for w in inner.1:
+                witness.push(w)
+        return (inner.0, witness)
+    mut ctors: List[String] := []
+    mut ctor_types: List[List[Int]] := []
+    mut no_fields: List[Int] := []
+    if form == "bool":
+        ctors = ["true", "false"]
+        ctor_types = [no_fields, no_fields]
+    elif form == "tuple":
+        ctors = [""]
+        ctor_types = [info.elements]
+    else:
+        for v, vi in info.variants:
+            ctors.push(v)
+            if vi < info.variant_types.len():
+                ctor_types.push(info.variant_types[vi])
+            else:
+                ctor_types.push(no_fields)
+    for ctor, ci in ctors:
+        fields := ctor_types[ci]
+        mut sub_types: List[Int] := []
+        for f in fields:
+            sub_types.push(f)
+        for t in rest:
+            sub_types.push(t)
+        inner := uncovered_pattern_values(specialize_pattern_rows(rows, form, ctor, fields.len()), sub_types)
+        if inner.0:
+            mut args: List[String] := []
+            for w, wi in inner.1:
+                if wi < fields.len():
+                    args.push(w)
+            if form == "bool":
+                witness.push(ctor)
+            elif form == "tuple":
+                witness.push("(" + args.join(", ") + ")")
+            elif args.len() > 0:
+                witness.push(extract_base_type_name(info.name) + "." + ctor + "(" + args.join(", ") + ")")
+            else:
+                witness.push(extract_base_type_name(info.name) + "." + ctor)
+            for w, wi in inner.1:
+                if wi >= fields.len():
+                    witness.push(w)
+            return (true, witness)
+    return (false, witness)
+
+# whether some row's first pattern tests a constructor rather than matching
+# every value
+fn pattern_column_tests_constructor(rows: List[List[Int]]) -> Bool:
+    for row in rows:
+        if pattern_tests_constructor(row[0]):
+            return true
+    return false
+
+fn pattern_tests_constructor(pat_idx: Int) -> Bool:
+    if pat_idx < 0:
+        return false
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_wildcard" or pat.kind == "pat_binding":
+        return false
+    if pat.kind == "pat_or":
+        for alt in pat.children:
+            if pattern_tests_constructor(alt):
+                return true
+        return false
+    return true
+
+# the rows that can match constructor `ctor` of the first column, each with
+# that column replaced by the constructor's `arity` sub-patterns. form is
+# "variant", "bool" or "tuple"; "default" keeps the rows whose first pattern
+# matches every value and drops the column.
+fn specialize_pattern_rows(rows: List[List[Int]], form: String, ctor: String, arity: Int) -> List[List[Int]]:
+    mut out: List[List[Int]] := []
+    for row in rows:
+        specialize_pattern_row(row[0], row, form, ctor, arity, out)
+    return out
+
+fn specialize_pattern_row(head: Int, row: List[Int], form: String, ctor: String, arity: Int, out: List[List[Int]]):
+    mut next: List[Int] := []
+    mut wild := head < 0
+    if head >= 0:
+        pat := get_node(head)
+        if pat.kind == "pat_or":
+            for alt in pat.children:
+                specialize_pattern_row(alt, row, form, ctor, arity, out)
+            return
+        wild = pat.kind == "pat_wildcard" or pat.kind == "pat_binding"
+        if not wild:
+            if form == "default":
+                return
+            if form == "variant":
+                if pat.kind != "pat_variant" or split_variant_pattern_name(pat.value).1 != ctor:
+                    return
+            elif form == "bool":
+                if pat.kind != "pat_bool" or pat.value != ctor:
+                    return
+            elif pat.kind != "pat_tuple":
+                return
+            # a sub-pattern count the checker already refused reads as all
+            # wildcards, so the rows keep one shape
+            if pat.children.len() == arity:
+                for c in pat.children:
+                    next.push(c)
+            else:
+                wild = true
+    if wild and form != "default":
+        mut k := 0
+        while k < arity:
+            next.push(0 - 1)
+            k = k + 1
+    for c, ci in row:
+        if ci > 0:
+            next.push(c)
+    out.push(next)
 
 # ---------------------------------------------------------------
 # lambda expression

@@ -7,7 +7,8 @@ stale and a fix to it is welcome.
 
 ## language
 
-- **a variant pattern must be qualified**. write `Color.Red`, not `Red`. a bare
+- **a variant pattern must be qualified**. write `Color.Red`, not `Red`, or
+  `colors.Color.Red` for an enum another module declares. a bare
   name in a pattern is a binding that matches every value, so one that names a
   variant of the matched enum is rejected (E228). `==` on enums
   with payloads compares tags and then payloads, strings by content and nested

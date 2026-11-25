@@ -6,8 +6,8 @@
 # core; the functions here take those emitters as explicit parameters
 # (emit_expr, emit_block), the same seam the decode module uses.
 
-from ast import Node, get_node
-from checker import c_get_expr_type
+from ast import Node, get_node, node_kind
+from checker import c_get_expr_type, c_pattern_type
 from types import get_type_info, get_type_name
 from ir_builder import ir_emit, ir_label, ir_new_temp_name, ir_reg, ir_var_regs, ir_var_types, ir_current_func_return_kind, ir_untracked_rc_binds, ir_kinded_rc_binds
 from ir_call_emit import ir_emit_call2, ir_emit_label, ir_last_was_ret
@@ -88,29 +88,116 @@ fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int
 # pattern is safe only when every bound rc slot's kind resolved: an
 # "unknown" slot is bound without a retain (ir_bind_owned_rc_payload emits
 # nothing for it), and freeing the box would leave that binding dangling.
+# a sub-pattern nested in a payload is judged the same way, with every
+# binding below a payload counted (a nested tuple's elements included, see
+# ir_emit_pattern_bindings), so it too needs each bound slot's kind resolved.
 # an optional subject's bare binding is the counted payload extraction, not
 # an alias, so it keeps the subject free.
-pub fn ir_match_pattern_keeps_subject_free(pat: Node, subj_is_optional: Bool) -> Bool:
+pub fn ir_match_pattern_keeps_subject_free(pat_idx: Int, subj_is_optional: Bool) -> Bool:
+    return ir_pattern_keeps_subject_free(pat_idx, subj_is_optional, false)
+
+fn ir_pattern_keeps_subject_free(pat_idx: Int, subj_is_optional: Bool, counted: Bool) -> Bool:
+    pat := get_node(pat_idx)
     if pat.kind == "pat_binding":
         return subj_is_optional
     if pat.kind == "pat_tuple":
-        return false
+        if not counted:
+            return false
+        elems := ir_match_tuple_element_kinds(pat_idx, pat.children.len())
+        for sub_idx, i in pat.children:
+            if node_kind(sub_idx) == "pat_binding":
+                if elems[i] == "unknown":
+                    return false
+            elif not ir_pattern_keeps_subject_free(sub_idx, false, true):
+                return false
+        return true
     if pat.kind == "pat_or":
         for alt_idx in pat.children:
-            if not ir_match_pattern_keeps_subject_free(get_node(alt_idx), subj_is_optional):
+            if not ir_pattern_keeps_subject_free(alt_idx, subj_is_optional, counted):
                 return false
         return true
     if pat.kind == "pat_variant":
-        mut kinds: List[String] := []
-        if ir_enum_payload_kinds.contains_key(pat.value):
-            kinds = ir_resolved_variant_kinds(pat.value, ir_enum_payload_kinds[pat.value].split(","))
+        kinds := ir_variant_pattern_kinds(pat_idx)
         for sub_idx, i in pat.children:
-            sub := get_node(sub_idx)
-            if sub.kind == "pat_binding":
+            if node_kind(sub_idx) == "pat_binding":
                 if i >= kinds.len() or kinds[i] == "unknown":
                     return false
+            elif not ir_pattern_keeps_subject_free(sub_idx, false, true):
+                return false
         return true
     return true
+
+## whether a pattern binds any name, at any depth.
+pub fn ir_pattern_binds_names(pat_idx: Int) -> Bool:
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_binding":
+        return true
+    for child in pat.children:
+        if ir_pattern_binds_names(child):
+            return true
+    return false
+
+## whether a sub-pattern can fail to match its slot. a binding or a wildcard
+## never can, and neither can a tuple of sub-patterns that never can.
+fn ir_pattern_is_refutable(pat_idx: Int) -> Bool:
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_binding" or pat.kind == "pat_wildcard":
+        return false
+    if pat.kind == "pat_tuple":
+        for child in pat.children:
+            if ir_pattern_is_refutable(child):
+                return true
+        return false
+    return true
+
+## the type a pattern matches against: what the checker recorded for it, or
+## fallback_tid when it recorded none. a sub-pattern's is its slot's type,
+## which is what a nested variant resolves a generic enum's payload kinds
+## against and what a nested tuple reads its element kinds from.
+fn ir_pattern_tid(pat_idx: Int, fallback_tid: Int) -> Int:
+    tid := c_pattern_type(pat_idx)
+    if tid >= 0:
+        return tid
+    return fallback_tid
+
+## the ir key of a variant pattern's name, "Enum.Variant". a pattern written
+## through a module alias ("lib.Enum.Variant") drops the alias, the way a
+## module-qualified constructor does, since an enum's variants are filed under
+## the enum's own name.
+pub fn ir_variant_pattern_key(value: String) -> String:
+    mut dots := 0
+    mut i := value.len() - 1
+    while i >= 0:
+        if value[i] == ".":
+            dots = dots + 1
+            if dots == 2:
+                return value.substring(i + 1, value.len())
+        i = i - 1
+    return value
+
+## the payload kinds of a variant pattern's slots, resolved against the enum
+## instance the pattern matches (see ir_pattern_tid), or an empty list for a
+## variant without a payload. fallback_tid stands in for a pattern the checker
+## recorded no type for.
+pub fn ir_variant_pattern_kinds_for(pat_idx: Int, fallback_tid: Int) -> List[String]:
+    key := ir_variant_pattern_key(get_node(pat_idx).value)
+    mut kinds: List[String] := []
+    if ir_enum_payload_kinds.contains_key(key):
+        kinds = ir_resolved_variant_kinds_for_tid(ir_pattern_tid(pat_idx, fallback_tid), key, ir_enum_payload_kinds[key].split(","))
+    return kinds
+
+fn ir_variant_pattern_kinds(pat_idx: Int) -> List[String]:
+    return ir_variant_pattern_kinds_for(pat_idx, ir_match_subject_tid)
+
+## load payload slot `i` of a boxed enum value under the kind its variant
+## declares. the tag fills the first word, so the payloads start one word in.
+fn ir_emit_payload_slot(subj_r: Int, i: Int, kinds: List[String], name: String) -> Int:
+    mut kind := "unknown"
+    if i < kinds.len():
+        kind = kinds[i]
+    slot_r := ir_reg()
+    ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " " + name)
+    return slot_r
 
 # the rc kind a match may release its subject with once an arm is taken, or
 # "" when the subject is not this match's to free. a subject the caller
@@ -138,7 +225,7 @@ fn ir_match_subject_release_kind(node: Node, subj_type: String, subj_owned: Bool
     while i < node.children.len():
         arm := get_node(node.children[i])
         if arm.children.len() > 0:
-            if not ir_match_pattern_keeps_subject_free(get_node(arm.children[0]), subj_is_optional):
+            if not ir_match_pattern_keeps_subject_free(arm.children[0], subj_is_optional):
                 return ""
         i = i + 1
     return kind
@@ -257,17 +344,18 @@ pub fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
         return r
     if pat.kind == "pat_variant":
         r := ir_reg()
-        if ir_struct_field_index_lookup.contains_key(pat.value):
-            enum_name := ir_variant_enum_name(pat.value)
+        key := ir_variant_pattern_key(pat.value)
+        if ir_struct_field_index_lookup.contains_key(key):
+            enum_name := ir_variant_enum_name(key)
             lit_r := ir_reg()
-            ir_emit("iconst " + lit_r.to_string() + " " + ir_struct_field_index_lookup[pat.value])
+            ir_emit("iconst " + lit_r.to_string() + " " + ir_struct_field_index_lookup[key])
             if ir_boxed_enums.contains_key(enum_name):
                 # boxed enum: the subject is a pointer; compare the stored tag,
-                # then fold in any literal payload sub-patterns
+                # then fold in any payload sub-patterns that can fail
                 tag_r := ir_reg()
                 ir_emit("field " + tag_r.to_string() + " " + subj_r.to_string() + " 0 int __enum_tag")
                 ir_emit("eq " + r.to_string() + " " + tag_r.to_string() + " " + lit_r.to_string())
-                return ir_emit_variant_payload_conds(pat, subj_r, r)
+                return ir_emit_variant_payload_conds(pat_idx, subj_r, r)
             ir_emit("eq " + r.to_string() + " " + subj_r.to_string() + " " + lit_r.to_string())
             return r
         ir_emit("iconst " + r.to_string() + " 0")
@@ -305,13 +393,12 @@ pub fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
     if pat.kind == "pat_tuple":
         # each element loads its slot and recurses into the ordinary
         # pattern machinery; bindings and wildcards match anything
-        elems := ir_match_tuple_element_kinds(pat.children.len())
+        elems := ir_match_tuple_element_kinds(pat_idx, pat.children.len())
         acc_r := ir_reg()
         ir_emit("iconst " + acc_r.to_string() + " 1")
         mut out_r := acc_r
         for sub_idx, i in pat.children:
-            sub := get_node(sub_idx)
-            if sub.kind == "pat_binding" or sub.kind == "pat_wildcard":
+            if not ir_pattern_is_refutable(sub_idx):
                 continue
             elem_r := ir_reg()
             ir_emit("field " + elem_r.to_string() + " " + subj_r.to_string() + " " + (i * 8).to_string() + " " + elems[i] + " __t" + i.to_string())
@@ -325,13 +412,14 @@ pub fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
     ir_emit("iconst " + r.to_string() + " 0")
     return r
 
-# element kind names for the current match subject's tuple type;
-# "unknown" per element when the subject isn't a known tuple
+# element kind names for the tuple type a tuple pattern matches (the match
+# subject's, or a payload slot's for a nested one); "unknown" per element
+# when that isn't a known tuple
 
 ## element kinds for a tuple-pattern subject.
-pub fn ir_match_tuple_element_kinds(count: Int) -> List[String]:
+pub fn ir_match_tuple_element_kinds(pat_idx: Int, count: Int) -> List[String]:
     mut out: List[String] := []
-    info := get_type_info(ir_match_subject_tid)
+    info := get_type_info(ir_pattern_tid(pat_idx, ir_match_subject_tid))
     mut i := 0
     while i < count:
         if info.kind == "tuple" and i < info.elements.len():
@@ -425,49 +513,46 @@ pub fn ir_resolved_variant_kinds_for_tid(tid: Int, variant_key: String, kinds: L
             out.push(k)
     return out
 
-## the match path's wrapper: resolve against the current subject.
-fn ir_resolved_variant_kinds(pat_value: String, kinds: List[String]) -> List[String]:
-    return ir_resolved_variant_kinds_for_tid(ir_match_subject_tid, pat_value, kinds)
-
-# literal payload sub-patterns (Shape.Circle(0.0)) narrow the tag match:
-# each one loads its slot and ANDs an equality into the arm condition.
-# binding and wildcard sub-patterns always match here; bindings are stored
-# by ir_emit_match_bindings once the arm is taken.
+# payload sub-patterns that can fail (a literal, a range, `none`, a nested
+# variant or a tuple holding one) narrow the tag match: each loads its slot
+# and tests it as a subject of its own, through ir_emit_match_cond, and the
+# results are ANDed into the arm condition. binding and wildcard sub-patterns
+# always match here; bindings are stored by ir_emit_match_bindings once the
+# arm is taken. the slots are read only after the tag matched, since another
+# variant's slot holds a value of another type or nothing at all, and testing
+# it (a string compare on an Int, a nested variant's tag read through an Int)
+# crashed.
 
 ## extend an arm condition with variant payload checks.
-pub fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) -> Int:
+pub fn ir_emit_variant_payload_conds(pat_idx: Int, subj_r: Int, tag_cond_r: Int) -> Int:
+    pat := get_node(pat_idx)
+    mut refutable := false
+    for sub_idx in pat.children:
+        if ir_pattern_is_refutable(sub_idx):
+            refutable = true
+    if not refutable:
+        return tag_cond_r
+    kinds := ir_variant_pattern_kinds(pat_idx)
+    temp := ir_new_temp_name("variant_match")
+    ir_emit("store " + temp + " " + tag_cond_r.to_string())
+    test_l := ir_label()
+    done_l := ir_label()
+    ir_emit("brif " + tag_cond_r.to_string() + " " + test_l + " " + done_l)
+    ir_emit_label(test_l)
     mut acc_r := tag_cond_r
-    mut kinds: List[String] := []
-    if ir_enum_payload_kinds.contains_key(pat.value):
-        kinds = ir_resolved_variant_kinds(pat.value, ir_enum_payload_kinds[pat.value].split(","))
     for sub_idx, i in pat.children:
-        sub := get_node(sub_idx)
-        if sub.kind == "pat_binding" or sub.kind == "pat_wildcard":
-            continue
-        mut kind := "unknown"
-        if i < kinds.len():
-            kind = kinds[i]
-        slot_r := ir_reg()
-        ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " __payload")
-        mut cond_r := ir_reg()
-        if sub.kind == "pat_int":
-            lit_r := ir_emit_int_literal(sub)
-            ir_emit("eq " + cond_r.to_string() + " " + slot_r.to_string() + " " + lit_r.to_string())
-        elif sub.kind == "pat_bool":
-            lit_r := ir_emit_bool_literal(sub)
-            ir_emit("eq " + cond_r.to_string() + " " + slot_r.to_string() + " " + lit_r.to_string())
-        elif sub.kind == "pat_float":
-            lit_r := ir_emit_float_literal(sub)
-            ir_emit("eq " + cond_r.to_string() + " " + slot_r.to_string() + " " + lit_r.to_string())
-        elif sub.kind == "pat_string":
-            lit_r := ir_emit_string_literal(sub)
-            ir_emit_call2(cond_r, "__str_eq", "bool", slot_r, lit_r)
-        else:
-            ir_emit("iconst " + cond_r.to_string() + " 0")
-        and_r := ir_reg()
-        ir_emit("and " + and_r.to_string() + " " + acc_r.to_string() + " " + cond_r.to_string())
-        acc_r = and_r
-    return acc_r
+        if ir_pattern_is_refutable(sub_idx):
+            slot_r := ir_emit_payload_slot(subj_r, i, kinds, "__payload")
+            cond_r := ir_emit_match_cond(sub_idx, slot_r)
+            and_r := ir_reg()
+            ir_emit("and " + and_r.to_string() + " " + acc_r.to_string() + " " + cond_r.to_string())
+            acc_r = and_r
+    ir_emit("store " + temp + " " + acc_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit_label(done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp)
+    return r
 
 # bind any names a pattern introduces, in the branch where it matched.
 
@@ -512,6 +597,14 @@ pub fn ir_bind_uncounted_view(name: String):
 
 ## bind pattern names to the matched subject's pieces.
 pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
+    ir_emit_pattern_bindings(pat_idx, subj_r, subj_type, false)
+
+## the binder behind ir_emit_match_bindings. `counted` is set below a variant
+## payload: an arm's own tuple pattern binds its elements as views of a
+## subject that outlives the arm, but a tuple nested in a payload binds them
+## with counts of their own, like the payload bindings around it, so the
+## subject can die once the arm has bound everything it reads.
+fn ir_emit_pattern_bindings(pat_idx: Int, subj_r: Int, subj_type: String, counted: Bool):
     pat := get_node(pat_idx)
     if pat.kind == "pat_or":
         # the alternatives bind the same names but may pull them from
@@ -525,24 +618,32 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
             next_l := ir_label()
             ir_emit("brif " + cond_r.to_string() + " " + bind_l + " " + next_l)
             ir_emit_label(bind_l)
-            ir_emit_match_bindings(pat.children[k], subj_r, subj_type)
+            ir_emit_pattern_bindings(pat.children[k], subj_r, subj_type, counted)
             ir_emit("jmp " + done_l)
             ir_emit_label(next_l)
             k = k + 1
         ir_emit_label(done_l)
         return
     if pat.kind == "pat_tuple":
-        elems := ir_match_tuple_element_kinds(pat.children.len())
+        elems := ir_match_tuple_element_kinds(pat_idx, pat.children.len())
         for sub_idx, i in pat.children:
             sub := get_node(sub_idx)
             if sub.kind == "pat_binding":
                 elem_r := ir_reg()
                 ir_emit("field " + elem_r.to_string() + " " + subj_r.to_string() + " " + (i * 8).to_string() + " " + elems[i] + " " + sub.value)
+                if counted:
+                    ir_bind_owned_rc_payload(sub.value, elem_r, elems[i])
+                else:
+                    ir_bind_uncounted_view(sub.value)
                 ir_var_regs.insert(sub.value, elem_r)
                 if elems[i] != "unknown":
                     ir_var_types.insert(sub.value, elems[i])
-                ir_bind_uncounted_view(sub.value)
                 ir_emit("store " + sub.value + " " + elem_r.to_string())
+            elif ir_pattern_binds_names(sub_idx):
+                # a nested pattern binds from the element as its own subject
+                elem_r := ir_reg()
+                ir_emit("field " + elem_r.to_string() + " " + subj_r.to_string() + " " + (i * 8).to_string() + " " + elems[i] + " __t" + i.to_string())
+                ir_emit_pattern_bindings(sub_idx, elem_r, elems[i], counted)
         return
     if pat.kind == "pat_binding":
         subj_info := get_type_info(ir_match_subject_tid)
@@ -571,22 +672,28 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
         # is released at scope exit (which frees the payload), so a plain
         # borrow would dangle once the box dies. the prepass tracks these
         # names, so the exit cleanup releases them (or transfers on escape).
-        mut kinds: List[String] := []
-        if ir_enum_payload_kinds.contains_key(pat.value):
-            kinds = ir_resolved_variant_kinds(pat.value, ir_enum_payload_kinds[pat.value].split(","))
+        # a nested pattern binds from its slot as a subject of its own, so a
+        # binding at any depth of nested variants takes its own count the
+        # same way.
+        kinds := ir_variant_pattern_kinds(pat_idx)
         for sub_idx, i in pat.children:
             sub := get_node(sub_idx)
             if sub.kind == "pat_binding":
                 mut kind := "unknown"
                 if i < kinds.len():
                     kind = kinds[i]
-                slot_r := ir_reg()
-                ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " " + sub.value)
+                slot_r := ir_emit_payload_slot(subj_r, i, kinds, sub.value)
                 ir_bind_owned_rc_payload(sub.value, slot_r, kind)
                 ir_var_regs.insert(sub.value, slot_r)
                 if kind != "unknown":
                     ir_var_types.insert(sub.value, kind)
                 ir_emit("store " + sub.value + " " + slot_r.to_string())
+            elif ir_pattern_binds_names(sub_idx):
+                mut kind := "unknown"
+                if i < kinds.len():
+                    kind = kinds[i]
+                slot_r := ir_emit_payload_slot(subj_r, i, kinds, "__payload")
+                ir_emit_pattern_bindings(sub_idx, slot_r, kind, true)
 
 # emit an arm body. a block body runs as statements (and may return); an
 # expression body produces a value stored into result_temp.

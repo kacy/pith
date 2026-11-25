@@ -30,10 +30,20 @@
 #   markdown.render_with(text, opts, r)        drive any `Renderer`
 #
 # `events` yields `Start(tag)` and `End(tag)` around containers, and `Text`,
-# `Code`, `Html`, `InlineHtml`, `SoftBreak`, `HardBreak` and `Rule` for the
-# rest. adjacent text arrives as one `Text`. paragraphs directly inside the
-# items of a tight list produce no `Start(Paragraph)`/`End(Paragraph)`, the
-# same choice the html renderer needs.
+# `Code`, `Html`, `InlineHtml`, `SoftBreak`, `HardBreak`, `Rule`,
+# `TaskMarker` and `FootnoteReference` for the rest. adjacent text arrives as
+# one `Text`. paragraphs directly inside the items of a tight list produce no
+# `Start(Paragraph)`/`End(Paragraph)`, the same choice the html renderer
+# needs.
+#
+# ## github flavored markdown
+#
+# `gfm(true)`, the default, turns on the github extensions as cmark-gfm
+# implements them: tables, strikethrough, task list items, extended
+# autolinks (`www.`, `http://`, `https://` and `ftp://` urls and email
+# addresses) and footnotes. with `allow_html(true)` as well, the raw html tags
+# gfm disallows (`<script>`, `<style>`, `<iframe>` and six more) have their
+# `<` escaped. `gfm(false)` gives plain commonmark.
 #
 # ## limits
 #
@@ -78,6 +88,13 @@ MIN_REFERENCE_BUDGET := 100000
 #
 # INLINE_SPECIAL: the bytes the inline parser stops a text run at.
 INLINE_SPECIAL := "0000000000100000000000000000000001000010001000000000000000001000000000000000000000000000000111011000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+# GFM_INLINE_SPECIAL: INLINE_SPECIAL plus `~` for strikethrough and `w` and
+# `:`, where an extended autolink may start.
+GFM_INLINE_SPECIAL := "0000000000100000000000000000000001000010001000000000000000101000000000000000000000000000000111011000000000000000000000010000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+# GFM_TEXT_SPECIAL: the bytes without which a subject is plain text under
+# gfm: INLINE_SPECIAL plus `~`, `:` and `@`. a `w` matters only in `www.`,
+# which is looked for apart.
+GFM_TEXT_SPECIAL := "0000000000100000000000000000000001000010001000000000000000101000100000000000000000000000000111011000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
 # HTML_SPECIAL: the bytes html.escape rewrites.
 HTML_SPECIAL := "0000000000000000000000000000000000100011000000000000000000001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
 # HREF_SAFE: the bytes a destination keeps as they are in an href; every other
@@ -118,8 +135,9 @@ impl Options:
         copy.unsafe_urls = allow
         return copy
 
-    # A copy with the github flavored markdown extensions on or off. stored for
-    # the extensions to come; commonmark parsing is the same either way today.
+    # A copy with the github flavored markdown extensions on or off: tables,
+    # strikethrough, task list items, extended autolinks, footnotes and, with
+    # raw html allowed, the filter on the tags gfm disallows.
     fn gfm(enabled: Bool) -> Options:
         copy := self.copy()
         copy.gfm_extensions = enabled
@@ -160,6 +178,28 @@ pub enum Tag:
     # an image: its source and title. the alt text is the events between
     # `Start` and `End`.
     Image(String, String)
+    # a gfm table and the alignment of each column. it holds a `TableHead`
+    # and then a `TableRow` for each body row.
+    Table(List[Alignment])
+    # the header row of a table, holding its cells directly.
+    TableHead
+    # a body row of a table. every row has one cell per column.
+    TableRow
+    # a table cell and the alignment of its column.
+    TableCell(Alignment)
+    # gfm strikethrough, `~text~` or `~~text~~`.
+    Strikethrough
+    # a footnote definition and its label as written. definitions arrive
+    # after the rest of the document, in the order of their first reference,
+    # and only those that are referenced.
+    FootnoteDefinition(String)
+
+# How a table column is aligned, from the colons of its delimiter cell.
+pub enum Alignment:
+    None
+    Left
+    Center
+    Right
 
 # One step of a document, in reading order.
 pub enum Event:
@@ -179,6 +219,12 @@ pub enum Event:
     HardBreak
     # a thematic break.
     Rule
+    # the checkbox of a gfm task list item, true when it is checked. it comes
+    # right after the item's `Start`.
+    TaskMarker(Bool)
+    # a reference to a footnote, by the label of its definition as the
+    # definition writes it. a reference with no definition arrives as text.
+    FootnoteReference(String)
 
 # Something that consumes a document's events and builds output from them.
 # `render_with` feeds a renderer every event in order and then calls `finish`.
@@ -212,8 +258,8 @@ fn drive[R: Renderer](stream: Events, renderer: R) -> String:
 # defined after its use; inline content is parsed one paragraph or heading at
 # a time as the iterator reaches it.
 pub fn events(source: String, opts: Options) -> Events:
-    document := parse_blocks(source)
-    return Events(document: document, opts: opts, queue: [], queue_at: 0, node: 0, entering: true, finished: false)
+    document := parse_blocks(source, opts.gfm_extensions)
+    return Events(document: document, opts: opts, queue: [], queue_at: 0, node: 0, entering: true, finished: false, table_at: -1, table_columns: [], footnote_order: [], footnote_seen: {}, footnote_at: -1)
 
 # ---------------------------------------------------------------
 # character classes
@@ -768,6 +814,11 @@ enum BlockKind:
     Rule
     Code
     Html
+    # a gfm table: its rows, header first, are the lines of `content`, and
+    # `info` holds one alignment letter per column (see delimiter_row).
+    Table
+    # a gfm footnote definition, labelled by `info`.
+    Footnote
 
 # one block of the document tree. blocks live in one list and refer to each
 # other by index, so the tree holds no reference cycles.
@@ -787,6 +838,8 @@ struct Block:
     # heading, the literal for code and html.
     content: String = ""
     info: String = ""
+    # a heading's level. on a list item, 1 marks an unchecked gfm task and 2
+    # a checked one.
     level: Int = 0
     fenced: Bool = false
     fence_char: Int = 0
@@ -817,6 +870,13 @@ struct Document:
     # is inlined, and a copy made at run time has one, so the per-byte lookup
     # in a text run reads it directly.
     inline_special: String
+    # a heap copy of the table that tells plain text apart (see
+    # queue_inlines): INLINE_SPECIAL, or GFM_TEXT_SPECIAL under gfm.
+    text_special: String
+    # whether the gfm extensions are on, and the footnote definitions by
+    # normalized label (the first definition of a label wins).
+    gfm: Bool
+    footnotes: Map[String, Int]
 
 # the list marker a line starts with.
 struct ListMarker:
@@ -831,7 +891,7 @@ fn accepts_lines(kind: BlockKind) -> Bool:
     return kind == BlockKind.Paragraph or kind == BlockKind.Code or kind == BlockKind.Html
 
 fn can_contain(parent: BlockKind, child: BlockKind) -> Bool:
-    if parent == BlockKind.Document or parent == BlockKind.Quote or parent == BlockKind.Item:
+    if parent == BlockKind.Document or parent == BlockKind.Quote or parent == BlockKind.Item or parent == BlockKind.Footnote:
         return child != BlockKind.Item
     if parent == BlockKind.List:
         return child == BlockKind.Item
@@ -842,6 +902,12 @@ fn may_start_block(c: Int) -> Bool:
     if is_ascii_digit(c):
         return true
     return c == 35 or c == 96 or c == 126 or c == 42 or c == 43 or c == 95 or c == 61 or c == 60 or c == 62 or c == 45
+
+# the further first characters of the gfm blocks: a footnote definition's
+# `[`, and the `|` or `:` of a table delimiter row, which can only follow a
+# paragraph.
+fn may_start_gfm_block(c: Int, container: BlockKind) -> Bool:
+    return c == 91 or ((c == 124 or c == 58) and container == BlockKind.Paragraph)
 
 # the line-by-line block parser. it follows the commonmark reference parser:
 # each line first continues the open containers it can, then tries to open
@@ -871,6 +937,14 @@ struct BlockParser:
     # the lines of the open leaf. only the innermost open block takes lines,
     # and it is closed before any other block opens, so one buffer serves.
     lines: List[String]
+    gfm: Bool
+    footnotes: Map[String, Int]
+    # the paragraph whose last line failed to head a table, which cmark-gfm
+    # does not try again.
+    table_refused: Int
+    # how many empty cells may still pad table rows shorter than their
+    # header (see add_table_row).
+    fill_budget: Int
 
 # where the line starting at `position` ends: its newline or carriage return,
 # or the end of the text.
@@ -901,14 +975,17 @@ fn without_nul(input: String) -> String:
         return input.replace(chr(0), encode_utf8(65533))
     return input
 
-fn parse_blocks(input: String) -> Document:
+fn parse_blocks(input: String, gfm: Bool) -> Document:
     # bound once rather than reassigned: indexing an immutable string local
     # in the line loop below is about three times faster than a `mut` one.
     source := without_nul(input)
+    length := source.len()
+    # the floor of the reference budget also bounds the empty cells that pad
+    # short table rows.
+    budget := max(length, MIN_REFERENCE_BUDGET)
     mut blocks: List[Block] := []
     blocks.push(Block(kind: BlockKind.Document, parent: -1, start_line: 1))
-    parser := BlockParser(source: source, blocks: blocks, references: {}, tip: 0, old_tip: 0, last_matched: 0, all_closed: true, line_start: 0, line_end: 0, line_number: 0, offset: 0, column: 0, next_nonspace: 0, next_nonspace_column: 0, indent: 0, indented: false, blank: false, partially_consumed_tab: false, lines: [])
-    length := source.len()
+    parser := BlockParser(source: source, blocks: blocks, references: {}, tip: 0, old_tip: 0, last_matched: 0, all_closed: true, line_start: 0, line_end: 0, line_number: 0, offset: 0, column: 0, next_nonspace: 0, next_nonspace_column: 0, indent: 0, indented: false, blank: false, partially_consumed_tab: false, lines: [], gfm: gfm, footnotes: {}, table_refused: -1, fill_budget: budget)
     mut position := 0
     while position < length:
         line_end := find_line_end(source, position)
@@ -921,8 +998,12 @@ fn parse_blocks(input: String) -> Document:
             position = line_end + 1
     while parser.tip >= 0:
         parser.finalize(parser.tip, parser.line_number)
-    budget := max(length, MIN_REFERENCE_BUDGET)
-    return Document(source: source, blocks: parser.blocks, references: parser.references, reference_budget: budget, inline_special: INLINE_SPECIAL.substring(0, 256))
+    mut special := INLINE_SPECIAL
+    mut text_special := INLINE_SPECIAL
+    if gfm:
+        special = GFM_INLINE_SPECIAL
+        text_special = GFM_TEXT_SPECIAL
+    return Document(source: source, blocks: parser.blocks, references: parser.references, reference_budget: budget, inline_special: special.substring(0, 256), text_special: text_special.substring(0, 256), gfm: gfm, footnotes: parser.footnotes)
 
 impl BlockParser:
     fn line_length() -> Int:
@@ -1007,7 +1088,7 @@ impl BlockParser:
             self.finalize(self.tip, self.line_number - 1)
         parent := self.tip
         mut depth := self.blocks[parent].depth
-        if kind == BlockKind.Quote or kind == BlockKind.Item:
+        if kind == BlockKind.Quote or kind == BlockKind.Item or kind == BlockKind.Footnote:
             depth += 1
         index := self.blocks.len()
         self.blocks.push(Block(kind: kind, parent: parent, start_line: self.line_number, depth: depth))
@@ -1042,7 +1123,7 @@ impl BlockParser:
             self.finalize_paragraph(index)
         elif kind == BlockKind.Code:
             self.finalize_code(block)
-        elif kind == BlockKind.Html:
+        elif kind == BlockKind.Html or kind == BlockKind.Table:
             block.content = self.lines.join("\n")
             self.lines.clear()
         elif kind == BlockKind.Item:
@@ -1056,8 +1137,10 @@ impl BlockParser:
 
     fn finalize_paragraph(index: Int):
         block := self.blocks[index]
-        content := self.lines.join("\n")
+        mut content := self.lines.join("\n")
         self.lines.clear()
+        if self.gfm and block.prev < 0 and self.blocks[block.parent].kind == BlockKind.Item:
+            content = self.take_task_marker(block.parent, content)
         consumed := parse_references(content, 0, self.references)
         mut rest := content
         if consumed > 0:
@@ -1156,6 +1239,18 @@ impl BlockParser:
                 if self.blank:
                     return 1
                 return 0
+            BlockKind.Table =>
+                if is_table_row(self.source, self.line_start + self.next_nonspace, self.line_end):
+                    return 0
+                return 1
+            BlockKind.Footnote =>
+                if self.indent >= 4:
+                    self.advance_offset(4, true)
+                    return 0
+                if self.blank:
+                    self.advance_next_nonspace()
+                    return 0
+                return 1
             _ =>
                 return 0
 
@@ -1217,7 +1312,8 @@ impl BlockParser:
         mut matched_leaf := container_kind != BlockKind.Paragraph and accepts_lines(container_kind)
         while not matched_leaf:
             self.find_next_nonspace()
-            if not self.indented and not may_start_block(self.peek_at(self.next_nonspace)):
+            first := self.peek_at(self.next_nonspace)
+            if not self.indented and not may_start_block(first) and not (self.gfm and may_start_gfm_block(first, self.kind_of(container))):
                 self.advance_next_nonspace()
                 break
             started := self.start_block(container)
@@ -1238,6 +1334,9 @@ impl BlockParser:
             self.add_line()
             if kind == BlockKind.Html and self.html_block_ends(self.blocks[container].html_type):
                 self.finalize(container, self.line_number)
+        elif kind == BlockKind.Table:
+            if self.offset < self.line_length():
+                self.add_table_row()
         elif self.offset < self.line_length() and not self.blank:
             self.add_child(BlockKind.Paragraph, self.offset)
             self.advance_next_nonspace()
@@ -1281,6 +1380,11 @@ impl BlockParser:
             started = self.start_list_item(container)
         if started == 0:
             started = self.start_indented_code()
+        if started == 0 and self.gfm and not self.indented:
+            if self.peek_at(self.next_nonspace) == 91:
+                started = self.start_footnote_definition(container)
+            else:
+                started = self.start_table(container)
         return started
 
     fn start_block_quote(container: Int) -> Int:
@@ -1639,6 +1743,226 @@ fn parse_reference(content: String, position: Int, references: Map[String, Refer
     return line_end - position
 
 # ---------------------------------------------------------------
+# gfm blocks: tables, footnote definitions and task list items
+# ---------------------------------------------------------------
+
+impl BlockParser:
+    # a footnote definition, `[^label]:`, opens a container like a block
+    # quote's. its later lines continue it when indented four columns, and it
+    # can interrupt a paragraph, as in cmark-gfm.
+    fn start_footnote_definition(container: Int) -> Int:
+        if self.blocks[container].depth >= MAX_NESTING:
+            return 0
+        start := self.line_start + self.next_nonspace
+        label_end := scan_footnote_label(self.source, start, self.line_end)
+        if label_end < 0:
+            return 0
+        self.close_unmatched()
+        after := skip_spaces(self.source, label_end + 2)
+        self.advance_next_nonspace()
+        self.advance_offset(min(after, self.line_end) - self.line_start - self.offset, false)
+        footnote := self.add_child(BlockKind.Footnote, self.next_nonspace)
+        self.blocks[footnote].info = self.source.substring(start + 2, label_end)
+        key := normalize_label(self.source, start + 2, label_end)
+        if not self.footnotes.contains_key(key):
+            self.footnotes[key] = footnote
+        return 1
+
+    # a table starts at a delimiter row under a paragraph whose last line has
+    # as many cells. the lines before that one stay a paragraph. a paragraph
+    # whose last line has the wrong number of cells is not tried again.
+    fn start_table(container: Int) -> Int:
+        if self.kind_of(container) != BlockKind.Paragraph or container == self.table_refused:
+            return 0
+        alignments := delimiter_row(self.source, self.line_start + self.next_nonspace, self.line_end)
+        if alignments == "":
+            return 0
+        header := self.lines[self.lines.len() - 1]
+        if count_cells(header) != alignments.len():
+            self.table_refused = container
+            return 0
+        self.lines.remove(self.lines.len() - 1)
+        mut table := container
+        if self.lines.len() > 0:
+            self.finalize(container, self.line_number - 2)
+            table = self.add_child(BlockKind.Table, self.next_nonspace)
+            self.blocks[table].start_line = self.line_number - 1
+        else:
+            self.blocks[table].kind = BlockKind.Table
+        self.blocks[table].info = alignments
+        self.lines.push(header)
+        self.advance_offset(self.line_length() - self.offset, false)
+        return 2
+
+    # add the current line to the open table as a body row. the empty cells
+    # that pad a short row come out of a budget the size of the input, so a
+    # wide header over many one-cell rows cannot make the output quadratic.
+    # a row the budget cannot pad ends the table and starts a paragraph, as a
+    # row past cmark-gfm's fixed limit does.
+    fn add_table_row():
+        row := self.rest_of_line()
+        columns := self.blocks[self.tip].info.len()
+        missing := columns - min(count_cells(row), columns)
+        if missing > self.fill_budget:
+            self.add_child(BlockKind.Paragraph, self.offset)
+            self.add_line()
+            return
+        self.fill_budget -= missing
+        self.lines.push(row)
+
+    # a task list item marker, `[ ]`, `[x]` or `[X]` followed by a space or a
+    # tab, at the start of an item's first paragraph: marks the item and
+    # returns the rest of the paragraph.
+    fn take_task_marker(item: Int, content: String) -> String:
+        if content.len() < 4 or ord(content[0]) != 91 or ord(content[2]) != 93 or not is_space_or_tab(ord(content[3])):
+            return content
+        mark := ord(content[1])
+        if mark == 32:
+            self.blocks[item].level = 1
+        elif mark == 120 or mark == 88:
+            self.blocks[item].level = 2
+        else:
+            return content
+        mut rest := 4
+        while rest < content.len() and is_ascii_whitespace(ord(content[rest])):
+            rest += 1
+        return content.substring(rest, content.len())
+
+# the position of the `]` that ends a footnote definition's label at
+# `position`, `[^label]:`, or -1. the label is one or more bytes other than
+# `]`, spaces and tabs.
+fn scan_footnote_label(source: String, position: Int, limit: Int) -> Int:
+    if position + 1 >= limit or ord(source[position]) != 91 or ord(source[position + 1]) != 94:
+        return -1
+    mut i := position + 2
+    while i < limit:
+        c := ord(source[i])
+        if c == 93 or c == 32 or c == 9:
+            break
+        i += 1
+    if i == position + 2 or i + 1 >= limit or ord(source[i]) != 93 or ord(source[i + 1]) != 58:
+        return -1
+    return i
+
+# space within a table row: space, tab, vertical tab or form feed.
+fn is_cell_space(c: Int) -> Bool:
+    return c == 32 or c == 9 or c == 11 or c == 12
+
+fn skip_cell_space(row: String, position: Int, limit: Int) -> Int:
+    mut i := position
+    while i < limit and is_cell_space(ord(row[i])):
+        i += 1
+    return i
+
+# whether source[start..end] is a table row: it holds more than a leading pipe
+# and spaces.
+fn is_table_row(source: String, start: Int, end: Int) -> Bool:
+    mut i := start
+    if i < end and ord(source[i]) == 124:
+        i += 1
+    return skip_cell_space(source, i, end) < end
+
+# the alignments of a table delimiter row in source[start..end], a letter
+# per column (`n` for none, `l`, `c` or `r`), or "" when it is not one. each
+# cell is hyphens with an optional colon at either end, and the pipes at the
+# ends of the row are optional.
+fn delimiter_row(source: String, start: Int, end: Int) -> String:
+    mut letters: List[String] := []
+    mut i := start
+    if i < end and ord(source[i]) == 124:
+        i += 1
+    while true:
+        i = skip_cell_space(source, i, end)
+        if i >= end:
+            break
+        left := ord(source[i]) == 58
+        if left:
+            i += 1
+        hyphens := i
+        while i < end and ord(source[i]) == 45:
+            i += 1
+        if i == hyphens:
+            return ""
+        right := i < end and ord(source[i]) == 58
+        if right:
+            i += 1
+        if left and right:
+            letters.push("c")
+        elif left:
+            letters.push("l")
+        elif right:
+            letters.push("r")
+        else:
+            letters.push("n")
+        i = skip_cell_space(source, i, end)
+        if i >= end:
+            break
+        if ord(source[i]) != 124:
+            return ""
+        i += 1
+    return letters.join("")
+
+# the cells of a table row are split at pipes that are not backslash-escaped,
+# and a leading and a trailing pipe are optional. a row is walked with
+# first_cell, cell_end and next_cell.
+
+# where the first cell of a row starts: past a leading pipe and the space
+# after it.
+fn first_cell(row: String) -> Int:
+    if row.len() > 0 and ord(row[0]) == 124:
+        return skip_cell_space(row, 1, row.len())
+    return 0
+
+# where the cell that starts at `start` ends: at the next unescaped pipe or
+# at the end of the row.
+fn cell_end(row: String, start: Int) -> Int:
+    length := row.len()
+    mut i := start
+    while i < length and ord(row[i]) != 124:
+        if ord(row[i]) == 92 and i + 1 < length and is_ascii_punctuation(ord(row[i + 1])):
+            i += 1
+        i += 1
+    return i
+
+# where the cell after the one that ends at `end` starts, or the end of the
+# row when there is none.
+fn next_cell(row: String, end: Int) -> Int:
+    if end < row.len():
+        return skip_cell_space(row, end + 1, row.len())
+    return end
+
+fn count_cells(row: String) -> Int:
+    mut count := 0
+    mut at := first_cell(row)
+    while at < row.len():
+        at = next_cell(row, cell_end(row, at))
+        count += 1
+    return count
+
+# a cell's text: escaped pipes unescaped, as gfm reads them before the inline
+# parse, and whitespace trimmed from both ends.
+fn cell_text(row: String, start: Int, end: Int) -> String:
+    mut first := start
+    mut last := end
+    while first < last and is_ascii_whitespace(ord(row[first])):
+        first += 1
+    while last > first and is_ascii_whitespace(ord(row[last - 1])):
+        last -= 1
+    cell := row.substring(first, last)
+    if cell.contains("\\|"):
+        return cell.replace("\\|", "|")
+    return cell
+
+fn table_alignment(letter: String) -> Alignment:
+    if letter == "l":
+        return Alignment.Left
+    if letter == "c":
+        return Alignment.Center
+    if letter == "r":
+        return Alignment.Right
+    return Alignment.None
+
+# ---------------------------------------------------------------
 # inline structure
 # ---------------------------------------------------------------
 
@@ -1653,6 +1977,9 @@ enum InlineKind:
     Strong
     Link
     Image
+    Strikethrough
+    # a gfm footnote reference; `start` holds the definition's block index.
+    FootnoteReference
 
 # one inline node. text is either a span of the subject (`start` >= 0) or a
 # literal in `literal`, so plain runs are not copied until they are emitted.
@@ -1747,6 +2074,10 @@ impl InlineParser:
                 self.parse_close_bracket()
             elif c == 60:
                 self.parse_angle()
+            elif c == 126:
+                self.parse_delimiter_run(c)
+            elif c == 119 or c == 58:
+                self.parse_gfm_text_run(self.position, self.position)
             else:
                 self.parse_entity()
         self.process_emphasis(-1)
@@ -1807,13 +2138,22 @@ impl InlineParser:
         return index
 
     fn parse_text_run():
-        subject := self.subject
-        length := subject.len()
         start := self.position
-        end := skip_unmarked(subject, self.document.inline_special, start + 1)
+        end := skip_unmarked(self.subject, self.document.inline_special, start + 1)
+        if self.document.gfm and end < self.subject.len():
+            stop := ord(self.subject[end])
+            if stop == 119 or stop == 58:
+                self.parse_gfm_text_run(start, end)
+                return
+        self.end_text_run(start, end)
+
+    # append the text run from `start` to `end`, less the spaces before a
+    # line break, and move past it.
+    fn end_text_run(start: Int, end: Int):
+        subject := self.subject
         self.position = end
         mut kept := end
-        if end < length and ord(subject[end]) == 10:
+        if end < subject.len() and ord(subject[end]) == 10:
             while kept > start and is_ascii_whitespace(ord(subject[kept - 1])):
                 kept -= 1
         if kept > start:
@@ -1898,6 +2238,9 @@ impl InlineParser:
         if not can_open and not can_close:
             return
         count := end - start
+        # a run of three or more tildes is text, not strikethrough.
+        if marker == 126 and count > 2:
+            return
         index := self.delimiters.len()
         self.delimiters.push(Delimiter(marker: marker, count: count, original: count, node: node, prev: self.top_delimiter, next: -1, can_open: can_open, can_close: can_close))
         if self.top_delimiter >= 0:
@@ -1916,7 +2259,10 @@ impl InlineParser:
     fn parse_bang():
         subject := self.subject
         start := self.position
-        if start + 1 < subject.len() and ord(subject[start + 1]) == 91:
+        # with gfm, `![^` is a `!` before a footnote reference, as cmark-gfm
+        # reads it, not the start of an image.
+        footnote := self.document.gfm and start + 2 < subject.len() and ord(subject[start + 2]) == 94
+        if start + 1 < subject.len() and ord(subject[start + 1]) == 91 and not footnote:
             node := self.append_span(start, start + 2)
             self.push_bracket(node, start + 1, true)
             self.position = start + 2
@@ -1979,8 +2325,10 @@ impl InlineParser:
                         self.position = label_end
 
         if not matched:
-            self.pop_bracket()
             self.position = after_bracket
+            if self.document.gfm and self.parse_footnote_reference(opener, after_bracket):
+                return
+            self.pop_bracket()
             self.append_span(after_bracket - 1, after_bracket)
             return
 
@@ -2171,8 +2519,10 @@ impl InlineParser:
     # kind of closer, below which point no opener can match it, which keeps
     # the search linear.
     fn process_emphasis(bottom: Int):
+        if self.top_delimiter == bottom:
+            return
         mut openers_bottom: List[Int] := []
-        for slot in 0..12:
+        for slot in 0..18:
             openers_bottom.push(bottom)
         mut closer := self.top_delimiter
         while closer >= 0 and self.delimiters[closer].prev != bottom:
@@ -2185,6 +2535,8 @@ impl InlineParser:
             mut slot := closing.original % 3
             if closing.marker == 42:
                 slot += 6
+            elif closing.marker == 126:
+                slot += 12
             if closing.can_open:
                 slot += 3
             mut opener := closing.prev
@@ -2202,6 +2554,9 @@ impl InlineParser:
                 if not closing.can_open:
                     self.remove_delimiter(closer)
                 closer = next_closer
+                continue
+            if closing.marker == 126:
+                closer = self.insert_strikethrough(opener, closer)
                 continue
             opening := self.delimiters[opener]
             mut used := 1
@@ -2235,6 +2590,363 @@ impl InlineParser:
                 closer = next_closer
         while self.top_delimiter >= 0 and self.top_delimiter != bottom:
             self.remove_delimiter(self.top_delimiter)
+
+# ---------------------------------------------------------------
+# gfm inlines: strikethrough, footnote references and autolinks
+# ---------------------------------------------------------------
+
+impl InlineParser:
+    # match a `~` opener with a closer, as cmark-gfm does: runs of the same
+    # length enclose a strikethrough, runs of different lengths stay text,
+    # and either way the two and every delimiter between them are dropped.
+    # returns the next closer to look at.
+    fn insert_strikethrough(opener: Int, closer: Int) -> Int:
+        opening := self.delimiters[opener]
+        closing := self.delimiters[closer]
+        next_closer := closing.next
+        if opening.count == closing.count:
+            strike := self.new_node(InlineKind.Strikethrough)
+            mut child := self.nodes[opening.node].next
+            while child >= 0 and child != closing.node:
+                following := self.nodes[child].next
+                self.unlink(child)
+                self.append_child(strike, child)
+                child = following
+            self.insert_after(opening.node, strike)
+            self.unlink(opening.node)
+            self.unlink(closing.node)
+        opening.next = closer
+        closing.prev = opener
+        self.remove_delimiter(opener)
+        self.remove_delimiter(closer)
+        return next_closer
+
+    # `[^label]` that matched no link refers to the footnote defined with
+    # that label, and replaces the bracket and everything parsed after it. a
+    # label with no definition is left to read as text. labels are matched
+    # like link labels and are as long at most.
+    fn parse_footnote_reference(opener: Bracket, after_bracket: Int) -> Bool:
+        subject := self.subject
+        label_start := opener.position + 2
+        label_end := after_bracket - 1
+        if opener.image or label_end <= label_start or label_end - label_start > MAX_LABEL_BYTES:
+            return false
+        if ord(subject[opener.position + 1]) != 94 or self.document.footnotes.len() == 0:
+            return false
+        found := self.document.footnotes.get(normalize_label(subject, label_start, label_end))
+        if found == none:
+            return false
+        while self.top_delimiter >= 0 and self.top_delimiter != opener.previous_delimiter:
+            self.remove_delimiter(self.top_delimiter)
+        mut child := self.nodes[opener.node].next
+        while child >= 0:
+            following := self.nodes[child].next
+            self.unlink(child)
+            child = following
+        self.unlink(opener.node)
+        reference := self.new_node(InlineKind.FootnoteReference)
+        self.nodes[reference].start = found.value()
+        self.append_child(0, reference)
+        self.pop_bracket()
+        return true
+
+    # the rest of a text run that began at `start` and has reached a `w` or a
+    # `:` at `at`. under gfm the special table stops a run at each of them,
+    # since an extended autolink may start there; when none does, the run
+    # goes on. only a `www.` or a `://` is looked at further, and not inside
+    # brackets.
+    fn parse_gfm_text_run(start: Int, at: Int):
+        subject := self.subject
+        length := subject.len()
+        special := self.document.inline_special
+        mut end := at
+        while end < length:
+            c := ord(subject[end])
+            if c == 119:
+                if end + 3 < length and ord(subject[end + 3]) == 46 and ord(subject[end + 1]) == 119 and ord(subject[end + 2]) == 119 and self.brackets.len() == 0 and self.parse_extended_autolink(start, end):
+                    return
+            elif c == 58:
+                if end + 2 < length and ord(subject[end + 1]) == 47 and ord(subject[end + 2]) == 47 and self.brackets.len() == 0 and self.parse_extended_autolink(start, end):
+                    return
+            elif end > start:
+                break
+            end = skip_unmarked(subject, special, end + 1)
+        self.end_text_run(start, end)
+
+    # an extended autolink at `at`, in the text run that began at `start`: a
+    # `www.` link at a `w`, or an http, https or ftp url whose scheme ends at
+    # a `:`. on a match, appends the text before the link and the link and
+    # moves past it.
+    fn parse_extended_autolink(start: Int, at: Int) -> Bool:
+        subject := self.subject
+        mut link_start := at
+        mut link_end := -1
+        if ord(subject[at]) == 119:
+            link_end = www_autolink_end(subject, at)
+        else:
+            while link_start > start and is_ascii_letter(ord(subject[link_start - 1])):
+                link_start -= 1
+            link_end = url_autolink_end(subject, link_start, at)
+        if link_end < 0:
+            return false
+        if link_start > start:
+            self.append_span(start, link_start)
+        address := subject.substring(link_start, link_end)
+        if link_start == at:
+            self.append_autolink("http://" + address, address)
+        else:
+            self.append_autolink(address, address)
+        self.position = link_end
+        return true
+
+# the end of a `www.` autolink at `at`, or -1. it starts the text or follows
+# whitespace or one of `*_~(`, and its domain needs a dot.
+fn www_autolink_end(subject: String, at: Int) -> Int:
+    if at > 0:
+        before := ord(subject[at - 1])
+        if not is_ascii_whitespace(before) and before != 42 and before != 95 and before != 126 and before != 40:
+            return -1
+    if not starts_with_exactly(subject, at, subject.len(), "www."):
+        return -1
+    domain := check_domain(subject, at, false)
+    if domain == 0:
+        return -1
+    return autolink_delim(subject, at, link_run_end(subject, at + domain))
+
+# the end of an http, https or ftp autolink whose scheme runs from
+# `scheme_start` to the `:` at `colon`, or -1. the scheme takes every letter
+# before the colon, so `xhttp://` is not one, and a host character must
+# follow the `//`.
+fn url_autolink_end(subject: String, scheme_start: Int, colon: Int) -> Int:
+    length := subject.len()
+    if length - colon < 4 or ord(subject[colon + 1]) != 47 or ord(subject[colon + 2]) != 47:
+        return -1
+    scheme := subject.substring(scheme_start, colon).to_lower()
+    if scheme != "http" and scheme != "https" and scheme != "ftp":
+        return -1
+    if not is_host_char(subject, colon + 3):
+        return -1
+    domain := check_domain(subject, colon + 3, true)
+    if domain == 0:
+        return -1
+    end := autolink_delim(subject, colon, link_run_end(subject, colon + 3 + domain))
+    if end <= colon:
+        return -1
+    return end
+
+# a byte a domain may hold: not whitespace and not punctuation. a byte
+# inside a multibyte sequence is not one, so as in cmark-gfm a domain stops
+# just after its first non-ascii character; that character counts unless it
+# is whitespace. cmark-gfm also stops at non-ascii punctuation.
+fn is_host_char(subject: String, position: Int) -> Bool:
+    c := ord(subject[position])
+    if c < 128:
+        return not is_ascii_whitespace(c) and not is_ascii_punctuation(c)
+    if c < 192:
+        return false
+    return not is_unicode_whitespace(code_point_at(subject, position))
+
+# how far the domain at `at` reaches, by cmark-gfm's rules, or 0 when it is
+# not one. an underscore in either of its last two segments rejects it,
+# unless it has more than ten segments: that cap keeps a run of failing
+# candidates linear. without `allow_short` it needs a dot.
+fn check_domain(subject: String, at: Int, allow_short: Bool) -> Int:
+    size := subject.len() - at
+    mut i := 1
+    mut dots := 0
+    mut underscores_before := 0
+    mut underscores := 0
+    while i < size - 1:
+        if ord(subject[at + i]) == 92 and i < size - 2:
+            i += 1
+        c := ord(subject[at + i])
+        if c == 95:
+            underscores += 1
+        elif c == 46:
+            underscores_before = underscores
+            underscores = 0
+            dots += 1
+        elif c != 45 and not is_host_char(subject, at + i):
+            break
+        i += 1
+    if (underscores_before > 0 or underscores > 0) and dots <= 10:
+        return 0
+    if allow_short or dots > 0:
+        return i
+    return 0
+
+# the first whitespace or `<` at or after `position`, where a link candidate
+# stops.
+fn link_run_end(subject: String, position: Int) -> Int:
+    mut i := position
+    while i < subject.len():
+        c := ord(subject[i])
+        if is_ascii_whitespace(c) or c == 60:
+            return i
+        i += 1
+    return i
+
+# where an autolink running from `start` to `end` really ends: before any
+# `<`, and without trailing punctuation, a trailing `)` that no `(` in the
+# link opens, or a trailing entity-like `&name;`.
+fn autolink_delim(subject: String, start: Int, end: Int) -> Int:
+    mut link_end := end
+    mut opening := 0
+    mut closing := 0
+    for i in start..end:
+        c := ord(subject[i])
+        if c == 60:
+            link_end = i
+            break
+        if c == 40:
+            opening += 1
+        elif c == 41:
+            closing += 1
+    while link_end > start:
+        c := ord(subject[link_end - 1])
+        if c == 41:
+            if closing <= opening:
+                return link_end
+            closing -= 1
+            link_end -= 1
+        elif c == 63 or c == 33 or c == 46 or c == 44 or c == 58 or c == 42 or c == 95 or c == 126 or c == 39 or c == 34:
+            link_end -= 1
+        elif c == 59:
+            mut name_start := link_end - 2
+            while name_start > start and is_ascii_letter(ord(subject[name_start])):
+                name_start -= 1
+            if name_start < link_end - 2 and ord(subject[name_start]) == 38:
+                link_end = name_start
+            else:
+                link_end -= 1
+        else:
+            return link_end
+    return link_end
+
+# the email autolinks in `line`, a run of text, found the way cmark-gfm finds
+# them in a text node: letters, digits and `.+-_` before an `@`, perhaps led
+# by `mailto:` or `xmpp:`, and after it a domain with a dot, ending in a
+# letter or a dot. each link is three numbers: its start, its end, and 1 when
+# `mailto:` is to be added to make the url. every byte is looked at a bounded
+# number of times.
+fn email_links(line: String) -> List[Int]:
+    mut found: List[Int] := []
+    length := line.len()
+    mut start := 0
+    mut offset := 0
+    while start + offset < length:
+        at := find_text(line, start + offset, length, "@")
+        if at < 0:
+            break
+        mut max_rewind := at - start - offset
+        mut mailto := true
+        mut xmpp := false
+        mut dots := 0
+        mut rewind := 0
+        mut link_end := 0
+        mut searching := true
+        while searching:
+            searching = false
+            sign := start + offset + max_rewind
+            rewind = 0
+            while rewind < max_rewind:
+                c := ord(line[sign - rewind - 1])
+                if is_ascii_alphanumeric(c) or c == 46 or c == 43 or c == 45 or c == 95:
+                    rewind += 1
+                elif c == 58 and protocol_before(line, sign, rewind, max_rewind, "mailto:"):
+                    mailto = false
+                    rewind += 1
+                elif c == 58 and protocol_before(line, sign, rewind, max_rewind, "xmpp:"):
+                    mailto = false
+                    xmpp = true
+                    rewind += 1
+                else:
+                    break
+            if rewind == 0:
+                break
+            link_end = 1
+            while sign + link_end < length:
+                c := ord(line[sign + link_end])
+                if c == 64:
+                    # another `@`: start over from it, keeping what the
+                    # search has seen, as cmark-gfm does.
+                    offset += max_rewind + 1
+                    max_rewind = link_end - 1
+                    searching = true
+                    break
+                if c == 46 and sign + link_end + 1 < length and is_ascii_alphanumeric(ord(line[sign + link_end + 1])):
+                    dots += 1
+                elif not is_ascii_alphanumeric(c) and not (c == 47 and xmpp) and c != 45 and c != 95:
+                    break
+                link_end += 1
+        base := start + offset + max_rewind
+        if rewind == 0:
+            offset += max_rewind + 1
+            continue
+        last := ord(line[base + link_end - 1])
+        if link_end < 2 or dots == 0 or (not is_ascii_letter(last) and last != 46):
+            offset += max_rewind + link_end
+            continue
+        end := autolink_delim(line, base, base + link_end)
+        found.push(base - rewind)
+        found.push(end)
+        if mailto:
+            found.push(1)
+        else:
+            found.push(0)
+        start = end
+        offset = 0
+    return found
+
+# whether `protocol`, which ends in `:`, ends just before the `rewind` bytes
+# that precede the `@` at `at`, with no letter or digit before it.
+fn protocol_before(line: String, at: Int, rewind: Int, max_rewind: Int, protocol: String) -> Bool:
+    length := protocol.len()
+    if length > max_rewind - rewind:
+        return false
+    begin := at - rewind - length
+    if not starts_with_exactly(line, begin, at, protocol):
+        return false
+    if length == max_rewind - rewind:
+        return true
+    return not is_ascii_alphanumeric(ord(line[begin - 1]))
+
+# the raw html tags gfm disallows, each between spaces. a browser reads what
+# follows them differently.
+DISALLOWED_TAGS := " title textarea style xmp iframe noembed noframes script plaintext "
+
+# raw html with the `<` of every disallowed tag, opening or closing, written
+# as `&lt;`, the gfm tag filter.
+fn filter_disallowed_tags(content: String) -> String:
+    mut at := find_text(content, 0, content.len(), "<")
+    mut parts: List[String] := []
+    mut copied := 0
+    while at >= 0:
+        if is_disallowed_tag(content, at):
+            parts.push(content.substring(copied, at))
+            parts.push("&lt;")
+            copied = at + 1
+        at = find_text(content, at + 1, content.len(), "<")
+    if copied == 0:
+        return content
+    parts.push(content.substring(copied, content.len()))
+    return parts.join("")
+
+# whether a disallowed tag starts at the `<` at `at`: its name in any case,
+# after an optional `/`, followed by whitespace, `>` or `/>`.
+fn is_disallowed_tag(content: String, at: Int) -> Bool:
+    length := content.len()
+    mut name_start := at + 1
+    if name_start < length and ord(content[name_start]) == 47:
+        name_start += 1
+    mut name_end := name_start
+    while name_end < length and name_end - name_start < 10 and is_ascii_letter(ord(content[name_end])):
+        name_end += 1
+    if name_end == name_start or name_end >= length:
+        return false
+    c := ord(content[name_end])
+    closes := is_ascii_whitespace(c) or c == 62 or (c == 47 and name_end + 1 < length and ord(content[name_end + 1]) == 62)
+    return closes and DISALLOWED_TAGS.contains(" " + content.substring(name_start, name_end).to_lower() + " ")
 
 fn is_email_local_char(c: Int) -> Bool:
     if is_ascii_alphanumeric(c):
@@ -2293,6 +3005,17 @@ pub struct Events:
     node: Int
     entering: Bool
     finished: Bool
+    # where the next row of the table being walked starts in its content, or
+    # -1 outside a table, and the alignments of its columns. a table is
+    # walked a row per step.
+    table_at: Int
+    table_columns: List[Alignment]
+    # the footnote definitions referenced so far, by block index, in the
+    # order of their first reference, and each one's place in that order.
+    footnote_order: List[Int]
+    footnote_seen: Map[Int, Int]
+    # which of them is being walked once the document is done, or -1.
+    footnote_at: Int
 
 impl Iterator for Events:
     type Item = Event
@@ -2318,16 +3041,25 @@ impl Events:
         index := self.node
         block := blocks[index]
         if not self.entering:
-            if block.kind == BlockKind.Document:
-                self.finished = true
+            if block.kind == BlockKind.Document or block.kind == BlockKind.Footnote:
+                self.next_footnote(block)
                 return
             self.queue.push(Event.End(container_tag(block)))
             self.move_past(block)
             return
         match block.kind:
-            BlockKind.Document | BlockKind.Quote | BlockKind.List | BlockKind.Item =>
-                if block.kind != BlockKind.Document:
+            BlockKind.Document | BlockKind.Quote | BlockKind.List | BlockKind.Item | BlockKind.Footnote =>
+                if block.kind == BlockKind.Footnote:
+                    # definitions are skipped where they stand and walked
+                    # after the document, one at a time.
+                    if self.footnote_at < 0 or index != self.footnote_order[self.footnote_at]:
+                        self.move_past(block)
+                        return
+                    self.queue.push(Event.Start(Tag.FootnoteDefinition(block.info)))
+                elif block.kind != BlockKind.Document:
                     self.queue.push(Event.Start(container_tag(block)))
+                    if block.kind == BlockKind.Item and block.level > 0:
+                        self.queue.push(Event.TaskMarker(block.level == 2))
                 if block.first_child >= 0:
                     self.node = block.first_child
                 else:
@@ -2351,9 +3083,12 @@ impl Events:
                 if block.content.len() > 0:
                     self.queue.push(Event.Text(block.content))
                 self.queue.push(Event.End(Tag.CodeBlock(block.info)))
+            BlockKind.Table =>
+                if self.queue_table_row(block):
+                    return
             BlockKind.Html =>
                 if self.opts.raw_html:
-                    self.queue.push(Event.Html(block.content))
+                    self.queue.push(Event.Html(self.raw_html(block.content)))
                 else:
                     tight := self.in_tight_item(block)
                     if not tight:
@@ -2384,15 +3119,24 @@ impl Events:
         subject := trim_end(content)
         if subject.len() == 0:
             return
+        # plain text, which most table cells and headings are, needs no
+        # parser.
+        if skip_unmarked(subject, self.document.text_special, 0) == subject.len() and not (self.document.gfm and subject.contains("www.")):
+            self.queue.push(Event.Text(subject))
+            return
         parser := parse_inlines(subject, self.document)
         nodes := parser.nodes
+        # with gfm, email addresses in text become links, except inside
+        # links and images.
+        emails := self.document.gfm and subject.contains("@")
+        mut in_link := 0
         mut current := nodes[0].first_child
         mut entering := true
         while current > 0:
             node := nodes[current]
             if entering:
                 if node.kind == InlineKind.Text or (node.kind == InlineKind.Html and not self.opts.raw_html):
-                    current = self.queue_text_run(parser, current)
+                    current = self.queue_text_run(parser, current, emails and in_link == 0)
                     entering = false
                     continue
                 match node.kind:
@@ -2403,16 +3147,22 @@ impl Events:
                     InlineKind.Code =>
                         self.queue.push(Event.Code(node.literal))
                     InlineKind.Html =>
-                        self.queue.push(Event.InlineHtml(node.literal))
+                        self.queue.push(Event.InlineHtml(self.raw_html(node.literal)))
+                    InlineKind.FootnoteReference =>
+                        self.queue_footnote_reference(node.start)
                     _ =>
                         self.queue.push(Event.Start(self.inline_tag(node)))
                         if node.first_child >= 0:
+                            if node.kind == InlineKind.Link or node.kind == InlineKind.Image:
+                                in_link += 1
                             current = node.first_child
                             continue
                         self.queue.push(Event.End(self.inline_tag(node)))
             else:
                 if node.kind != InlineKind.Text and node.kind != InlineKind.Html and node.first_child >= 0:
                     self.queue.push(Event.End(self.inline_tag(node)))
+                    if node.kind == InlineKind.Link or node.kind == InlineKind.Image:
+                        in_link -= 1
             if node.next >= 0:
                 current = node.next
                 entering = true
@@ -2421,10 +3171,12 @@ impl Events:
                 entering = false
 
     # queue one Text event for the run of text siblings starting at `first`
-    # and return the last node of the run.
-    fn queue_text_run(parser: InlineParser, first: Int) -> Int:
+    # and return the last node of the run. with `emails`, the addresses in
+    # the run become links; raw html shown as text is not searched.
+    fn queue_text_run(parser: InlineParser, first: Int, emails: Bool) -> Int:
         nodes := parser.nodes
         mut pieces: List[String] := []
+        mut searched := 0
         mut current := first
         mut last := first
         while current >= 0:
@@ -2436,21 +3188,128 @@ impl Events:
                 elif node.literal.len() > 0:
                     pieces.push(node.literal)
             elif node.kind == InlineKind.Html and not self.opts.raw_html:
+                if emails:
+                    pieces = self.link_emails(pieces, searched)
                 pieces.push(node.literal)
+                searched = pieces.len()
             else:
                 break
             last = current
             current = node.next
+        if emails:
+            pieces = self.link_emails(pieces, searched)
+        self.queue_text(pieces)
+        return last
+
+    fn queue_text(pieces: List[String]):
         if pieces.len() == 1:
             self.queue.push(Event.Text(pieces[0]))
         elif pieces.len() > 1:
             self.queue.push(Event.Text(pieces.join("")))
-        return last
+
+    # search the text in pieces[first..] for email addresses. when there are
+    # any, queue the pieces up to the last one, each address as a link, and
+    # return what is left; otherwise return the pieces as they are.
+    fn link_emails(pieces: List[String], first: Int) -> List[String]:
+        mut tail: List[String] := []
+        for k in first..pieces.len():
+            tail.push(pieces[k])
+        stretch := tail.join("")
+        found := email_links(stretch)
+        if found.len() == 0:
+            return pieces
+        mut before: List[String] := []
+        for k in 0..first:
+            before.push(pieces[k])
+        mut copied := 0
+        mut k := 0
+        while k < found.len():
+            if found[k] > copied:
+                before.push(stretch.substring(copied, found[k]))
+            self.queue_text(before)
+            before.clear()
+            address := stretch.substring(found[k], found[k + 1])
+            mut url := address
+            if found[k + 2] == 1:
+                url = "mailto:" + address
+            link := Tag.Link(self.checked_url(url), "")
+            self.queue.push(Event.Start(link))
+            self.queue.push(Event.Text(address))
+            self.queue.push(Event.End(link))
+            copied = found[k + 1]
+            k += 3
+        if copied < stretch.len():
+            before.push(stretch.substring(copied, stretch.len()))
+        return before
+
+    # raw html as the events carry it: with gfm, the disallowed tags are
+    # filtered.
+    fn raw_html(content: String) -> String:
+        if self.document.gfm:
+            return filter_disallowed_tags(content)
+        return content
+
+    # queue a footnote reference and note its definition, to be walked after
+    # the document.
+    fn queue_footnote_reference(definition: Int):
+        if not self.footnote_seen.contains_key(definition):
+            self.footnote_seen[definition] = self.footnote_order.len()
+            self.footnote_order.push(definition)
+        self.queue.push(Event.FootnoteReference(self.document.blocks[definition].info))
+
+    # past the end of the document or of a footnote definition: walk the
+    # next definition that was referenced, or finish. a definition found
+    # referenced only inside another goes to the end of the order.
+    fn next_footnote(block: Block):
+        if block.kind == BlockKind.Footnote:
+            self.queue.push(Event.End(Tag.FootnoteDefinition(block.info)))
+        self.footnote_at += 1
+        if self.footnote_at >= self.footnote_order.len():
+            self.finished = true
+            return
+        self.node = self.footnote_order[self.footnote_at]
+        self.entering = true
+
+    # queue the next part of a table: its start and header row, a body row,
+    # or its end. returns true while rows remain, so the walk stays on it.
+    fn queue_table_row(block: Block) -> Bool:
+        if self.table_at < 0:
+            self.table_columns = table_alignments(block.info)
+            self.queue.push(Event.Start(Tag.Table(self.table_columns)))
+            self.queue.push(Event.Start(Tag.TableHead))
+            self.table_at = self.queue_table_cells(block.content, 0)
+            self.queue.push(Event.End(Tag.TableHead))
+            return true
+        if self.table_at < block.content.len():
+            self.queue.push(Event.Start(Tag.TableRow))
+            self.table_at = self.queue_table_cells(block.content, self.table_at)
+            self.queue.push(Event.End(Tag.TableRow))
+            return true
+        self.queue.push(Event.End(Tag.Table(self.table_columns)))
+        self.table_at = -1
+        return false
+
+    # queue the cells of the table row that starts at `start` in a table's
+    # content, one per column, and return where the next row starts. cells
+    # past the last column are dropped and missing ones are empty.
+    fn queue_table_cells(content: String, start: Int) -> Int:
+        end := find_line_end(content, start)
+        row := content.substring(start, end)
+        mut at := first_cell(row)
+        for alignment in self.table_columns:
+            self.queue.push(Event.Start(Tag.TableCell(alignment)))
+            if at < row.len():
+                cell := cell_end(row, at)
+                self.queue_inlines(cell_text(row, at, cell))
+                at = next_cell(row, cell)
+            self.queue.push(Event.End(Tag.TableCell(alignment)))
+        return end + 1
 
     fn inline_tag(node: Inline) -> Tag:
         return match node.kind:
             InlineKind.Emphasis => Tag.Emphasis
             InlineKind.Strong => Tag.Strong
+            InlineKind.Strikethrough => Tag.Strikethrough
             InlineKind.Image => Tag.Image(self.checked_url(node.destination), node.title)
             _ => Tag.Link(self.checked_url(node.destination), node.title)
 
@@ -2472,6 +3331,12 @@ fn list_tag(block: Block) -> Tag:
     if block.ordered:
         return Tag.List(block.list_start, block.tight)
     return Tag.List(none, block.tight)
+
+fn table_alignments(letters: String) -> List[Alignment]:
+    mut alignments: List[Alignment] := []
+    for column in 0..letters.len():
+        alignments.push(table_alignment(letters[column]))
+    return alignments
 
 fn trim_end(content: String) -> String:
     mut end := content.len()
@@ -2496,14 +3361,39 @@ pub struct HtmlRenderer:
     # constants (see Document.inline_special).
     html_special: String
     href_safe: String
+    # inside a table: whether the cells are header cells, and whether the
+    # body has been opened.
+    table_head: Bool
+    table_body: Bool
+    # footnotes as cmark-gfm writes them: each label's number, in the order
+    # of first reference, and how many references it has had.
+    footnote_numbers: Map[String, Int]
+    footnote_references: Map[String, Int]
+    # how many definitions have been written; the first opens the section.
+    footnotes_written: Int
+    # how many block quotes and lists are open, counted from the start of
+    # the current footnote definition, and whether the `</p>` of a paragraph
+    # directly inside a definition is held back, since the backlinks go
+    # inside the last such paragraph.
+    footnote_depth: Int
+    paragraph_held: Bool
 
 # A renderer that writes html.
 pub fn html_renderer() -> HtmlRenderer:
-    return HtmlRenderer(parts: [], at_line_start: true, image_depth: 0, html_special: HTML_SPECIAL.substring(0, 256), href_safe: HREF_SAFE.substring(0, 256))
+    return HtmlRenderer(parts: [], at_line_start: true, image_depth: 0, html_special: HTML_SPECIAL.substring(0, 256), href_safe: HREF_SAFE.substring(0, 256), table_head: false, table_body: false, footnote_numbers: {}, footnote_references: {}, footnotes_written: 0, footnote_depth: 0, paragraph_held: false)
 
 impl Renderer for HtmlRenderer:
     # Writes the html for one event.
     fn event(event: Event):
+        if self.paragraph_held:
+            self.paragraph_held = false
+            label := ended_footnote(event)
+            if label != "":
+                self.write(" ")
+                self.write_backlinks(label)
+                self.write("</p>\n</li>\n")
+                return
+            self.write("</p>\n")
         if self.image_depth > 0:
             self.alt_text_event(event)
             return
@@ -2531,9 +3421,30 @@ impl Renderer for HtmlRenderer:
             Event.Rule =>
                 self.newline()
                 self.write("<hr />\n")
+            Event.TaskMarker(checked) =>
+                if checked:
+                    self.write("<input type=\"checkbox\" checked=\"\" disabled=\"\" /> ")
+                else:
+                    self.write("<input type=\"checkbox\" disabled=\"\" /> ")
+            Event.FootnoteReference(label) =>
+                number := self.count_footnote_reference(label)
+                references := self.footnote_references.get(label).unwrap_or(1)
+                self.write("<sup class=\"footnote-ref\"><a href=\"#fn-")
+                self.write_url(label)
+                self.write("\" id=\"fnref-")
+                self.write_url(label)
+                if references > 1:
+                    self.write("-{references}")
+                self.write("\" data-footnote-ref>{number}</a></sup>")
 
-    # The html written so far.
+    # The html written so far, with the footnote section closed.
     fn finish() -> String:
+        if self.paragraph_held:
+            self.paragraph_held = false
+            self.write("</p>\n")
+        if self.footnotes_written > 0:
+            self.write("</ol>\n</section>\n")
+            self.footnotes_written = 0
         return self.parts.join("")
 
 impl HtmlRenderer:
@@ -2597,6 +3508,7 @@ impl HtmlRenderer:
             Tag.BlockQuote =>
                 self.newline()
                 self.write("<blockquote>\n")
+                self.footnote_depth += 1
             Tag.CodeBlock(info) =>
                 self.newline()
                 language := first_word(info)
@@ -2614,6 +3526,7 @@ impl HtmlRenderer:
                     self.write("<ol>\n")
                 else:
                     self.write("<ol start=\"{start.value()}\">\n")
+                self.footnote_depth += 1
             Tag.Item =>
                 self.newline()
                 self.write("<li>")
@@ -2633,16 +3546,53 @@ impl HtmlRenderer:
                 self.write_url(url)
                 self.write("\" alt=\"")
                 self.image_depth = 1
+            Tag.Table(alignments) =>
+                self.newline()
+                self.write("<table>")
+                self.table_body = false
+            Tag.TableHead =>
+                self.newline()
+                self.write("<thead>\n<tr>")
+                self.table_head = true
+            Tag.TableRow =>
+                self.newline()
+                if not self.table_body:
+                    self.write("<tbody>\n")
+                    self.table_body = true
+                self.write("<tr>")
+            Tag.TableCell(alignment) =>
+                self.newline()
+                if self.table_head:
+                    self.write("<th")
+                else:
+                    self.write("<td")
+                self.write(alignment_attribute(alignment))
+                self.write(">")
+            Tag.Strikethrough =>
+                self.write("<del>")
+            Tag.FootnoteDefinition(label) =>
+                self.newline()
+                if self.footnotes_written == 0:
+                    self.write("<section class=\"footnotes\" data-footnotes>\n<ol>\n")
+                self.footnotes_written += 1
+                self.footnote_depth = 0
+                self.write("<li id=\"fn-")
+                self.write_url(label)
+                self.write("\">\n")
 
     fn close_tag(tag: Tag):
         match tag:
             Tag.Paragraph =>
-                self.write("</p>\n")
+                if self.footnotes_written > 0 and self.footnote_depth == 0:
+                    self.paragraph_held = true
+                else:
+                    self.write("</p>\n")
             Tag.Heading(level) =>
                 self.write("</h{level}>\n")
             Tag.BlockQuote =>
                 self.newline()
                 self.write("</blockquote>\n")
+                self.footnote_depth -= 1
             Tag.CodeBlock(info) =>
                 self.write("</code></pre>\n")
             Tag.List(start, tight) =>
@@ -2650,6 +3600,7 @@ impl HtmlRenderer:
                     self.write("</ul>\n")
                 else:
                     self.write("</ol>\n")
+                self.footnote_depth -= 1
             Tag.Item =>
                 self.write("</li>\n")
             Tag.Emphasis =>
@@ -2660,6 +3611,57 @@ impl HtmlRenderer:
                 self.write("</a>")
             Tag.Image(url, title) =>
                 self.write("\" />")
+            Tag.Table(alignments) =>
+                if self.table_body:
+                    self.newline()
+                    self.write("</tbody>")
+                    self.table_body = false
+                self.newline()
+                self.write("</table>\n")
+            Tag.TableHead =>
+                self.newline()
+                self.write("</tr>\n</thead>")
+                self.table_head = false
+            Tag.TableRow =>
+                self.newline()
+                self.write("</tr>")
+            Tag.TableCell(alignment) =>
+                if self.table_head:
+                    self.write("</th>")
+                else:
+                    self.write("</td>")
+            Tag.Strikethrough =>
+                self.write("</del>")
+            Tag.FootnoteDefinition(label) =>
+                self.write_backlinks(label)
+                self.write("\n</li>\n")
+
+    # assign a footnote its number at its first reference, and count the
+    # reference. returns the number.
+    fn count_footnote_reference(label: String) -> Int:
+        mut number := self.footnote_numbers.get(label).unwrap_or(0)
+        if number == 0:
+            number = self.footnote_numbers.len() + 1
+            self.footnote_numbers[label] = number
+        self.footnote_references[label] = self.footnote_references.get(label).unwrap_or(0) + 1
+        return number
+
+    # the links from the end of a footnote back to each of its references.
+    fn write_backlinks(label: String):
+        number := self.footnotes_written
+        references := self.footnote_references.get(label).unwrap_or(1)
+        for reference in 1..references + 1:
+            mut suffix := ""
+            if reference > 1:
+                suffix = "-{reference}"
+                self.write(" ")
+            self.write("<a href=\"#fnref-")
+            self.write_url(label)
+            self.write("{suffix}\" class=\"footnote-backref\" data-footnote-backref data-footnote-backref-idx=\"{number}{suffix}\" aria-label=\"Back to reference {number}{suffix}\">")
+            self.write("↩")
+            if reference > 1:
+                self.write("<sup class=\"footnote-ref\">{reference}</sup>")
+            self.write("</a>")
 
     # inside an image, text becomes the alt attribute and tags are dropped.
     fn alt_text_event(event: Event):
@@ -2687,6 +3689,25 @@ impl HtmlRenderer:
                 self.write(" ")
             Event.Rule =>
                 self.write(" ")
+            Event.TaskMarker(checked) =>
+                return
+            Event.FootnoteReference(label) =>
+                # counted, as cmark-gfm counts it, but not written.
+                self.count_footnote_reference(label)
+
+# the label of the footnote definition an event ends, or "".
+fn ended_footnote(event: Event) -> String:
+    if let Event.End(tag) = event:
+        if let Tag.FootnoteDefinition(label) = tag:
+            return label
+    return ""
+
+fn alignment_attribute(alignment: Alignment) -> String:
+    return match alignment:
+        Alignment.None => ""
+        Alignment.Left => " align=\"left\""
+        Alignment.Center => " align=\"center\""
+        Alignment.Right => " align=\"right\""
 
 fn html_entity(c: Int) -> String:
     if c == 38:
@@ -2726,6 +3747,8 @@ fn describe(event: Event) -> String:
         Event.SoftBreak => "soft"
         Event.HardBreak => "hard"
         Event.Rule => "rule"
+        Event.TaskMarker(checked) => "task({checked})"
+        Event.FootnoteReference(label) => "fnref(" + label + ")"
 
 fn describe_tag(tag: Tag) -> String:
     return match tag:
@@ -2739,6 +3762,12 @@ fn describe_tag(tag: Tag) -> String:
         Tag.Strong => "strong"
         Tag.Link(url, title) => "link[" + url + "|" + title + "]"
         Tag.Image(url, title) => "image[" + url + "|" + title + "]"
+        Tag.Table(alignments) => "table[{alignments.len()}]"
+        Tag.TableHead => "thead"
+        Tag.TableRow => "tr"
+        Tag.TableCell(alignment) => "td" + alignment_attribute(alignment)
+        Tag.Strikethrough => "del"
+        Tag.FootnoteDefinition(label) => "footnote[" + label + "]"
 
 fn describe_all(source: String, opts: Options) -> String:
     mut parts: List[String] := []
@@ -2901,3 +3930,96 @@ test "any input renders without failing":
     garbage := chr(255) + chr(128) + "*" + chr(192) + "_" + chr(237) + "[" + chr(160) + "]"
     to_html(garbage)
     assert_eq(to_html("a" + chr(0) + "b"), "<p>a�b</p>\n")
+
+test "gfm tables render with alignment and inline content":
+    page := to_html("| a | *b* | c |\n| :-- | :-: | --: |\n| `x` | y")
+    assert_eq(page, "<table>\n<thead>\n<tr>\n<th align=\"left\">a</th>\n<th align=\"center\"><em>b</em></th>\n<th align=\"right\">c</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td align=\"left\"><code>x</code></td>\n<td align=\"center\">y</td>\n<td align=\"right\"></td>\n</tr>\n</tbody>\n</table>\n")
+    assert_eq(to_html("text\n| a |\n| - |"), "<p>text</p>\n<table>\n<thead>\n<tr>\n<th>a</th>\n</tr>\n</thead>\n</table>\n")
+    assert_eq(to_html("| a | b |\n| - |"), "<p>| a | b |\n| - |</p>\n")
+
+test "table cells cannot break out of the table":
+    escaped := to_html("| a |\n| - |\n| `x \\| y` \\| </td></table><script>z</script> |")
+    assert(escaped.contains("<td><code>x | y</code> | &lt;/td&gt;&lt;/table&gt;&lt;script&gt;z&lt;/script&gt;</td>"))
+    assert_eq(count_of(escaped, "<td>"), 1)
+    split := to_html("| a | b |\n| - | - |\n| `x|y` | z |")
+    assert(split.contains("<td>`x</td>\n<td>y`</td>"))
+    assert_eq(count_of(split, "</table>"), 1)
+
+test "strikethrough takes one or two tildes":
+    assert_eq(to_html("~a~ ~~b~~ ~~~c~~~ ~d~~"), "<p><del>a</del> <del>b</del> ~~~c~~~ ~d~~</p>\n")
+    assert_eq(to_html("~~a *b~~ c*"), "<p><del>a *b</del> c*</p>\n")
+    assert_eq(to_html("~~a\n\nb~~"), "<p>~~a</p>\n<p>b~~</p>\n")
+
+test "task list items render as disabled checkboxes":
+    assert_eq(to_html("- [ ] a\n- [x] b\n- [X] c\n- [y] d"), "<ul>\n<li><input type=\"checkbox\" disabled=\"\" /> a</li>\n<li><input type=\"checkbox\" checked=\"\" disabled=\"\" /> b</li>\n<li><input type=\"checkbox\" checked=\"\" disabled=\"\" /> c</li>\n<li>[y] d</li>\n</ul>\n")
+    assert_eq(to_html("- [ ]a\n- [ ]"), "<ul>\n<li>[ ]a</li>\n<li>[ ]</li>\n</ul>\n")
+    assert_eq(to_html("[ ] not in a list"), "<p>[ ] not in a list</p>\n")
+
+test "task markers cannot inject attributes":
+    page := to_html("- [x] \" onclick=\"alert(1)\" x=\"\n- [ ] <input autofocus onfocus=alert(1)>")
+    assert(page.contains("<li><input type=\"checkbox\" checked=\"\" disabled=\"\" /> &quot; onclick=&quot;alert(1)&quot; x=&quot;</li>"))
+    assert(page.contains("<li><input type=\"checkbox\" disabled=\"\" /> &lt;input autofocus onfocus=alert(1)&gt;</li>"))
+    assert_eq(count_of(page, "<input"), 2)
+
+test "extended autolinks":
+    assert_eq(to_html("see www.example.com/a, http://x.org/b_(c). and https://y.io"), "<p>see <a href=\"http://www.example.com/a\">www.example.com/a</a>, <a href=\"http://x.org/b_(c)\">http://x.org/b_(c)</a>. and <a href=\"https://y.io\">https://y.io</a></p>\n")
+    assert_eq(to_html("mail me@example.com or mailto:you@example.org."), "<p>mail <a href=\"mailto:me@example.com\">me@example.com</a> or <a href=\"mailto:you@example.org\">mailto:you@example.org</a>.</p>\n")
+    assert_eq(to_html("[www.example.com](/x) `www.example.com` <span>a@b.co</span>"), "<p><a href=\"/x\">www.example.com</a> <code>www.example.com</code> &lt;span&gt;<a href=\"mailto:a@b.co\">a@b.co</a>&lt;/span&gt;</p>\n")
+    assert_eq(to_html("<a href=\"x@y.com\">"), "<p>&lt;a href=&quot;x@y.com&quot;&gt;</p>\n")
+
+test "autolinked javascript urls are refused":
+    for source in ["javascript:alert(1)", "javascript://x.com/%0aalert(1)", "jAvAsCrIpT://x.com", "&#106;avascript://x.com", "java&#x09;script://x.com", "javascript&colon;//x.com", "javascript:a@b.co"]:
+        page := to_html(source)
+        assert(not page.contains("href=\"javascript"))
+        assert(not page.contains("href=\"jav"))
+    assert_eq(to_html("javascript://x.com/a"), "<p>javascript://x.com/a</p>\n")
+    assert_eq(to_html("javascript:a@b.co"), "<p>javascript:<a href=\"mailto:a@b.co\">a@b.co</a></p>\n")
+    assert_eq(to_html("xmpp:a@b.co"), "<p><a href=\"\">xmpp:a@b.co</a></p>\n")
+    assert_eq(to_html("http://x.com/\"onmouseover=\"alert(1)"), "<p><a href=\"http://x.com/%22onmouseover=%22alert(1)\">http://x.com/&quot;onmouseover=&quot;alert(1)</a></p>\n")
+
+test "footnotes render after the document":
+    page := to_html("a[^1] b[^n] c[^1] d[^none]\n\n[^n]: second\n[^1]: first\n[^1]: ignored\n[^unused]: unused")
+    assert(page.starts_with("<p>a<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"fnref-1\" data-footnote-ref>1</a></sup> b<sup class=\"footnote-ref\"><a href=\"#fn-n\" id=\"fnref-n\" data-footnote-ref>2</a></sup> c<sup class=\"footnote-ref\"><a href=\"#fn-1\" id=\"fnref-1-2\" data-footnote-ref>1</a></sup> d[^none]</p>\n<section class=\"footnotes\" data-footnotes>\n<ol>\n<li id=\"fn-1\">\n<p>first <a href=\"#fnref-1\""))
+    assert(page.contains("<li id=\"fn-n\">\n<p>second <a href=\"#fnref-n\""))
+    assert(page.ends_with("</ol>\n</section>\n"))
+    assert(not page.contains("ignored"))
+    assert(not page.contains("unused"))
+    assert_eq(count_of(page, "footnote-backref\" data"), 3)
+
+test "footnote labels are escaped in ids and text":
+    page := to_html("x[^\"><img/src=x/onerror=alert(1)>'&]\n\n[^\"><img/src=x/onerror=alert(1)>'&]: y")
+    assert(page.contains("id=\"fnref-%22%3E%3Cimg/src=x/onerror=alert(1)%3E&#39;&amp;\""))
+    assert(page.contains("<li id=\"fn-%22%3E%3Cimg/src=x/onerror=alert(1)%3E&#39;&amp;\">"))
+    assert(not page.contains("<img"))
+    assert_eq(count_of(page, "onerror"), 4)
+    label := to_html("x[^a'&b]\n\n[^a'&b]: y")
+    assert(label.contains("href=\"#fn-a&#39;&amp;b\" id=\"fnref-a&#39;&amp;b\""))
+
+test "gfm events":
+    assert_eq(describe_all("| a |\n| -: |\n| b |", options()), "+table[1] +thead +td align=\"right\" text(a) -td align=\"right\" -thead +tr +td align=\"right\" text(b) -td align=\"right\" -tr -table[1]")
+    assert_eq(describe_all("- [x] a ~~b~~", options()), "+list[none true] +item task(true) text(a ) +del text(b) -del -item -list[none true]")
+    assert_eq(describe_all("a[^x]\n\n[^x]: b", options()), "+p text(a) fnref(x) -p +footnote[x] +p text(b) -p -footnote[x]")
+    assert_eq(describe_all("www.a.com", options()), "+p +link[http://www.a.com|] text(www.a.com) -link[http://www.a.com|] -p")
+
+test "the tag filter escapes disallowed raw html":
+    allowed := options().allow_html(true)
+    assert_eq(render("<script>x</script> <em>y</em> <TITLE> </style >", allowed), "&lt;script>x&lt;/script> <em>y</em> &lt;TITLE> &lt;/style >\n")
+    assert_eq(render("a <iframe src=x> <xmp/> <plaintext>", allowed), "<p>a &lt;iframe src=x> &lt;xmp/> &lt;plaintext></p>\n")
+    assert_eq(render("a <titles> <scripts>", allowed), "<p>a <titles> <scripts></p>\n")
+    assert_eq(render("<script>x</script>", allowed.gfm(false)), "<script>x</script>\n")
+
+test "gfm(false) turns the extensions off":
+    off := options().gfm(false)
+    assert_eq(render("| a |\n| - |", off), "<p>| a |\n| - |</p>\n")
+    assert_eq(render("~~a~~ www.a.com a@b.co http://x.org", off), "<p>~~a~~ www.a.com a@b.co http://x.org</p>\n")
+    assert_eq(render("- [ ] a", off), "<ul>\n<li>[ ] a</li>\n</ul>\n")
+    assert_eq(render("a[^1]\n\n[^1]: /b", off), "<p>a<a href=\"/b\">^1</a></p>\n")
+    assert_eq(render("![^1](/i.png)", off), "<p><img src=\"/i.png\" alt=\"^1\" /></p>\n")
+
+test "short table rows are padded within a budget":
+    wide := "|a".repeat(2000) + "|\n" + "|-".repeat(2000) + "|\n" + "a\n".repeat(1000)
+    page := to_html(wide)
+    rows := count_of(page, "<tr>")
+    assert(rows > 1)
+    assert(rows < 100)
+    assert(page.len() < 3000000)

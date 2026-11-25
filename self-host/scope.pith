@@ -319,6 +319,16 @@ pub fn binding_is_module_level(scope_id: Int, name: String) -> Bool:
         return false
     return scope_entries[binding_scope_ids[index]].parent < 0
 
+## true when the name resolves, from this scope, to a binding inside a
+## function: a parameter, a local, a loop variable, a pattern binding or a
+## lambda parameter. the builtins and the module-level names share the root
+## scope, so they are not.
+pub fn binding_is_local(scope_id: Int, name: String) -> Bool:
+    index := lookup_binding_index(scope_id, name)
+    if index < 0:
+        return false
+    return scope_entries[binding_scope_ids[index]].parent >= 0
+
 ## replace the recorded type of an existing binding by arena index.
 pub fn set_binding_type_at(index: Int, type_id: Int):
     if index >= 0 and index < binding_types.len():

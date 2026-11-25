@@ -74,6 +74,15 @@ stale and a fix to it is welcome.
   side of a `for` loop whose variable shadows it. reading the global and then
   binding a local of the same name in one function is E266. `pith lint` reports
   the shadowing as E308.
+- **a local spelled like an import alias hides the module in its scope**. with
+  `import std.text as text`, a parameter, local, loop variable, payload binding
+  or closure parameter named `text` is that value wherever it is in scope, as a
+  receiver too: `text.len()` is the String method. the module is reachable
+  again outside that scope, and a module global spelled like an alias does not
+  hide it. the parser still reads one spelling by name: a call with written
+  type arguments, `text.describe[Int](v)`, on a local spelled like an alias
+  parses as an index followed by a call, so bind the method's receiver under
+  another name first.
 - **same-named types in different modules**. two modules can each declare a
   struct or enum, plain or generic, with the same name, and each value
   dispatches to its own module's methods. a second impl block that declares a

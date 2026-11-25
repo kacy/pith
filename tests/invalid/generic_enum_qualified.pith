@@ -1,0 +1,12 @@
+# a generic enum constructed through an import alias checks like the
+# bare-name form. it used to type as the error wildcard without a word, so an
+# Int binding accepted a Slot, an unannotated payload-free variant was not
+# asked for its annotation, and an unknown variant was not reported.
+import support.qualified_genum_mod as ev
+
+fn main():
+    x: Int := ev.Slot.Full("a")
+    y := ev.Slot.Empty
+    z := ev.Slot.Nope(1)
+    w: ev.Slot[Int] := ev.Slot.Gone
+    print("{x}")

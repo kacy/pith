@@ -145,6 +145,14 @@ cases=(
   tests/leaks/leak_owned_temp_field_read
   tests/leaks/leak_enum_bare_variant
   tests/leaks/leak_generic_enum_payload
+  "tests/leaks/leak_generic_enum_target SHAPE=qual"
+  "tests/leaks/leak_generic_enum_target SHAPE=qual_infer"
+  "tests/leaks/leak_generic_enum_target SHAPE=qual_arg"
+  "tests/leaks/leak_generic_enum_target SHAPE=nested_return"
+  "tests/leaks/leak_generic_enum_target SHAPE=nested_arg"
+  "tests/leaks/leak_generic_enum_target SHAPE=nested_assign"
+  "tests/leaks/leak_generic_enum_target SHAPE=nested_list"
+  "tests/leaks/leak_generic_enum_target SHAPE=right"
   tests/leaks/leak_optional_shell_arg
   tests/leaks/leak_optional_arg_unread_callee
   tests/leaks/leak_container_arg

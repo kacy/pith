@@ -2304,17 +2304,19 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
     target_info := get_type_info(target_tid)
     mut input_r := arg_regs[0]
     # an argument minted by a call (`decode[T](bytes.from_string_utf8(s))`, a
-    # body read, `decode_text[T](req.body())`) is transferred to this
-    # expression and dies with the decode; a named local or field stays the
-    # caller's. a text argument's conversion below mints the bytes this call
-    # frees either way; the text itself is released here only when a call
-    # minted it, which used to strand one string per `decode_text[T](f())`.
+    # body read, `decode_text[T](req.body())`), a concatenation or an
+    # interpolation is transferred to this expression and dies with the
+    # decode; a named local or field stays the caller's. a text argument's
+    # conversion below mints the bytes this call frees either way; the text
+    # itself is released here only when the argument minted it, which used to
+    # strand one string per `decode_text[T](f())` and per
+    # `decode_text[T]("...{i}...")`.
     mut fresh_bytes_input := false
     mut fresh_text_input := false
     input_expr := ir_decode_arg_expr_idx(node, 1)
     if input_expr >= 0:
         input_kind := get_node(input_expr).kind
-        fresh_input := input_kind == "call" or input_kind == "method_call"
+        fresh_input := input_kind == "call" or input_kind == "method_call" or input_kind == "binary" or input_kind == "string_interp"
         if text_input:
             fresh_text_input = fresh_input
         else:

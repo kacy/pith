@@ -269,6 +269,15 @@ cases=(
   "tests/leaks/leak_json_node_nested_optional SHAPE=present"
   "tests/leaks/leak_json_node_nested_optional SHAPE=absent"
   tests/leaks/leak_json_optional_string_present
+  "tests/leaks/leak_json_optional_fields SHAPE=flat"
+  "tests/leaks/leak_json_optional_fields SHAPE=nested"
+  "tests/leaks/leak_json_optional_fields SHAPE=opt_struct"
+  "tests/leaks/leak_json_optional_fields SHAPE=opt_lists"
+  "tests/leaks/leak_json_optional_fields SHAPE=items"
+  "tests/leaks/leak_json_optional_fields SHAPE=opt_items"
+  "tests/leaks/leak_json_optional_fields SHAPE=opt_map"
+  "tests/leaks/leak_json_optional_fields SHAPE=concat"
+  "tests/leaks/leak_json_optional_fields SHAPE=absent"
   tests/leaks/leak_json_decode_fail_after_fields
   tests/leaks/leak_json_fill_collections
   tests/leaks/leak_json_fill_collections_fail

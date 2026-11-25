@@ -18,7 +18,7 @@
 # code does not follow it.
 
 from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, lookup_entry_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_ERR, TID_NONE
-from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_rebinds_capture, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, binding_is_module_level, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
+from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_rebinds_capture, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, binding_is_module_level, binding_is_local, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
 from ast import Node, get_node, node_kind, node_value, node_child_count, node_child, append_node_child, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, render_diagnostics_json
 from lexer import int_literal_magnitude
@@ -210,6 +210,14 @@ pub mut expression_type_cache: Map[Int, Int] := {}
 # use-site -> declaration-node map, recorded as identifiers and calls
 # resolve, so editor tooling can answer go-to-definition
 mut definition_of: Map[Int, Int] := {}
+# receivers spelled like a module this file imports (`text` under
+# `import std.text as text`) that a local of the same name holds where they are
+# written: a parameter, a local, a loop variable, a payload binding or a lambda
+# parameter. the local wins inside its scope, as it already did in every
+# position but a receiver, so `text.len()` calls String.len on the parameter
+# instead of looking for a `len` in std.text. keyed by the receiver's node; the
+# emitter asks through c_ident_is_shadowed_alias.
+mut local_alias_receivers: Map[Int, Bool] := {}
 
 # the mutex paths held at the statement being checked: the function's
 # `holding` paths first, then the `locked` blocks around the statement,
@@ -318,6 +326,7 @@ pub fn initialize_checker(file_path: String):
     suppress_unknown_type_for = {}
     expression_type_cache = {}
     definition_of = {}
+    local_alias_receivers = {}
     struct_field_guards = {}
     struct_field_frozen = {}
     struct_field_weak = {}
@@ -4214,6 +4223,8 @@ fn check_for_statement(node: Node, scope_id: Int):
 pub fn c_check_expr(node_idx: Int, scope_id: Int) -> Int:
     prev := checker_set_current_node(node_idx)
     node := get_node(node_idx)
+    if node.kind == "method_call" or node.kind == "field_access" or node.kind == "call" or node.kind == "index":
+        note_local_alias_receiver(node_idx, scope_id)
     mut result := TID_ERR
     if node.kind == "binary":
         result = check_binary_expression(node, scope_id)
@@ -4230,6 +4241,37 @@ pub fn c_check_expr(node_idx: Int, scope_id: Int) -> Int:
 # the recorded use-site -> declaration-node map
 pub fn get_definition_of() -> Map[Int, Int]:
     return definition_of
+
+## whether the identifier at `idx` is a receiver spelled like an import alias
+## that a local holds where it is written, so it reads the local and not the
+## module. see local_alias_receivers.
+pub fn c_ident_is_shadowed_alias(idx: Int) -> Bool:
+    return local_alias_receivers.contains_key(idx)
+
+# mark the receiver at the base of a member chain (`a.b`, `a.b(...)`,
+# `a.b[T](...)`) when it is spelled like an import alias and a local of that
+# name is in scope. a builtin or a module-level name of the same spelling does
+# not count: the alias keeps winning over those, as it did before.
+fn note_local_alias_receiver(node_idx: Int, scope_id: Int):
+    mut base := node_idx
+    mut walking := true
+    while walking:
+        n := get_node(base)
+        if (n.kind == "method_call" or n.kind == "field_access" or n.kind == "call" or n.kind == "index") and n.children.len() > 0:
+            base = n.children[0]
+        else:
+            walking = false
+    recv := get_node(base)
+    if base == node_idx or recv.kind != "ident" or not module_aliases.contains_key(recv.value):
+        return
+    if binding_is_local(scope_id, recv.value):
+        local_alias_receivers.insert(base, true)
+
+# whether the identifier at `idx` names a module this file imports, rather
+# than a local that holds the same name there
+fn names_module_alias(idx: Int) -> Bool:
+    n := get_node(idx)
+    return n.kind == "ident" and module_aliases.contains_key(n.value) and not local_alias_receivers.contains_key(idx)
 
 # the declaration node a call or a method call resolved to, or -1. a call is
 # recorded under its callee, except a call to a generic function, which is
@@ -4797,7 +4839,7 @@ fn check_json_decode_callee(index_node: Node, member_name: String) -> Bool:
     if base_node.children.len() < 1:
         return false
     recv_node := get_node(base_node.children[0])
-    if recv_node.kind != "ident":
+    if recv_node.kind != "ident" or local_alias_receivers.contains_key(base_node.children[0]):
         return false
     if module_aliases.contains_key(recv_node.value):
         if module_aliases[recv_node.value] == "std.json":
@@ -4813,7 +4855,7 @@ fn check_config_decode_callee(index_node: Node, member_name: String) -> Bool:
     if base_node.children.len() < 1:
         return false
     recv_node := get_node(base_node.children[0])
-    if recv_node.kind != "ident":
+    if recv_node.kind != "ident" or local_alias_receivers.contains_key(base_node.children[0]):
         return false
     if module_aliases.contains_key(recv_node.value):
         if module_aliases[recv_node.value] == "std.config":
@@ -4834,7 +4876,7 @@ fn handle_decode_module(index_node: Node, member_name: String) -> String:
     if base_node.children.len() < 1:
         return ""
     recv_node := get_node(base_node.children[0])
-    if recv_node.kind != "ident":
+    if recv_node.kind != "ident" or local_alias_receivers.contains_key(base_node.children[0]):
         return ""
     if module_aliases.contains_key(recv_node.value):
         if module_aliases[recv_node.value] == "std.toml":
@@ -4866,7 +4908,7 @@ fn check_config_file_decode_callee(index_node: Node, member_name: String) -> Boo
     if base_node.children.len() < 1:
         return false
     recv_node := get_node(base_node.children[0])
-    if recv_node.kind != "ident":
+    if recv_node.kind != "ident" or local_alias_receivers.contains_key(base_node.children[0]):
         return false
     if module_aliases.contains_key(recv_node.value):
         if module_aliases[recv_node.value] == "std.config":
@@ -5132,7 +5174,7 @@ fn check_explicit_generic_callee_name(index_node: Node) -> String:
         return base_node.value
     if base_node.kind == "field_access" and base_node.children.len() > 0:
         recv_node := get_node(base_node.children[0])
-        if recv_node.kind == "ident" and module_aliases.contains_key(recv_node.value):
+        if names_module_alias(base_node.children[0]):
             return module_generic_target_name(module_aliases[recv_node.value], base_node.value)
     return ""
 
@@ -6830,7 +6872,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
 
     if recv_node.kind == "ident":
         recv_name := recv_node.value
-        if module_aliases.contains_key(recv_name):
+        if names_module_alias(node.children[0]):
             module_path := module_aliases[recv_name]
             # cross-module struct construction: `m.S(...)` where S is a struct
             # type the aliased module declares. resolve the type the same way the
@@ -7802,7 +7844,7 @@ fn check_field_access_expression(node_idx: Int, node: Node, scope_id: Int) -> In
     obj_node := get_node(obj_node_idx)
     if obj_node.kind == "ident":
         obj_name := obj_node.value
-        if module_aliases.contains_key(obj_name):
+        if names_module_alias(obj_node_idx):
             module_path := module_aliases[obj_name]
             qualified_name := module_import_target_name(module_path, field_name)
             module_name := module_generic_target_name(module_path, field_name)
@@ -10224,6 +10266,7 @@ pub struct CheckerSnapshot:
     pub suppress_unknown_type_for: Map[String, Int]
     pub expression_type_cache: Map[Int, Int]
     pub definition_of: Map[Int, Int]
+    pub local_alias_receivers: Map[Int, Bool]
     pub locked_paths: List[String]
     pub guarded_aliases: Map[Int, String]
     pub returns_parameter_cache: Map[Int, Bool]
@@ -10318,6 +10361,7 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         suppress_unknown_type_for: copy_map(suppress_unknown_type_for),
         expression_type_cache: copy_map(expression_type_cache),
         definition_of: copy_map(definition_of),
+        local_alias_receivers: copy_map(local_alias_receivers),
         locked_paths: copy_list(locked_paths),
         guarded_aliases: copy_map(guarded_aliases),
         returns_parameter_cache: copy_map(returns_parameter_cache),
@@ -10412,6 +10456,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     suppress_unknown_type_for = copy_map(s.suppress_unknown_type_for)
     expression_type_cache = copy_map(s.expression_type_cache)
     definition_of = copy_map(s.definition_of)
+    local_alias_receivers = copy_map(s.local_alias_receivers)
     locked_paths = copy_list(s.locked_paths)
     guarded_aliases = copy_map(s.guarded_aliases)
     returns_parameter_cache = copy_map(s.returns_parameter_cache)

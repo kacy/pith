@@ -39,7 +39,7 @@
 
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, node_count, Node
-from checker import c_interface_coercion, wrapping_conversion_target, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_argument_widens_to_result, c_result_widening_target, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from checker import c_interface_coercion, c_ident_is_shadowed_alias, wrapping_conversion_target, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_argument_widens_to_result, c_result_widening_target, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, lookup_entry_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
@@ -1653,6 +1653,13 @@ fn ir_emit_owned_branch_value(expr_idx: Int) -> Int:
 fn ir_branches_take_counts(idx: Int) -> Bool:
     return ir_branch_retain_kind(idx).len() > 0 and ir_branch_values_are_owned(idx)
 
+# whether the identifier at `idx` names a module the file imports. a local
+# spelled like the alias is a value there instead (the checker records which,
+# see c_ident_is_shadowed_alias).
+fn ir_ident_names_module(idx: Int) -> Bool:
+    node := get_node(idx)
+    return node.kind == "ident" and ir_module_aliases.contains_key(node.value) and not c_ident_is_shadowed_alias(idx)
+
 # true when a field-access node is really a payload-free variant
 # construction: the receiver names a boxed enum (directly, or through a
 # module alias) and the member is one of its variants. mirrors the two
@@ -1666,8 +1673,7 @@ fn ir_field_access_is_bare_variant(idx: Int) -> Bool:
     if recv.kind == "ident":
         ename = recv.value
     elif recv.kind == "field_access" and recv.children.len() > 0:
-        base := get_node(recv.children[0])
-        if base.kind == "ident" and ir_module_aliases.contains_key(base.value):
+        if ir_ident_names_module(recv.children[0]):
             ename = recv.value
     if ename.len() == 0 or not ir_boxed_enums.contains_key(ename):
         return false
@@ -9351,8 +9357,7 @@ fn ir_emit_variant_ctor_method(idx: Int) -> Int:
         # boxed enum (registered by its base name across modules). resolve it the
         # same as the local `Enum.Variant(...)` form.
         if ctor_recv.kind == "field_access" and ctor_recv.children.len() > 0:
-            qual_mod := get_node(ctor_recv.children[0])
-            if qual_mod.kind == "ident" and ir_module_aliases.contains_key(qual_mod.value) and ir_boxed_enums.contains_key(ctor_recv.value):
+            if ir_ident_names_module(ctor_recv.children[0]) and ir_boxed_enums.contains_key(ctor_recv.value):
                 qual_key := ctor_recv.value + "." + mname
                 if ir_struct_field_index_lookup.contains_key(qual_key):
                     return ir_emit_variant_construction(idx, node, ctor_recv.value, qual_key)
@@ -10253,8 +10258,7 @@ fn ir_expr_is_named_function_value(idx: Int) -> Bool:
     if node.kind == "ident":
         return ir_ident_is_function_value(idx, node.value)
     if node.kind == "field_access" and node.children.len() > 0:
-        recv_node := get_node(node.children[0])
-        if not (recv_node.kind == "ident" and ir_module_aliases.contains_key(recv_node.value)):
+        if not ir_ident_names_module(node.children[0]):
             return false
         expr_tid := c_get_expr_type(idx)
         if expr_tid < 0 or get_type_info(expr_tid).kind != "function":
@@ -11515,7 +11519,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         # function name. this must run before the receiver is evaluated: a
         # module alias is not a loadable value.
         recv_node := get_node(node.children[0])
-        if recv_node.kind == "ident" and ir_module_aliases.contains_key(recv_node.value):
+        if ir_ident_names_module(node.children[0]):
             expr_tid := c_get_expr_type(idx)
             if expr_tid >= 0 and get_type_info(expr_tid).kind == "function":
                 callee := ir_resolve_static_callee(idx)
@@ -11540,8 +11544,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         # evaluated. emit the same construction the bare Phase.Alpha path
         # does. payload variants never reach here (they are calls).
         if recv_node.kind == "field_access" and recv_node.children.len() > 0:
-            base_node := get_node(recv_node.children[0])
-            if base_node.kind == "ident" and ir_module_aliases.contains_key(base_node.value):
+            if ir_ident_names_module(recv_node.children[0]):
                 ename := recv_node.value
                 variant_key := ename + "." + fname
                 if ir_struct_field_index_lookup.contains_key(variant_key):

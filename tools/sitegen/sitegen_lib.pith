@@ -2,9 +2,11 @@
 # the cli binary and the golden test share one implementation.
 import std.algo as algo
 import std.fs as fs
+import std.html as html
+import std.markdown as markdown
 import std.toml as toml
 import std.json as json
-import std.regex as regex
+import std.yaml as yaml
 
 # # one rendered post: parsed front matter plus the body as html.
 pub struct Post:
@@ -21,32 +23,40 @@ pub struct Site:
 
 # --- front matter ------------------------------------------------------
 
-# a post starts with a `---` block of `key: value` lines; everything
-# after the closing `---` is markdown.
+# a post starts with yaml front matter between `---` lines; everything after
+# the closing `---` is markdown.
 # # split a raw post into its front-matter map and markdown body.
-pub fn split_front_matter(raw: String) -> (Map[String, String], String):
+pub fn split_front_matter(raw: String) -> (Map[String, String], String)!:
     mut meta: Map[String, String] := {}
-    lines := raw.split(chr(10))
-    if lines.len() == 0 or lines[0].trim() != "---":
-        return (meta, raw)
-    kv := regex.compile("^([^:]+): *(.*)$") catch Regex([], [], 0)
-    mut body_start := 0
-    mut i := 1
-    while i < lines.len():
-        line := lines[i].trim()
-        if line == "---":
-            body_start = i + 1
-            i = lines.len()
-        else:
-            if let c = kv.captures(line):
-                meta.insert(c[1].trim(), c[2])
-            i = i + 1
-    mut body := ""
-    mut j := body_start
-    while j < lines.len():
-        body = body + lines[j] + chr(10)
-        j = j + 1
-    return (meta, body)
+    split := markdown.split_front_matter(raw)!
+    if split.format == "toml":
+        fail "sitegen reads yaml front matter, not toml"
+    if split.format == "yaml":
+        scope := yaml.open_scope()
+        defer yaml.close_scope(scope)
+        parsed := yaml.parse_required(split.data)
+        if parsed.is_err:
+            fail "front matter: " + parsed.err.message
+        for key in yaml.keys(parsed.ok):
+            meta.insert(key, yaml_text(yaml.get_value(parsed.ok, key)))
+    return (meta, split.body)
+
+# a front matter value as text: a scalar as written, and a list as its items
+# joined with commas, the form parse_tags reads.
+fn yaml_text(node: Int) -> String:
+    kind := yaml.type_of(node)
+    if kind == "seq":
+        mut items: List[String] := []
+        for i in 0..yaml.array_len(node):
+            items.push(yaml_text(yaml.array_get(node, i)))
+        return items.join(",")
+    if kind == "int":
+        return yaml.scalar_int(node).to_string()
+    if kind == "float":
+        return yaml.scalar_float(node).to_string()
+    if kind == "bool":
+        return yaml.scalar_bool(node).to_string()
+    return yaml.scalar_string(node)
 
 fn parse_tags(raw: String) -> List[String]:
     mut out: List[String] := []
@@ -54,112 +64,6 @@ fn parse_tags(raw: String) -> List[String]:
         t := part.trim()
         if t != "":
             out.push(t)
-    return out
-
-# --- markdown ----------------------------------------------------------
-
-fn escape_html(s: String) -> String:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-# inline spans: `code`, **bold**, *italic*, [text](url)
-# # render inline spans: `code`, **bold**, *italic*, [text](url).
-pub fn render_inline(s: String) -> String:
-    mut out := ""
-    mut i := 0
-    n := s.len()
-    while i < n:
-        if s[i] == "`":
-            close := index_from(s, "`", i + 1)
-            if close > i:
-                out = out + "<code>" + escape_html(s.substring(i + 1, close)) + "</code>"
-                i = close + 1
-                continue
-        if i + 1 < n and s[i] == "*" and s[i + 1] == "*":
-            close := find_marker(s, "**", i + 2)
-            if close > i:
-                out = out + "<strong>" + render_inline(s.substring(i + 2, close)) + "</strong>"
-                i = close + 2
-                continue
-        if s[i] == "*":
-            close := index_from(s, "*", i + 1)
-            if close > i:
-                out = out + "<em>" + render_inline(s.substring(i + 1, close)) + "</em>"
-                i = close + 1
-                continue
-        if s[i] == "[":
-            close_text := index_from(s, "]", i + 1)
-            if close_text > i and close_text + 1 < n and s[close_text + 1] == "(":
-                close_url := index_from(s, ")", close_text + 2)
-                if close_url > close_text:
-                    text := s.substring(i + 1, close_text)
-                    url := s.substring(close_text + 2, close_url)
-                    out = out + "<a href=" + chr(34) + escape_html(url) + chr(34) + ">" + render_inline(text) + "</a>"
-                    i = close_url + 1
-                    continue
-        out = out + escape_html(s[i])
-        i = i + 1
-    return out
-
-fn index_from(s: String, needle: String, start: Int) -> Int:
-    mut i := start
-    while i < s.len():
-        if s[i] == needle:
-            return i
-        i = i + 1
-    return -1
-
-fn find_marker(s: String, marker: String, start: Int) -> Int:
-    mut i := start
-    while i + 1 < s.len():
-        if s[i] == "*" and s[i + 1] == "*":
-            return i
-        i = i + 1
-    return -1
-
-# # render the markdown subset to html: headings, paragraphs,
-# # lists, and fenced code blocks.
-pub fn render_markdown(md: String) -> String:
-    mut out := ""
-    mut in_code := false
-    mut in_list := false
-    for line in md.split(chr(10)):
-        trimmed := line.trim()
-        if trimmed.starts_with("```"):
-            if in_list:
-                out = out + "</ul>" + chr(10)
-                in_list = false
-            if in_code:
-                out = out + "</pre>" + chr(10)
-                in_code = false
-            else:
-                out = out + "<pre>" + chr(10)
-                in_code = true
-            continue
-        if in_code:
-            out = out + escape_html(line) + chr(10)
-            continue
-        if in_list and not trimmed.starts_with("- "):
-            out = out + "</ul>" + chr(10)
-            in_list = false
-        if trimmed == "":
-            continue
-        if trimmed.starts_with("### "):
-            out = out + "<h3>" + render_inline(trimmed.substring(4, trimmed.len())) + "</h3>" + chr(10)
-        elif trimmed.starts_with("## "):
-            out = out + "<h2>" + render_inline(trimmed.substring(3, trimmed.len())) + "</h2>" + chr(10)
-        elif trimmed.starts_with("# "):
-            out = out + "<h1>" + render_inline(trimmed.substring(2, trimmed.len())) + "</h1>" + chr(10)
-        elif trimmed.starts_with("- "):
-            if not in_list:
-                out = out + "<ul>" + chr(10)
-                in_list = true
-            out = out + "<li>" + render_inline(trimmed.substring(2, trimmed.len())) + "</li>" + chr(10)
-        else:
-            out = out + "<p>" + render_inline(trimmed) + "</p>" + chr(10)
-    if in_list:
-        out = out + "</ul>" + chr(10)
-    if in_code:
-        out = out + "</pre>" + chr(10)
     return out
 
 # --- rendering ---------------------------------------------------------
@@ -173,8 +77,8 @@ fn placeholder(name: String) -> String:
 
 # # fill the layout's placeholders with the site and page values.
 pub fn apply_layout(layout: String, site: Site, title: String, content: String) -> String:
-    mut page := layout.replace(placeholder("site_title"), site.title)
-    page = page.replace(placeholder("title"), title)
+    mut page := layout.replace(placeholder("site_title"), html.escape(site.title))
+    page = page.replace(placeholder("title"), html.escape(title))
     page = page.replace(placeholder("content"), content)
     return page
 
@@ -184,7 +88,7 @@ fn post_url(site: Site, p: Post) -> String:
 fn render_index(posts: List[Post], site: Site) -> String:
     mut items := "<ul>" + chr(10)
     for p in posts:
-        items = items + "<li>" + p.date + " <a href=" + chr(34) + "posts/" + p.slug + ".html" + chr(34) + ">" + escape_html(p.title) + "</a></li>" + chr(10)
+        items = items + "<li>" + html.escape(p.date) + " <a href=" + chr(34) + "posts/" + p.slug + ".html" + chr(34) + ">" + html.escape(p.title) + "</a></li>" + chr(10)
     items = items + "</ul>" + chr(10)
     return items
 
@@ -217,14 +121,14 @@ fn load_posts(content_dir: String) -> List[Post]!:
         if not name.ends_with(".md"):
             continue
         raw := fs.read(content_dir + "/" + name)!
-        parts := split_front_matter(raw)
+        parts := split_front_matter(raw)!
         meta := parts.0
         body := parts.1
         slug := slug_of(name)
         title := meta.get_default("title", name)
         date := meta.get_default("date", "1970-01-01")
         tags := parse_tags(meta.get_default("tags", ""))
-        posts.push(Post(slug, title, date, tags, render_markdown(body)))
+        posts.push(Post(slug, title, date, tags, markdown.to_html(body)))
     return sort_by_date(posts)
 
 fn sort_by_date(posts: List[Post]) -> List[Post]:
@@ -264,7 +168,7 @@ pub fn build_site(site_dir: String, out_dir: String) -> Int!:
 
     by_tag := collect_tags(posts)
     for tag in by_tag.keys():
-        mut body := "<h2>tag: " + escape_html(tag) + "</h2>" + chr(10) + "<ul>" + chr(10)
+        mut body := "<h2>tag: " + html.escape(tag) + "</h2>" + chr(10) + "<ul>" + chr(10)
         for slug in by_tag[tag]:
             body = body + "<li><a href=" + chr(34) + "../posts/" + slug + ".html" + chr(34) + ">" + slug + "</a></li>" + chr(10)
         body = body + "</ul>" + chr(10)

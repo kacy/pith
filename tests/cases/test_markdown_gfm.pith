@@ -1,0 +1,101 @@
+# runs the github flavored markdown extension examples through std.markdown
+# with the gfm extensions on and compares the html with the expected html.
+#
+# the examples come from two files in cmark-gfm's test directory (see
+# tests/markdown/README.md): the gfm 0.29 spec, whose extension examples are
+# marked `example table`, `example autolink` and so on, and cmark-gfm's
+# extensions test file, which also covers footnotes and task lists. the
+# spec's unmarked examples are commonmark 0.29's; the commonmark runner
+# covers commonmark with the 0.31.2 examples instead.
+#
+# the examples run with raw html and every url scheme allowed, as cmark-gfm's
+# runner runs them. the comparison is exact after the `'` normalization of
+# the commonmark runner and one more: the spec writes a task list checkbox
+# the way a browser serializes it, `<input disabled="" type="checkbox">`,
+# where cmark-gfm writes `<input type="checkbox" disabled="" />`, so the
+# spec's two task list examples, which cmark-gfm's own runner skips, are
+# compared in the spec's spelling. an example whose html is `<IGNORE>` only
+# has to render.
+
+import std.fs as fs
+import std.markdown as markdown
+import std.strings as strings
+
+FENCE := "````````````````````````````````"
+
+struct Example:
+    number: Int
+    label: String
+    section: String
+    source: String
+    html: String
+
+# the examples of a file in the spec's format: a fence line naming the
+# example, its markdown, a line holding `.`, its html, and a closing fence.
+# `→` stands for a tab.
+fn read_examples(path: String) -> List[Example]!:
+    lines := strings.split_keep_empty(fs.read(path)!, "\n")
+    mut examples: List[Example] := []
+    mut section := ""
+    mut i := 0
+    while i < lines.len():
+        line := lines[i]
+        if line.starts_with("#"):
+            section = line
+        if line.starts_with(FENCE + " example"):
+            label := line.substring(FENCE.len() + 8, line.len()).trim()
+            mut source: List[String] := []
+            i += 1
+            while lines[i] != ".":
+                source.push(lines[i] + "\n")
+                i += 1
+            mut html: List[String] := []
+            i += 1
+            while lines[i] != FENCE:
+                html.push(lines[i] + "\n")
+                i += 1
+            examples.push(Example(number: examples.len() + 1, label: label, section: section, source: with_tabs(source.join("")), html: with_tabs(html.join(""))))
+        i += 1
+    return examples
+
+fn with_tabs(content: String) -> String:
+    return content.replace("→", "\t")
+
+fn normalize(page: String) -> String:
+    return page.replace("&#39;", "'").replace("&#x27;", "'")
+
+fn spec_checkboxes(page: String) -> String:
+    checked := page.replace("<input type=\"checkbox\" checked=\"\" disabled=\"\" />", "<input checked=\"\" disabled=\"\" type=\"checkbox\">")
+    return checked.replace("<input type=\"checkbox\" disabled=\"\" />", "<input disabled=\"\" type=\"checkbox\">")
+
+fn passes(example: Example, opts: markdown.Options) -> Bool:
+    mut actual := markdown.render(example.source, opts)
+    if example.html == "<IGNORE>\n":
+        return true
+    if example.label == "disabled":
+        actual = spec_checkboxes(actual)
+    return normalize(actual) == normalize(example.html)
+
+fn main() -> Int!:
+    opts := markdown.options().allow_html(true).allow_unsafe_urls(true)
+    mut total := 0
+    mut passed := 0
+    mut failures: List[String] := []
+    for example in read_examples("tests/markdown/gfm-0.29-spec.txt")!:
+        if example.label == "":
+            continue
+        total += 1
+        if passes(example, opts):
+            passed += 1
+        else:
+            failures.push("spec example {example.number} ({example.label})")
+    for example in read_examples("tests/markdown/cmark-gfm-extensions.txt")!:
+        total += 1
+        if passes(example, opts):
+            passed += 1
+        else:
+            failures.push("extensions example {example.number} ({example.section})")
+    print("gfm: {passed}/{total} passed")
+    for failure in failures:
+        print("failed: {failure}")
+    return 0

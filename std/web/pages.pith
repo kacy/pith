@@ -1,0 +1,306 @@
+# std.web.pages - markdown files served as html pages through a layout
+#
+# a directory of markdown files becomes a site: each `.md` file is a page,
+# rendered into a std.template layout with its front matter, its table of
+# contents and its body.
+#
+#   import std.web as web
+#   import std.web.pages as pages
+#   import std.template as template
+#
+#   layout := template.load("layout.html")!
+#   app := web.new().get("/docs/*path", pages.handler("docs", layout))
+#
+# `GET /docs/guide/setup` renders `docs/guide/setup.md`, and a path that names
+# a directory renders its `index.md`, so `GET /docs/` is `docs/index.md`. the
+# route's last segment must be a `*name` one; the handler reads whatever it
+# matched, under any name.
+#
+# a directory's page lives at its path with a trailing slash and any other
+# page at its path without one, as net/http's FileServer has it: `/docs` and
+# `/docs/guide/setup/` get a 301 to `/docs/` and `/docs/guide/setup`. that
+# way a relative link in a page resolves against the directory its file is
+# in, the same as it does when the markdown is read on disk.
+#
+# ## the layout
+#
+# the layout is rendered with this context:
+#
+#   - every key of the page's front matter, yaml between `---` lines or toml
+#     between `+++` lines, at the top level: `<%= title %>`, `<%= date %>`,
+#     `<% for tag in tags %>`.
+#   - `title`: the front matter's, or else the text of the page's first
+#     heading.
+#   - `content`: the markdown body, which the layout writes with
+#     `<%md content %>`. that renders it with std.markdown's safe defaults and
+#     heading ids, and compile refuses it anywhere but element text.
+#   - `toc`: the headings, each with `level`, `text` and `id`, for
+#     `<a href="#<%= h.id %>"><%= h.text %></a>`.
+#
+# `content` and `toc` are set after the front matter, so a front matter key of
+# either name is ignored. the body reaches the page through `<%md %>` rather
+# than as html under `<%raw %>`, so a layout needs no `<%raw %>` at all and
+# nothing in a markdown file can write raw html or a `javascript:` url. turn
+# on links from each heading to itself with `layout.heading_anchors(true)`.
+#
+# ## what is served
+#
+#   - only `.md` files, found by adding `.md` or `/index.md` to the path. a
+#     request can never name another kind of file.
+#   - nothing outside `dir`: a `..` segment is redirected to the clean path
+#     before the route runs, as for static files, and a segment that still
+#     starts with `.` (an encoded `..`, or a hidden file) gets 404. a NUL byte
+#     gets 400. symbolic links under `dir` are followed, as static files
+#     follow them.
+#   - at most MAX_PAGE_BYTES of markdown. a larger file, front matter that
+#     does not parse, or a layout that fails to render gets 500, and the
+#     reason goes to the log.
+#   - `Last-Modified` and a strong `ETag`, with 304 and 412 for conditional
+#     requests, from `http.serve_content`. the time is the later of the file's
+#     modification time and the time the handler was made, since a new layout
+#     changes every page without touching its file.
+#
+# each request reads and renders its page, so there is no cache to go stale.
+# served as pages on the development machine, docs/markdown.md (10 kb) takes
+# about 0.27 ms a request and docs/web.md (55 kb) about 1.4 ms.
+
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.log as log
+import std.markdown as markdown
+import std.net.http as http
+import std.os.path as path
+import std.template as template
+import std.time as time
+import std.toml as toml
+import std.web as web
+import std.yaml as yaml
+
+# the largest markdown file a page is rendered from.
+pub MAX_PAGE_BYTES := 1_048_576
+
+# what a handler serves: the directory, the layout with heading ids on, and
+# when the handler was made.
+struct Site:
+    dir: String
+    layout: template.Template
+    made: Int
+
+# A handler that serves the markdown pages under `dir` through `layout`.
+# register it on a route whose last segment is `*name`:
+#
+#   app.get("/docs/*path", pages.handler("docs", layout))
+pub fn handler(dir: String, layout: template.Template) -> fn(web.Request) -> http.HttpResponse:
+    site := Site(dir: dir, layout: layout.heading_ids(true), made: time.unix())
+    return fn(req: web.Request) => serve(site, req)
+
+# answer one request for a page.
+fn serve(site: Site, req: web.Request) -> http.HttpResponse:
+    name := matched_rest(req)
+    if name.contains(chr(0)):
+        return http.bad_request_response()
+    found := find_page(site.dir, name)
+    if found.file == "":
+        return http.not_found_response()
+    request_path := req.path()
+    if found.directory != request_path.ends_with("/"):
+        return canonical_redirect(req, request_path, found.directory)
+    page := render_page(site.layout, found.file)
+    if page.is_err:
+        log.root().error().str("file", found.file).err(page.err).msg("could not render a markdown page")
+        return http.server_error_response()
+    modified := max(fs.modified(found.file) catch 0, site.made)
+    resp := http.serve_content(req.raw, "page.html", modified, bytes.from_string_utf8(page.ok))
+    if resp.content_type == http.MIME_HTML:
+        return resp.header("Content-Type", "text/html; charset=utf-8")
+    return resp
+
+# what the route's trailing `*name` segment matched, or "" for a route without
+# one.
+fn matched_rest(req: web.Request) -> String:
+    last := req.pattern.substring(req.pattern.last_index_of("/") + 1, req.pattern.len())
+    if not last.starts_with("*"):
+        return ""
+    return req.param(last.substring(1, last.len()))
+
+# the page a request path finds: its markdown file, "" for none, and whether
+# the path named a directory, whose page is its index.md.
+struct Found:
+    file: String
+    directory: Bool
+
+# the page that `name`, a "/"-separated path under `dir`, finds: the path plus
+# `.md`, or the `index.md` in the directory it names. nothing when a segment
+# starts with `.`.
+fn find_page(dir: String, name: String) -> Found:
+    mut segments: List[String] := []
+    for segment in name.split("/"):
+        if segment.starts_with("."):
+            return Found(file: "", directory: false)
+        if segment != "":
+            segments.push(segment)
+    base := path.join(dir, segments.join("/"))
+    if segments.len() > 0 and fs.is_file(base + ".md"):
+        return Found(file: base + ".md", directory: false)
+    index := path.join(base, "index.md")
+    if fs.is_file(index):
+        return Found(file: index, directory: true)
+    return Found(file: "", directory: false)
+
+# the 301 to a page's canonical path: with a trailing slash for a directory,
+# without one for anything else. the query is kept. the request path is
+# already clean, so it cannot become a `//host` location.
+fn canonical_redirect(req: web.Request, request_path: String, directory: Bool) -> http.HttpResponse:
+    mut location := request_path + "/"
+    if not directory:
+        location = request_path.substring(0, request_path.len() - 1)
+    query := req.raw.query() catch ""
+    if query.len() > 0:
+        location = location + "?" + query
+    return http.redirect_response(location)
+
+# the html of the page in `file`, rendered through `layout`. the size is
+# checked before the read and again after, in case the file grew between.
+fn render_page(layout: template.Template, file: String) -> String!:
+    if fs.size(file)! > MAX_PAGE_BYTES:
+        fail "the page is larger than {MAX_PAGE_BYTES} bytes"
+    source := fs.read(file)!
+    if source.len() > MAX_PAGE_BYTES:
+        fail "the page is larger than {MAX_PAGE_BYTES} bytes"
+    return render_source(layout, source)!
+
+# the html of a page whose markdown is `source`.
+fn render_source(layout: template.Template, source: String) -> String!:
+    split := markdown.split_front_matter(source)!
+    ctx := template.context()
+    if split.format == "yaml":
+        copy_yaml(ctx.handle(), split.data)!
+    elif split.format == "toml":
+        copy_toml(ctx.handle(), split.data)!
+    headings := markdown.toc(split.body, markdown.options())
+    toc := template.list()
+    for heading in headings:
+        toc.push(template.context().set_int("level", heading.level).set("text", heading.text).set("id", heading.id))
+    if not json.object_has(ctx.handle(), "title") and headings.len() > 0:
+        ctx.set("title", headings[0].text)
+    ctx.set_child("toc", toc).set("content", split.body)
+    rendered := template.render(layout, ctx)
+    if rendered.is_err:
+        fail rendered.err.message
+    return rendered.ok
+
+# copies the keys of the yaml mapping in `data` into the json object `target`.
+fn copy_yaml(target: Int, data: String) -> Bool!:
+    scope := yaml.open_scope()
+    defer yaml.close_scope(scope)
+    parsed := yaml.parse_required(data)
+    if parsed.is_err:
+        fail "front matter: " + parsed.err.message
+    root := parsed.ok
+    if yaml.is_null(root):
+        return true
+    if yaml.type_of(root) != "map":
+        fail "front matter is not a mapping"
+    for key in yaml.keys(root):
+        json.object_set(target, key, yaml_value(yaml.get_value(root, key)))
+    return true
+
+# a yaml node as a json node. yaml nests at most yaml.MAX_NESTING_DEPTH deep,
+# which bounds the recursion.
+fn yaml_value(node: Int) -> Int:
+    kind := yaml.type_of(node)
+    if kind == "string":
+        return json.make_string(yaml.scalar_string(node))
+    if kind == "int":
+        return json.make_int(yaml.scalar_int(node))
+    if kind == "float":
+        return json.make_float(yaml.scalar_float(node))
+    if kind == "bool":
+        return json.make_bool(yaml.scalar_bool(node))
+    if kind == "seq":
+        items := json.make_array()
+        for i in 0..yaml.array_len(node):
+            json.array_push(items, yaml_value(yaml.array_get(node, i)))
+        return items
+    if kind == "map":
+        fields := json.make_object()
+        for key in yaml.keys(node):
+            json.object_set(fields, key, yaml_value(yaml.get_value(node, key)))
+        return fields
+    return json.make_null()
+
+# copies the keys of the toml table in `data` into the json object `target`.
+fn copy_toml(target: Int, data: String) -> Bool!:
+    scope := toml.open_scope()
+    defer toml.close_scope(scope)
+    parsed := toml.parse_required(data)
+    if parsed.is_err:
+        fail "front matter: " + parsed.err.message
+    root := parsed.ok
+    for key in toml.keys(root):
+        json.object_set(target, key, toml_value(toml.get_value(root, key)))
+    return true
+
+# a toml node as a json node.
+fn toml_value(node: Int) -> Int:
+    kind := toml.type_of(node)
+    if kind == "string":
+        return json.make_string(toml.scalar_string(node))
+    if kind == "int":
+        return json.make_int(toml.scalar_int(node))
+    if kind == "float":
+        return json.make_float(toml.scalar_float(node))
+    if kind == "bool":
+        return json.make_bool(toml.scalar_bool(node))
+    if kind == "array":
+        items := json.make_array()
+        for i in 0..toml.array_len(node):
+            json.array_push(items, toml_value(toml.array_get(node, i)))
+        return items
+    if kind == "table":
+        fields := json.make_object()
+        for key in toml.keys(node):
+            json.object_set(fields, key, toml_value(toml.get_value(node, key)))
+        return fields
+    return json.make_null()
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+LAYOUT := "<title><%= title %></title><nav><% for h in toc %><a href=\"#<%= h.id %>\"><%= h.text %></a><% end %></nav><main><%md content %></main>"
+
+fn rendered(source: String) -> String:
+    layout := template.compile(LAYOUT) catch:
+        return "bad layout"
+    return render_source(layout.heading_ids(true), source) catch "error"
+
+test "a page renders through the layout with its toc and front matter":
+    page := rendered("---\ntitle: A <b> page\n---\n# Hello\n\n## Next step\n")
+    assert_eq(page, "<title>A &lt;b&gt; page</title><nav><a href=\"#hello\">Hello</a><a href=\"#next-step\">Next step</a></nav><main><h1 id=\"hello\">Hello</h1>\n<h2 id=\"next-step\">Next step</h2>\n</main>")
+
+test "the first heading is the title when the front matter has none":
+    assert(rendered("# First *one*\n\n# Second").starts_with("<title>First one</title>"))
+    assert(rendered("+++\nsummary = \"s\"\n+++\n# Toml page").starts_with("<title>Toml page</title>"))
+    assert(rendered("no headings").starts_with("<title></title>"))
+
+test "front matter cannot replace the body or the toc":
+    page := rendered("---\ncontent: \"<script>alert(1)</script>\"\ntoc: x\n---\nbody")
+    assert(page.ends_with("<main><p>body</p>\n</main>"))
+    assert(not page.contains("<script>"))
+
+test "raw html in a page is shown as text":
+    page := rendered("<script>alert(1)</script>\n\n[x](javascript:alert(1))")
+    assert(page.contains("<main><p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n<p><a href=\"\">x</a></p>\n</main>"))
+
+test "front matter that does not parse fails the page":
+    assert_eq(rendered("---\na: [\n---\nbody"), "error")
+    assert_eq(rendered("---\n- a list\n---\nbody"), "error")
+    assert_eq(rendered("+++\na = \n+++\nbody"), "error")
+
+test "a page path cannot leave its directory or name a hidden file":
+    assert_eq(find_page("/nonexistent-dir", "../etc/passwd").file, "")
+    assert_eq(find_page("/nonexistent-dir", "a/../../b").file, "")
+    assert_eq(find_page("/nonexistent-dir", ".git/config").file, "")
+    assert_eq(find_page("/nonexistent-dir", "a/.hidden").file, "")

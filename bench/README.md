@@ -26,7 +26,7 @@ So, two habits:
 Absolute times are only comparable within a run. Memory columns are far more
 stable than time columns and carry most of the signal here.
 
-## the full suite against go and rust (2026-11-12)
+## the full suite against go and rust (2026-11-24)
 
 ### at a glance
 
@@ -36,28 +36,28 @@ have every benchmark, with arguments and caveats.
 
 | area | benchmarks | against go | against rust |
 |---|---|---|---|
-| substring search | `substring_search` | 2.4-4.9x faster | 1.9-4.9x faster |
-| JSON decoding | `json_decode_shapes` (6 shapes) | 1.5-5.3x faster | 2.5x faster to 1.2x slower |
-| walking decoded JSON | `json_decode_shapes/list_walk` | 3.3x slower | 6.0x slower |
-| service logic | `event_ledger`, `catalog_workload`, `std_pipeline` | 1.45x faster to even | 1.3-1.6x slower |
-| sorting | `generic_sort` (int, string) | 1.7x faster to even | 2.1-5.1x slower |
-| maps | `map_update` (int, bytes, string keys) | 1.15-1.9x faster | 1.85x faster to 1.4x slower |
-| strings and text | `string_build`, `string_buffer`, `csv_encode`, `path_clean_count` | 3.5x faster to 1.4x slower | 1.03-2.8x slower |
-| HTTP head parsing | `http_head_read` | 1.3x slower | 5.6x slower |
-| closures | `closure_calls`, `closure_error` | 1.5-1.6x slower | 1.8-4.3x slower |
-| reference cycles | `cyclic_graph`, `cyclic_graph_strong` | 2.1-5.9x slower | 1.8-2.5x slower |
-| hashing | sha256, sha512, fnv1a, crc32 | 1.16-2.3x slower | 1.14-2.1x slower |
-| channels, spawning, parallel work | `chan_fanout`, `lock_sweep/spawn`, `cpu_parallel_sync` | 1.15-2.1x faster | 1.1-12x faster |
-| task scheduling | `task_churn`, `task_pingpong`, `green_fanout` | 1.3-2.6x slower | 2.4x faster to 1.6x slower |
-| locks and metrics | `lock_sweep`, `metrics_contention` | 1.35x faster to 1.2x slower | 2.6x faster to 1.8x slower |
-| HTTP server throughput | `http_sweep.sh`, 32-1024 connections | 1.55-2.3x faster than net/http, 13-15% behind a minimal server | 1.08-1.24x ahead of hyper up to 256 connections, 10% behind at 1024 |
+| substring search | `substring_search` | 2.2-5.8x faster | 1.9-5.9x faster |
+| JSON decoding | `json_decode_shapes` (6 shapes) | 1.5-5.7x faster | 2.7x faster to 1.2x slower |
+| walking decoded JSON | `json_decode_shapes/list_walk` | 3.2x slower | 5.7x slower |
+| service logic | `event_ledger`, `catalog_workload`, `std_pipeline` | 1.5x faster to even | 1.3-1.4x slower |
+| sorting | `generic_sort` (int, string) | 1.7x faster to even | 2.1-5.0x slower |
+| maps | `map_update` (int, bytes, string keys) | 1.17-1.9x faster | 2.0x faster to 1.4x slower |
+| strings and text | `string_build`, `string_buffer`, `csv_encode`, `path_clean_count` | 2.9x faster to 1.5x slower | 1.07-2.9x slower |
+| HTTP head parsing | `http_head_read` | 1.25x slower | 5.4x slower |
+| closures | `closure_calls`, `closure_error` | 1.16-1.5x slower | 1.7-3.2x slower |
+| reference cycles | `cyclic_graph`, `cyclic_graph_strong` | 2.1-6.1x slower | 1.8-2.5x slower |
+| hashing | sha256, sha512, fnv1a, crc32 | 1.13-2.3x slower | 1.15-3.2x slower |
+| channels, spawning, parallel work | `chan_fanout`, `lock_sweep/spawn`, `cpu_parallel_sync` | 1.16-1.6x faster | 1.12-11x faster |
+| task scheduling | `task_churn`, `task_pingpong`, `green_fanout` | 1.27-2.6x slower | 2.4x faster to 1.6x slower |
+| locks and metrics | `lock_sweep`, `metrics_contention` | 1.6x faster to 1.2x slower | 2.8x faster to 1.4x slower |
+| HTTP server throughput | `http_sweep.sh`, 32-1024 connections | 1.6-2.3x faster than net/http, 10-18% behind a minimal server | 1.09-1.24x ahead of hyper up to 256 connections, 14% behind at 1024 |
 | HTTP server p99 latency | same | lowest at every connection count | lowest at every connection count |
-| gRPC unary calls | `bench/grpc/run.sh`, pinned | 1.01-1.02x faster at concurrency 1, 1.15-1.24x slower at 8 | 1.08-1.31x faster |
+| gRPC unary calls | `bench/grpc/run.sh`, pinned | even at concurrency 1, 1.17-1.26x slower at 8 | 1.06-1.28x faster |
 | catalog service p50 (2026-11-05) | `catalog_server_rust` | 1.1-1.25x slower | 1.06x faster to 1.02x slower |
 | zstd, MB/s (2026-11-05) | `zstd` | decode 5.1-6.7x slower, encode 4.1-8.8x slower | decode 1.3-1.5x slower, encode 2.2-3.3x slower |
-| API gateway | `gateway_bench.sh`, 64-1024 connections, forwarding with no token | 1.2-1.7x faster, with 3.6-5.7x lower p99 and 55-70% less memory | no port |
+| API gateway | `gateway_bench.sh`, 64-1024 connections, forwarding with no token | 1.1-1.5x faster, with 2.7-4.6x lower p99 and 62-69% less memory | no port |
 
-Every row but two comes from the same build, main at `adcfce20` (after #1394).
+Every row but two comes from the same build, main at `f136babe`, which is what 0.2.16 ships.
 The catalog service and zstd rows were not rerun and carry over from the
 2026-11-05 run. The server, gRPC, gateway, catalog service and zstd rows come
 from their own runners, described in their sections below.
@@ -96,53 +96,57 @@ TRIALS=3 bench/compare.sh map_update json_decode_shapes
 
 Setup: Ryzen 9 9950X, every run pinned to one CCD (cpus 0-7,16-23), 16 workers
 (`PITH_GREEN_WORKERS`, `GOMAXPROCS`, tokio worker threads), Go 1.27.3,
-Rust 1.99.1, Pith at main after #1394 (Cranelift 0.130). Times are the median wall time of 5 interleaved rounds, process start
+Rust 1.99.1, Pith at main `f136babe` (Cranelift 0.130). Times are the median wall time of 5 interleaved rounds, process start
 included.
 
 ### compute and std
 
 | benchmark | args | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---|---:|---:|---:|---:|---:|
-| event_ledger | `200000` | 65 | 95 | 51 | 0.69x | 1.27x |
-| std_pipeline | `50000` | 79 | 78 | 57 | 1.00x | 1.38x |
-| catalog_workload | `4000` | 3.3 | 3.6 | 2.1 | 0.92x | 1.57x |
-| string_build | `2000000` | 31 | 33 | 21 | 0.95x | 1.50x |
-| closure_error | `2000000` | 289 | 182 | 163 | 1.59x | 1.78x |
-| tight_loop | `2000000000` | 481 | 354 | 1.5 | 1.36x | (a) |
-| closure_calls | `50000000` | 110 | 72 | 26 | 1.53x | 4.27x |
-| substring_search | `20000` | 45 | 220 | 220 | 0.20x | 0.20x |
-| substring_search/absent | `500 long-absent` | 1.7 | 4.1 | 3.3 | 0.41x | 0.52x |
-| string_buffer/build | `current build 100000 200 200` | 514 | 1790 | 273 | 0.29x | 1.88x |
-| string_buffer/snapshot | `current snapshot 10000 200 200` | 296 | 206 | 287 | 1.44x | 1.03x |
-| cyclic_graph | `10000000` | 261 | 124 | 142 | 2.11x | 1.84x |
-| cyclic_graph_strong | `10000000` | 740 | 125 | 291 | 5.90x | 2.54x |
-| csv_encode | `5000 400` | 224 | 309 | 131 | 0.73x | 1.71x |
-| json_decode_shapes/small | `small 4 20000000` | 710 | 3523 | 1118 | 0.20x | 0.63x |
-| json_decode_shapes/wide | `wide 32 3000000` | 599 | 3189 | 1515 | 0.19x | 0.40x |
-| json_decode_shapes/nested | `nested 4 8000000` | 848 | 2240 | 804 | 0.38x | 1.05x |
-| json_decode_shapes/list | `list 32 400000` | 994 | 2077 | 936 | 0.48x | 1.06x |
-| json_decode_shapes/list_walk | `list_walk 32 5000` | 168 | 51 | 28 | 3.30x | 5.98x |
-| json_decode_shapes/map | `map 32 300000` | 697 | 1040 | 580 | 0.67x | 1.20x |
-| json_decode_shapes/float | `float 4 12000000` | 797 | 3581 | 982 | 0.22x | 0.81x |
-| path_clean_count | `2000000` | 514 | 745 | 181 | 0.69x | 2.84x |
-| map_update/string | `string 50000000 64` | 446 | 511 | 473 | 0.87x | 0.94x |
-| map_update/bytes | `bytes 50000000 64` | 680 | 1270 | 493 | 0.54x | 1.38x |
-| map_update/int | `int 100000000 64` | 382 | 682 | 707 | 0.56x | 0.54x |
-| generic_sort/int | `current random int 100000 30` | 300 | 504 | 59 | 0.60x | 5.06x |
-| generic_sort/string | `current random string 100000 30` | 658 | 651 | 319 | 1.01x | 2.06x |
-| http_head_read | `1000000` | 623 | 490 | 112 | 1.27x | 5.58x |
+| event_ledger | `200000` | 64 | 97 | 51 | 0.66x | 1.26x |
+| std_pipeline | `50000` | 79 | 78 | 57 | 1.02x | 1.39x |
+| catalog_workload | `4000` | 3.0 | 3.9 | 2.1 | 0.77x | 1.43x |
+| string_build | `2000000` | 32 | 33 | 21 | 0.98x | 1.52x |
+| closure_error | `2000000` | 275 | 181 | 162 | 1.52x | 1.70x |
+| tight_loop | `2000000000` | 732 | 353 | 1.6 | 2.07x | (a) |
+| closure_calls | `50000000` | 83 | 72 | 26 | 1.16x | 3.20x |
+| substring_search | `20000` | 38 | 220 | 222 | 0.17x | 0.17x |
+| substring_search/absent | `500 long-absent` | 1.8 | 4.0 | 3.4 | 0.45x | 0.53x |
+| string_buffer/build | `current build 100000 200 200` | 560 | 1634 | 260 | 0.34x | 2.15x |
+| string_buffer/snapshot | `current snapshot 10000 200 200` | 306 | 199 | 285 | 1.54x | 1.07x |
+| cyclic_graph | `10000000` | 259 | 124 | 142 | 2.09x | 1.82x |
+| cyclic_graph_strong | `10000000` | 756 | 124 | 301 | 6.11x | 2.51x |
+| csv_encode | `5000 400` | 218 | 308 | 130 | 0.71x | 1.68x |
+| json_decode_shapes/small | `small 4 20000000` | 667 | 3534 | 1120 | 0.19x | 0.60x |
+| json_decode_shapes/wide | `wide 32 3000000` | 559 | 3192 | 1521 | 0.18x | 0.37x |
+| json_decode_shapes/nested | `nested 4 8000000` | 907 | 2145 | 799 | 0.42x | 1.14x |
+| json_decode_shapes/list | `list 32 400000` | 983 | 2080 | 923 | 0.47x | 1.07x |
+| json_decode_shapes/list_walk | `list_walk 32 5000` | 158 | 50 | 28 | 3.16x | 5.68x |
+| json_decode_shapes/map | `map 32 300000` | 673 | 1035 | 570 | 0.65x | 1.18x |
+| json_decode_shapes/float | `float 4 12000000` | 801 | 3541 | 980 | 0.23x | 0.82x |
+| path_clean_count | `2000000` | 528 | 748 | 180 | 0.71x | 2.93x |
+| map_update/string | `string 50000000 64` | 433 | 507 | 470 | 0.85x | 0.92x |
+| map_update/bytes | `bytes 50000000 64` | 676 | 1245 | 485 | 0.54x | 1.39x |
+| map_update/int | `int 100000000 64` | 358 | 683 | 702 | 0.52x | 0.51x |
+| generic_sort/int | `current random int 100000 30` | 299 | 500 | 60 | 0.60x | 5.02x |
+| generic_sort/string | `current random string 100000 30` | 661 | 646 | 317 | 1.02x | 2.08x |
+| http_head_read | `1000000` | 615 | 491 | 114 | 1.25x | 5.40x |
 
-The hash kernels hash 256 MB. The rows below subtract the `none` arm (57 ms
-for Pith, 48 for Go, 47 for Rust), which only builds the input. sha256 and crc32
+The hash kernels hash 256 MB. The rows below subtract the `none` arm (58 ms
+for Pith, 48 for Go, 48 for Rust), which only builds the input. sha256 and crc32
 hand whole blocks to a runtime kernel that uses the CPU's SHA and carry-less
 multiply instructions (#1242).
 
 | kernel | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| sha256 | 110 | 95 | 97 | 1.16x | 1.14x |
-| sha512 | 432 | 190 | 210 | 2.28x | 2.06x |
-| fnv1a | 236 | 189 | 190 | 1.25x | 1.25x |
-| crc32 | 13 | 7.6 | 7.5 | 1.75x | 1.77x |
+| sha256 | 109 | 96 | 95 | 1.13x | 1.15x |
+| sha512 | 435 | 189 | 207 | 2.30x | 2.10x |
+| fnv1a | 236 | 188 | 187 | 1.25x | 1.26x |
+| crc32 | 14.6 | 6.5 | 4.5 | 2.25x | 3.24x |
+
+crc32 takes about 10 ms once the 50 ms input build is subtracted, so noise in
+the subtraction moves its row: the previous run measured 1.75x Go on the same
+kernel code.
 
 ### against c and c++
 
@@ -152,23 +156,23 @@ the input.
 
 | benchmark | pith ms | c ms | c++ ms | pith/c | pith/c++ |
 |---|---:|---:|---:|---:|---:|
-| string_build | 31 | 47 | 17 | 0.66x | 1.79x |
-| tight_loop | 481 | 352 | - | 1.37x | - |
-| closure_calls | 110 | 39 | 39 | 2.83x | 2.82x |
-| substring_search | 45 | 523 | 859 | 0.09x | 0.05x |
-| substring_search/absent | 1.7 | 6.4 | 10 | 0.27x | 0.17x |
-| hash_kernels/fnv1a | 294 | 235 | - | 1.25x | - |
-| hash_kernels/crc32 | 71 | 123 | - | 0.58x | - |
-| string_buffer/build | 514 | - | 532 | - | 0.96x |
-| string_buffer/snapshot | 296 | - | 371 | - | 0.80x |
-| cyclic_graph | 261 | 3.3 | 135 | (b) | 1.94x |
-| csv_encode | 224 | 116 | 193 | 1.94x | 1.16x |
-| path_clean_count | 514 | 208 | - | 2.47x | - |
-| map_update/string | 446 | 486 | 375 | 0.92x | 1.19x |
-| map_update/bytes | 680 | 484 | 412 | 1.41x | 1.65x |
-| map_update/int | 382 | 234 | 248 | 1.63x | 1.54x |
-| generic_sort/int | 300 | 261 | 162 | 1.15x | 1.86x |
-| generic_sort/string | 658 | 455 | 311 | 1.45x | 2.12x |
+| string_build | 32 | 47 | 18 | 0.68x | 1.83x |
+| tight_loop | 732 | 351 | - | 2.08x | - |
+| closure_calls | 83 | 39 | 39 | 2.14x | 2.12x |
+| substring_search | 38 | 522 | 857 | 0.07x | 0.04x |
+| substring_search/absent | 1.8 | 6.5 | 10 | 0.28x | 0.17x |
+| hash_kernels/fnv1a | 293 | 235 | - | 1.25x | - |
+| hash_kernels/crc32 | 72 | 123 | - | 0.59x | - |
+| string_buffer/build | 560 | - | 496 | - | 1.13x |
+| string_buffer/snapshot | 306 | - | 359 | - | 0.85x |
+| cyclic_graph | 259 | 3.2 | 134 | (b) | 1.94x |
+| csv_encode | 218 | 122 | 194 | 1.78x | 1.12x |
+| path_clean_count | 528 | 210 | - | 2.52x | - |
+| map_update/string | 433 | 480 | 374 | 0.90x | 1.16x |
+| map_update/bytes | 676 | 483 | 411 | 1.40x | 1.64x |
+| map_update/int | 358 | 233 | 247 | 1.54x | 1.45x |
+| generic_sort/int | 299 | 261 | 160 | 1.14x | 1.86x |
+| generic_sort/string | 661 | 451 | 308 | 1.47x | 2.15x |
 
 (b) gcc and clang remove the allocation in `cyclic_graph.c`, so the C time is
 not an allocation cost. The C++ port with `shared_ptr` is the comparable row.
@@ -177,24 +181,24 @@ not an allocation cost. The C++ port with `shared_ptr` is the comparable row.
 
 | benchmark | args | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---|---:|---:|---:|---:|---:|
-| chan_fanout | `1000000` | 40 | 49 | 465 | 0.82x | 0.09x |
-| task_churn | `200000` | 981 | 681 | 2324 | 1.44x | 0.42x |
-| task_pingpong | `2000000` | 404 | 313 | 529 | 1.29x | 0.76x |
-| green_fanout | `2000000` | 632 | 243 | 393 | 2.61x | 1.61x |
-| cpu_parallel_sync | `200 1000000` | 654 | 753 | 725 | 0.87x | 0.90x |
-| lock_sweep/log | `log 16 100000000` | 54 | 44 | 3.6 | 1.22x | (a) |
-| lock_sweep/spawn | `spawn 16 1600000` | 38 | 80 | 100 | 0.47x | 0.37x |
-| lock_sweep/labels | `labels 16 1600000` | 59 | 80 | 56 | 0.74x | 1.05x |
-| lock_sweep/breaker | `breaker 16 50000000` | 74 | 61 | 55 | 1.22x | 1.34x |
-| lock_sweep/readfile | `readfile 16 200000` | 89 | 98 | 232 | 0.91x | 0.38x |
-| metrics_contention/counter | `3 4000000 16 counter` | 623 | 512 | 345 | 1.22x | 1.81x |
-| metrics_contention/histogram | `3 4000000 16 histogram` | 542 | 671 | 526 | 0.81x | 1.03x |
-| metrics_contention/labels | `3 1000000 16 labels` | 81 | 107 | 134 | 0.76x | 0.61x |
+| chan_fanout | `1000000` | 40 | 49 | 453 | 0.82x | 0.09x |
+| task_churn | `200000` | 994 | 680 | 2338 | 1.46x | 0.43x |
+| task_pingpong | `2000000` | 398 | 314 | 514 | 1.27x | 0.77x |
+| green_fanout | `2000000` | 622 | 243 | 392 | 2.56x | 1.58x |
+| cpu_parallel_sync | `200 1000000` | 648 | 750 | 729 | 0.86x | 0.89x |
+| lock_sweep/log | `log 16 100000000` | 53 | 44 | 3.6 | 1.21x | (a) |
+| lock_sweep/spawn | `spawn 16 1600000` | 49 | 79 | 99 | 0.62x | 0.50x |
+| lock_sweep/labels | `labels 16 1600000` | 48 | 79 | 54 | 0.61x | 0.90x |
+| lock_sweep/breaker | `breaker 16 50000000` | 68 | 61 | 78 | 1.12x | 0.88x |
+| lock_sweep/readfile | `readfile 16 200000` | 84 | 99 | 233 | 0.86x | 0.36x |
+| metrics_contention/counter | `3 4000000 16 counter` | 478 | 513 | 342 | 0.93x | 1.40x |
+| metrics_contention/histogram | `3 4000000 16 histogram` | 549 | 677 | 522 | 0.81x | 1.05x |
+| metrics_contention/labels | `3 1000000 16 labels` | 91 | 106 | 133 | 0.86x | 0.68x |
 
 `lock_sweep/breaker` is sixteen tasks contending on one mutex. Its Pith time
-moves between runs: earlier runs landed at about 87 or 113 ms, and this one
-read a median of 74. `lock_sweep/spawn` lands at about 36 or 48 ms, and read
-38 ms here.
+moves between runs: earlier runs landed at about 74, 87 or 113 ms, and this
+one read a median of 69. `lock_sweep/spawn` lands at about 37 or 48 ms, and
+read 49 ms here.
 
 (a) LLVM removes the loop, so the Rust time is not a loop cost: `tight_loop`
 becomes a closed form, `lock_sweep/log` hoists the level check out of the loop,
@@ -252,19 +256,19 @@ setup as the sweep above (wrk -t16 on the other CCD, 10 s runs, median of 3):
 
 | conns | pith | net/http | min go | fasthttp | hyper | rustmin |
 |---:|---:|---:|---:|---:|---:|---:|
-| 32 | 1.16M | 747k | 1.34M | 1.34M | 1.07M | 1.07M |
-| 128 | 1.77M | 774k | 2.09M | 2.01M | 1.42M | 1.50M |
-| 256 | 1.92M | 1.00M | 2.23M | 2.21M | 1.74M | 1.82M |
-| 1024 | 1.97M | 1.17M | 2.29M | 2.20M | 2.19M | 2.28M |
+| 32 | 1.22M | 755k | 1.35M | 1.35M | 1.08M | 1.08M |
+| 128 | 1.85M | 794k | 2.26M | 2.22M | 1.50M | 1.56M |
+| 256 | 1.93M | 1.01M | 2.30M | 2.25M | 1.78M | 1.83M |
+| 1024 | 1.94M | 1.19M | 2.35M | 2.26M | 2.27M | 2.30M |
 
 p99 latency in µs:
 
 | conns | pith | net/http | min go | fasthttp | hyper | rustmin |
 |---:|---:|---:|---:|---:|---:|---:|
-| 32 | 59 | 306 | 328 | 329 | 110 | 89 |
-| 128 | 116 | 1380 | 761 | 890 | 289 | 241 |
-| 256 | 217 | 1820 | 759 | 790 | 285 | 265 |
-| 1024 | 1050 | 4230 | 1530 | 1530 | 1100 | 1170 |
+| 32 | 53 | 302 | 306 | 312 | 100 | 64 |
+| 128 | 105 | 1320 | 429 | 443 | 153 | 145 |
+| 256 | 193 | 1840 | 751 | 744 | 273 | 264 |
+| 1024 | 860 | 4030 | 1460 | 1670 | 1010 | 1280 |
 
 Pith handles more requests per second than both Rust servers up to 256
 connections, and both pass it at 1024. It has the lowest p99 of all six
@@ -317,18 +321,19 @@ order, and two unpinned runs on this box read Go and Rust at concurrency 8
 anywhere from 59k to 101k. So these runs pinned the server to cores
 8-15,24-31 and every client to cores 0-7,16-23, rotated the client order,
 and gave each client 16 workers. Each arm then stayed within 3 percent of its
-median, except Pith at 1 KiB and concurrency 1, which ranged from 35.8k to
-38.8k.
+median, except Pith at 1 KiB and concurrency 1, which ranged from 36.1k to
+38.2k.
 
 | payload | concurrency | go (grpc-go) | rust (tonic) | pith |
 |---|---:|---:|---:|---:|
-| 16 B | 1 | 37.2k | 31.1k | 37.8k |
-| 1 KiB | 1 | 37.0k | 28.6k | 37.3k |
-| 16 B | 8 | 119.5k | 96.8k | 104.2k |
-| 1 KiB | 8 | 108.8k | 77.4k | 87.7k |
+| 16 B | 1 | 37.6k | 31.4k | 37.8k |
+| 1 KiB | 1 | 37.5k | 28.6k | 36.5k |
+| 16 B | 8 | 120.7k | 96.9k | 103.1k |
+| 1 KiB | 8 | 108.7k | 77.5k | 86.6k |
 
-At concurrency 1, Pith is 1 to 2 percent ahead of Go. At concurrency 8, Go is
-ahead by 1.15-1.24x. Pith is ahead of tonic on every row.
+At concurrency 1, Pith is even with Go: 0.5 percent ahead at 16 B and 2.7
+percent behind at 1 KiB. At concurrency 8, Go is ahead by 1.17-1.26x. Pith is
+ahead of tonic on every row.
 
 ### where pith stands
 
@@ -345,14 +350,19 @@ most compute rows, often by 2x or more. The largest gaps come from these:
   `closure_error`): non-escaping lambdas passed to call-only parameters use a
   stack slot, but closures returned from a function still allocate on the heap
   and indirect calls are not inlined
+- checked integer arithmetic: an Int add, subtract or multiply that can
+  overflow stops the program (#1401). #1484 dropped the checks the compiler
+  can prove never fire. `tight_loop`, three operations per iteration, still
+  pays for the two that can, and runs at 2.1x Go against 1.36x before the
+  checks existed
 - sha512 in portable Pith, about 2.3x Go
 - per-object allocation and refcount cost (`cyclic_graph`, `task_churn`); a
   some optional built outside a getter still gets a heap shell
 - spawning from the main thread (`green_fanout`, 2.6x Go): main is an OS
   thread, so its spawns go through the shared injector and id pool instead
   of a worker's own cache, and glibc malloc pays for frees on another thread
-- the node pool behind `json_decode_shapes/list_walk`, about 3.3x Go
-- concurrent gRPC calls, 1.15-1.24x behind grpc-go at concurrency 8
+- the node pool behind `json_decode_shapes/list_walk`, about 3.2x Go
+- concurrent gRPC calls, 1.17-1.26x behind grpc-go at concurrency 8
 
 ## guarded locking against its base (2026-11-06)
 
@@ -615,6 +625,20 @@ WRK=wrk PITH=./target/release/pith bench/http_sweep.sh
 ## api gateway benchmark
 
 `bench/gateway_bench.sh` compares `examples/gateway` with `bench/gateway.go`, a Go `net/http` gateway with the same behavior. It covers plain forwarding, an ES256 bearer token checked at the edge, and a backend killed partway through a run. The results from the 2026-11-05 run, the changes behind them and what they cost are in [examples/gateway/README.md](../examples/gateway/README.md).
+
+The 2026-11-24 sweep (main at `f136babe`, the setup above, three trials per
+row) measured these for plain forwarding:
+
+| conns | pith req/s | go req/s | pith p99 | go p99 | pith peak rss | go peak rss |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 433k | 281k | 330 µs | 880 µs | 11.5 mb | 30.3 mb |
+| 256 | 443k | 400k | 1.31 ms | 4.34 ms | 16.6 mb | 45.6 mb |
+| 1024 | 422k | 349k | 4.56 ms | 20.9 ms | 32.1 mb | 104 mb |
+
+With an ES256 token checked at the edge, the two gateways are within 4 percent
+of each other at 256 and 1024 connections, Pith handles 1.75x Go's rate at 64,
+and Pith has the lower p99 at every count. With a backend killed a third of
+the way through, neither gateway failed a request.
 
 ## catalog service benchmark
 
@@ -1599,3 +1623,11 @@ The remaining module-wide locks are in `std.web.session` (every session
 access), the Postgres and MySQL pool registries (every acquire and release),
 `std.crypto.jwks`, gRPC stream tracking and `std.shutdown`. None appeared in
 the profiles above, but none of these benchmarks exercises them.
+
+## markdown rendering (2026-11-24)
+
+`bench/markdown_render.pith` renders `docs/*.md`, concatenated and repeated to
+10.7 MB, three times with `std.markdown`. At main `f136babe`, pinned to one
+CCD, it renders 64 MB/s with the github extensions on (497 ms). It has no Go
+or Rust port yet. docs/markdown.md compares gfm on and off, from the change
+that added the extensions.

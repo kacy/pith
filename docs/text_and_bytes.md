@@ -41,6 +41,22 @@ if pair.found:
 That shape is clearer than a magic sentinel and easier to work with in
 examples.
 
+### Splitting on a separator
+
+`text.split(sep)` drops empty parts, so `"a,,b".split(",")` has two items
+and `",a,".split(",")` has one. That suits words and fields where a doubled
+separator means nothing. When an empty part does mean something, such as a
+blank line whose position you need or an empty CSV field, use
+`text.split_exact(sep)`, which keeps every part: `"a,,b".split_exact(",")`
+has three items. `strings.split_keep_empty(text, sep)` is the same split as a
+function.
+
+```pith
+fields := "a,,b".split(",")
+exact := "a,,b".split_exact(",")
+print("{fields.len()} {exact.len()}")
+```
+
 ## Bytes helpers
 
 `std.bytes` is the explicit text/bytes boundary.

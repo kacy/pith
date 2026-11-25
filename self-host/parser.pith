@@ -242,6 +242,14 @@ fn position_from_mark(mark: Int) -> (Int, Int):
         i = i + 1
     return get_current_position()
 
+# a keyword where a name belongs, such as a local named `from`. the report
+# goes at the keyword, the token at fault, and spells the word as written
+# instead of as its token kind.
+fn report_reserved_name(kind: String, code: String):
+    word := kind.substring(3, kind.len())
+    at := position_from_mark(current_token_position)
+    parser_report_error_at(at.0, at.1, code, "`" + word + "` is a reserved word, so it can't be a name", "pick another name, such as `" + word + "_value`")
+
 # add a node at the position of its FIRST token instead of its last.
 # add_node_with_position reads the token the parser just consumed, which
 # for anything spanning more than one token is the token that closed the
@@ -413,6 +421,12 @@ fn expect(kind: String) -> Token:
     if cur_kind == "eof":
         parser_report_error_at(pos.0, pos.1, "E241", "unexpected end of file, expected " + kind, "")
         return Token(kind, "", pos.0, pos.1, 0, 0)
+    # a keyword used as a name: report it, then keep its spelling as the
+    # name so the rest of the declaration parses without a cascade
+    if kind == "identifier" and cur_kind.starts_with("kw_"):
+        report_reserved_name(cur_kind, "E240")
+        word := advance_token()
+        return Token(kind, word.value, word.line, word.column, word.offset, word.len)
     # an err token was already reported by report_lexer_error_tokens before
     # parsing began, so recovery skips it without a second diagnostic.
     if cur_kind != "err":
@@ -1053,6 +1067,8 @@ fn parse_primary() -> Int:
     # reported by report_lexer_error_tokens.
     if _cur_tok_kind() == "eof":
         parser_report_error_here("E241", "unexpected end of file while parsing expression", "")
+    elif _cur_tok_kind().starts_with("kw_"):
+        report_reserved_name(_cur_tok_kind(), "E242")
     elif _cur_tok_kind() != "err":
         parser_report_error_here("E242", "unexpected token in expression: " + _cur_tok_kind(), "")
     _tv := _cur_tok_value()
@@ -1718,6 +1734,16 @@ fn skip_nested_block() -> Int:
 
 fn parse_statement() -> Int:
     # token via _cur_tok_kind/_cur_tok_value
+
+    # a keyword used as a variable name, `from := 1` or `match = 2`. say so
+    # at the keyword and skip the line, instead of parsing the keyword as the
+    # start of its own statement and reporting what follows it
+    if _cur_tok_kind().starts_with("kw_"):
+        after := _peek_ahead_kind(1)
+        if after == "colon_eq" or after == "eq":
+            report_reserved_name(_cur_tok_kind(), "E240")
+            skip_to_line_end()
+            return add_leaf_with_position("error", "")
 
     # mut binding
     if _cur_tok_kind() == "kw_mut":

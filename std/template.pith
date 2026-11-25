@@ -28,6 +28,7 @@
 # ## the syntax, in full
 #
 #   <%= path %>            escaped output — the default
+#   <%md path %>           the value rendered as markdown, safely
 #   <%raw path %>          unescaped output — you are asserting it is safe html
 #   <% if path %> … <% end %>
 #   <% if not path %> … <% end %>
@@ -82,10 +83,25 @@
 # the paths through an `if` must leave the html in the same place, and so must
 # a `for` body, so a value after the block has one context. a template that
 # opens an attribute in one branch and not the other fails to compile.
+#
+# ## markdown
+#
+# `<%md path %>` renders the value as markdown with std.markdown's safe
+# defaults and writes the html in place: raw html in the value is shown as
+# text, and link and image urls go through `html.safe_url`. there is no way to
+# let raw html through from a template, so `<%md` is safe wherever it compiles
+# and a `grep -rn '<%raw'` audit can skip it. text that should keep its raw
+# html is rendered with std.markdown in pith and written with `<%raw %>`.
+#
+# the html it writes is block content, so compile accepts it only in element
+# text: not in an attribute, a tag, a comment, `<script>`, `<style>`,
+# `<title>` or `<textarea>`. `heading_ids` and `heading_anchors` on a compiled
+# template give the headings ids and links to themselves.
 
 import std.fs as fs
 import std.html as html
 import std.json as json
+import std.markdown as markdown
 
 # the largest template source that will be compiled or loaded.
 MAX_SOURCE_BYTES := 1_048_576
@@ -106,6 +122,7 @@ NODE_IF := 3
 NODE_ELSE := 4
 NODE_FOR := 5
 NODE_END := 6
+NODE_MARKDOWN := 7
 
 # how a `<%= %>` value is written out
 MODE_TEXT := 0
@@ -142,9 +159,13 @@ struct Node:
     mode: Int
 
 # a parsed template. compile once, render many times; a `Template` holds no
-# per-render state and is safe to share.
+# per-render state and is safe to share, with other tasks too: its nodes are
+# frozen once compile builds them.
 pub struct Template:
-    nodes: List[Node]
+    frozen nodes: List[Node]
+    # how `<%md %>` renders headings: with ids, and with links to themselves.
+    markdown_ids: Bool = false
+    markdown_anchors: Bool = false
 
 # the values a template renders. a thin, typed front for a `std.json` object
 # node, so a context can be built by hand or adopted from parsed json.
@@ -285,6 +306,11 @@ fn parse_tag(body: String, offset: Int) -> Node!TemplateError:
         if not is_path(path):
             return fail_at("expected a name or dotted path after 'raw', got '{path}'", offset)!
         return node_output(NODE_RAW, path, offset)
+    if trimmed.starts_with("md "):
+        path := trimmed.substring(3, trimmed.len()).trim()
+        if not is_path(path):
+            return fail_at("expected a name or dotted path after 'md', got '{path}'", offset)!
+        return node_output(NODE_MARKDOWN, path, offset)
     if trimmed == "end":
         return Node(NODE_END, "", "", "", false, 0 - 1, 0 - 1, offset, MODE_TEXT)
     if trimmed == "else":
@@ -555,6 +581,17 @@ fn escape_mode(st: HtmlState, offset: Int) -> Int!TemplateError:
         return MODE_UNQUOTED
     fail TemplateError("a value cannot be part of a tag or attribute name; use '<% if %>' to choose between fixed ones", offset)
 
+# where a `<%md %>` at `st` would land, for the error that refuses it.
+fn markdown_place(st: HtmlState) -> String:
+    kind := st.kind
+    if kind == H_SCRIPT or kind == H_RCDATA:
+        return "inside <{st.tag}>"
+    if kind == H_COMMENT or kind == H_BOGUS:
+        return "inside a comment or declaration"
+    if kind == H_DOUBLE or kind == H_SINGLE or kind == H_UNQUOTED or kind == H_BEFORE_VALUE:
+        return "in an attribute value"
+    return "inside a tag"
+
 # one state for the two that the paths through a block leave the html in, or
 # a failure when they differ in a way that leaves a later value unsure of
 # where it lands. a tag that ends on a different attribute in each branch is
@@ -694,12 +731,30 @@ pub fn compile(source: String) -> Template!TemplateError:
             elif node.kind == NODE_RAW:
                 nodes.push(node)
                 state = after_value(state)
+            elif node.kind == NODE_MARKDOWN:
+                # the html it writes is whole elements, so the page is back in
+                # element text afterwards and the state does not move.
+                if state.kind != H_TEXT:
+                    fail TemplateError("'<%md' writes block html, so it can only sit in element text, not {markdown_place(state)}", open)
+                nodes.push(node)
             else:
                 nodes.push(node)
             position = close + 2
     if open_blocks.len() > 0:
         fail TemplateError("missing 'end'", nodes[open_blocks[open_blocks.len() - 1]].offset)
     return Template(nodes)
+
+impl Template:
+    # A copy whose `<%md %>` tags give each heading an `id` made from its
+    # text, as `markdown.options().heading_ids(true)` does. the ids are unique
+    # within one `<%md %>`, not across several.
+    fn heading_ids(enabled: Bool) -> Template:
+        return Template(nodes: self.nodes, markdown_ids: enabled, markdown_anchors: self.markdown_anchors)
+
+    # A copy whose `<%md %>` tags also start each heading with a link to
+    # itself, as `markdown.options().heading_anchors(true)` does.
+    fn heading_anchors(enabled: Bool) -> Template:
+        return Template(nodes: self.nodes, markdown_ids: self.markdown_ids, markdown_anchors: enabled)
 
 # record the matching `end` on the node that opened the block.
 fn close_block(nodes: List[Node], opener: Int, closer: Int) -> List[Node]:
@@ -868,6 +923,17 @@ fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[Strin
             index = index + 1
         elif node.kind == NODE_RAW:
             piece := stringify(resolve(root, names, values, node.path))
+            add_rendered_bytes(budget, piece.len(), node.offset)!
+            parts.push(piece)
+            index = index + 1
+        elif node.kind == NODE_MARKDOWN:
+            source := stringify(resolve(root, names, values, node.path))
+            # a source longer than the whole output cap fails before it is
+            # parsed rather than after.
+            if source.len() > MAX_OUTPUT_BYTES:
+                fail TemplateError("markdown at '{node.path}' is larger than {MAX_OUTPUT_BYTES} bytes", node.offset)
+            opts := markdown.options().heading_ids(t.markdown_ids).heading_anchors(t.markdown_anchors)
+            piece := markdown.render(source, opts)
             add_rendered_bytes(budget, piece.len(), node.offset)!
             parts.push(piece)
             index = index + 1
@@ -1234,3 +1300,76 @@ test "nested for loops enforce MAX_OUTPUT_BYTES during rendering":
     ctx := context().set_child("rows", items).set("chunk", chunk)
     res := render_string("<% for a in rows %><% for b in rows %><%= chunk %><% end %><% end %>", ctx)
     assert(res.is_err)
+
+test "md renders a value as markdown, exactly as markdown.to_html does":
+    source := "# Title\n\nsome *text*, a [link](/a?b=1&c=2) and `code`\n\n- one\n- two\n\n```\nx < y\n```\n"
+    ctx := context().set("body", source)
+
+    assert_eq(render_string("<main><%md body %></main>", ctx)!, "<main>" + markdown.to_html(source) + "</main>")
+    assert_eq(render_string("[<%md missing %>]", ctx)!, "[]")
+    rows := list().push_text("*a*").push_text("`b`")
+    assert_eq(render_string("<% for r in rows %><div><%md r %></div><% end %>", context().set_child("rows", rows))!, "<div><p><em>a</em></p>\n</div><div><p><code>b</code></p>\n</div>")
+
+fn md_of(value: String) -> String:
+    ctx := context().set("v", value).set("secret", "<b>leaked</b>")
+    return render_string("<main><%md v %></main>", ctx) catch "ERR"
+
+test "md is never a way to write raw html":
+    assert_eq(md_of("<script>alert(1)</script>"), "<main><p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n</main>")
+    assert_eq(md_of("<img src=x onerror=alert(1)>"), "<main><p>&lt;img src=x onerror=alert(1)&gt;</p>\n</main>")
+    assert_eq(md_of("</main><script>alert(1)</script>"), "<main><p>&lt;/main&gt;&lt;script&gt;alert(1)&lt;/script&gt;</p>\n</main>")
+    assert_eq(md_of("[x](javascript:alert(1))"), "<main><p><a href=\"\">x</a></p>\n</main>")
+    assert_eq(md_of("[x](java&#x09;script&colon;alert(1))"), "<main><p><a href=\"\">x</a></p>\n</main>")
+    assert_eq(md_of("![x](data:image/svg+xml,%3Csvg%20onload=alert(1)%3E)"), "<main><p><img src=\"\" alt=\"x\" /></p>\n</main>")
+    assert_eq(md_of("[x](/u \"\\\" onmouseover=\\\"alert(1)\")"), "<main><p><a href=\"/u\" title=\"&quot; onmouseover=&quot;alert(1)\">x</a></p>\n</main>")
+    assert_eq(md_of("<%raw secret %>"), "<main><p>&lt;%raw secret %&gt;</p>\n</main>")
+    assert_eq(md_of("```\"><script>\nx\n```"), "<main><pre><code class=\"language-&quot;&gt;&lt;script&gt;\">x\n</code></pre>\n</main>")
+    for attack in ["<div onclick=x>", "<iframe srcdoc=x>", "<!-- x -->", "<?php x ?>", "<![CDATA[x]]>", "<style>*{}</style>"]:
+        assert_eq(md_of(attack), "<main>" + markdown.to_html(attack) + "</main>")
+        assert(not md_of(attack).contains(attack))
+
+test "md is refused anywhere but element text":
+    assert_eq(compile_rejects("<p title=\"<%md v %>\">"), true)
+    assert_eq(compile_rejects("<p title='<%md v %>'>"), true)
+    assert_eq(compile_rejects("<p title=<%md v %>>"), true)
+    assert_eq(compile_rejects("<a href=\"<%md v %>\">"), true)
+    assert_eq(compile_rejects("<div <%md v %>>"), true)
+    assert_eq(compile_rejects("<<%md v %>>"), true)
+    assert_eq(compile_rejects("</<%md v %>>"), true)
+    assert_eq(compile_rejects("<script><%md v %></script>"), true)
+    assert_eq(compile_rejects("<style><%md v %></style>"), true)
+    assert_eq(compile_rejects("<title><%md v %></title>"), true)
+    assert_eq(compile_rejects("<textarea><%md v %></textarea>"), true)
+    assert_eq(compile_rejects("<noscript><%md v %></noscript>"), true)
+    assert_eq(compile_rejects("<!-- <%md v %> -->"), true)
+    assert_eq(compile_rejects("<!doctype <%md v %>>"), true)
+    assert_eq(compile_rejects("<%md %>"), true)
+    assert_eq(compile_rejects("<%md a b %>"), true)
+    assert_eq(compile_rejects("<%md a() %>"), true)
+    refused := compile("<title><%md v %></title>")
+    assert(refused.is_err)
+    assert_eq(refused.err.message, "'<%md' writes block html, so it can only sit in element text, not inside <title>")
+    assert_eq(compile_rejects("<div><%md v %></div><p><%md v %></p>"), false)
+    assert_eq(compile_rejects("<script>a < b</script><%md v %><p title=\"<%= v %>\">"), false)
+    assert_eq(compile_rejects("<% if c %><%md v %><% else %><%md w %><% end %>"), false)
+
+test "a template can give markdown headings ids and anchors":
+    ctx := context().set("body", "# Hi there\n\n## Hi there")
+    page := compile("<%md body %>")!
+
+    assert_eq(render(page, ctx)!, "<h1>Hi there</h1>\n<h2>Hi there</h2>\n")
+    assert_eq(render(page.heading_ids(true), ctx)!, "<h1 id=\"hi-there\">Hi there</h1>\n<h2 id=\"hi-there-1\">Hi there</h2>\n")
+    anchored := render(page.heading_anchors(true), ctx)!
+    assert_eq(anchored, markdown.render("# Hi there\n\n## Hi there", markdown.options().heading_anchors(true)))
+    assert_eq(render(page, ctx)!, "<h1>Hi there</h1>\n<h2>Hi there</h2>\n")
+
+test "md output counts against MAX_OUTPUT_BYTES":
+    too_big := context().set("v", "a".repeat(MAX_OUTPUT_BYTES + 1))
+    assert(render_string("<%md v %>", too_big).is_err)
+    mut rows := list()
+    mut i := 0
+    while i < 2100:
+        rows = rows.push_text("x")
+        i = i + 1
+    ctx := context().set_child("rows", rows).set("v", "y".repeat(4096))
+    assert(render_string("<% for r in rows %><%md v %><% end %>", ctx).is_err)

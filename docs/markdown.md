@@ -577,7 +577,8 @@ shared base can be specialized:
   quotes have a `│` bar, and footnotes follow a rule at the end.
 - each table column is as wide as its widest cell. when the table is wider
   than the terminal, the widest columns are cut to the largest width that fits
-  and their cells wrap.
+  and their cells wrap. a table with so many columns that one column each does
+  not fit runs past the width.
 - `renderer(columns)` writes styles unless NO_COLOR is set (see
   `term.no_color()`), and `colors(false)` or `colors(true)` overrides that.
   without colors, code spans keep their backticks and strikethrough keeps its

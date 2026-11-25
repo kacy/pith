@@ -1,4 +1,4 @@
-# interface values
+# Interface values
 
 Status: implemented. The plan at the end records what is left.
 
@@ -17,7 +17,7 @@ the bracketed bound `[T: Shape]` already marks the specialized form, so a bare
 `Shape` can only mean the dispatched one, and a keyword would be the only one
 in Pith's type syntax (`dyn Shape?` reads ambiguously).
 
-## what a program can write
+## What a program can write
 
 ```pith
 interface Shape:
@@ -72,31 +72,31 @@ The rules:
 `examples/interface_values.pith` uses an interface as a list element, a
 struct field, a map value and a return type.
 
-## which interfaces can be values
+## Which interfaces can be values
 
 An interface can be used as a value type only if every method can be called
 without knowing the concrete type. The checker reports a new error, E316, at
 the use of the interface as a type, naming the method that prevents it:
 
-- a method with type parameters of its own (`fn map[U](...)`): the
+- A method with type parameters of its own (`fn map[U](...)`): the
   specialization to call is not known at the call site;
-- an interface with type parameters (`Source[T]`), for the same reason;
-- an interface with associated types: the caller cannot name them.
+- An interface with type parameters (`Source[T]`), for the same reason;
+- An interface with associated types: the caller cannot name them.
 
 Pith has no `Self` type, so the rule Rust has for it does not arise.
 
 A bound use of such an interface is still fine. This matches what Rust calls
 object safety, without the opt-out annotations.
 
-## representation
+## Representation
 
 An interface value is an ordinary counted struct handle. Its fields are:
 
-| field | holds |
+| Field | Holds |
 |---|---|
-| 0 | a type id for the concrete type, a small integer assigned per program |
-| 1 | the concrete value: a handle, or an Int, Float or Bool stored in the word |
-| 2.. | one function pointer per interface method, in declaration order |
+| 0 | A type id for the concrete type, a small integer assigned per program |
+| 1 | The concrete value: a handle, or an Int, Float or Bool stored in the word |
+| 2.. | One function pointer per interface method, in declaration order |
 
 Building one is a `pith_struct_alloc(2 + methods)`, a constant store for the
 type id, the value store (with a retain when the value is counted), and a
@@ -124,7 +124,7 @@ through the IR, the register-result ABI, every collection and the count
 checker. The allocation is the smaller cost, and the struct pool already makes
 small allocations cheap.
 
-## dispatch
+## Dispatch
 
 A method call `s.area()` on an interface value loads the function pointer from
 the method's slot and calls it indirectly with field 1 as the receiver:
@@ -136,13 +136,13 @@ calli   r3 r2 int 1 r1           # the one new instruction
 ```
 
 `calli REG PTR RETKIND NARGS ARG...` lowers to a Cranelift `call_indirect`
-with N i64 parameters and one i64 return. That is the plain abi every function
+with N i64 parameters and one i64 return. That is the plain ABI every function
 already uses, so the function in a slot returns a fallible result as its box.
 
 A slot usually points at the concrete method itself. A method of an
 `impl Iface for T` block keeps the boxed result unless the type's own impl
 declares a method of the same name, as std/io does for its streams. The two
-then compile to one symbol, which takes the register-result abi when every
+then compile to one symbol, which takes the register-result ABI when every
 body under it fits. Direct calls read the register pair, and the slot points
 at `<symbol>.iface`, an adapter that calls the method and folds the pair into
 the box. No name written in source contains a `.`, so the adapter's name
@@ -159,7 +159,7 @@ wherever it emits a node that carries a record. A collection literal stored
 into a `List[Shape]` or `Map[K, Shape]` takes the target's type rather than
 unifying its elements, which would refuse `[Sq(..), Label(..)]`.
 
-## ownership
+## Ownership
 
 - Converting a borrowed value to an interface value retains it. Converting a
   value the expression owns moves it into field 1 without a retain.
@@ -181,7 +181,7 @@ unifying its elements, which would refuse `[Sq(..), Label(..)]`.
 - An interface value satisfies its own bound: `f[T: Shape](x)` with `x: Shape`
   specializes at `Shape`, and the calls in the body dispatch.
 
-## errors and the checker
+## Errors and the checker
 
 - E315 goes away for interfaces that can be values, and is replaced by E316
   for those that cannot.
@@ -191,7 +191,7 @@ unifying its elements, which would refuse `[Sq(..), Label(..)]`.
   type mismatch (E200/E219) at the value.
 - The generic body pass needs no change: a bound is still a bound.
 
-## what is out of scope for the first version
+## What is out of scope for the first version
 
 - Downcasts (`if s is Circle`, or `match` on the concrete type). The type id
   is stored so this can be added without changing the layout.
@@ -201,7 +201,7 @@ unifying its elements, which would refuse `[Sq(..), Label(..)]`.
 - Embedding one interface in another.
 - Value equality. `==` stays identity until structs get derived equality.
 
-## plan
+## Plan
 
 Done:
 

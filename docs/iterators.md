@@ -1,4 +1,4 @@
-# iterators
+# Iterators
 
 Pith has one iterator protocol. Built-in collections use it, the
 range-for sugar uses it, and your own types use it the same way. If a
@@ -16,7 +16,7 @@ them needs `impl Iterator for T` with the element type bound as
 `type Item`. Passing a struct that only has a matching `next` is error
 E226.
 
-## the protocol
+## The protocol
 
 A struct that implements `Iterator` works with both the for loop and the
 adapters:
@@ -52,7 +52,7 @@ Two things to keep in mind:
 - The element type is `Item`, and `next` returns `Item?`. Returning
   `none` ends the loop; returning a value yields it to the loop body.
 
-## range-for
+## Range-for
 
 For "do this N times" or indexing into a parallel list, use range-for
 instead of building a list of integers:
@@ -77,29 +77,29 @@ hand to an adapter; the sugar is faster otherwise.
 from std.iter import Iterator, Range, to_list, map_iter, filter_iter
 ```
 
-- `Iterator` — the interface. It declares an associated element type and
+- `Iterator`: the interface. It declares an associated element type and
   a `next()` over it: `type Item` and `fn next() -> Item?`. Bound on it
   when you want a generic function that walks any iterator, and name the
   element type as `I.Item`:
   `fn to_list[I: Iterator](it: I) -> List[I.Item]`.
-- `Range(lo, hi)` — a `[lo, hi)` value you can hold. Carries its own
+- `Range(lo, hi)`: a `[lo, hi)` value you can hold. It carries its own
   cursor and follows the protocol, so it plugs into the adapters. The
   for-loop sugar is faster when you just want a counted loop.
-- `to_list(it)` — drains any iterator into a `List[I.Item]`. The element
+- `to_list(it)`: drains any iterator into a `List[I.Item]`. The element
   type comes from the iterator's associated `Item`, so you never write a
   type argument.
-- `map_iter(src, f)` / `filter_iter(src, p)` — lazy adapters. Each call
+- `map_iter(src, f)` / `filter_iter(src, p)`: lazy adapters. Each call
   wraps the source iterator with a closure and produces a new iterator
   whose `next()` pulls from the source on demand.
 
 The adapter constructors are named `map_iter` / `filter_iter` rather
 than `map` / `filter` so they don't collide with the eager free-function
-forms over `List` that pith has had for longer. Use the method form
+forms over `List` that Pith has had for longer. Use the method form
 (`xs.map(...)`, `xs.filter(...)`) on a list when you want eager
 results; reach for the iter form when you want fusion or you're working
 with a non-list source.
 
-## lazy fusion
+## Lazy fusion
 
 A chain of adapters is walked exactly once, at the terminal:
 
@@ -122,14 +122,14 @@ pulls from `Range`. There is no intermediate list between stages, so
 
 Each call site monomorphizes the adapter for its concrete source and
 closure types, so `self.src.next()` inside the adapter resolves to the
-right concrete `next` at compile time. No dynamic dispatch — that's
-why nested adapters fuse.
+right concrete `next` at compile time. There is no dynamic dispatch,
+which is why nested adapters fuse.
 
-## writing your own adapter
+## Writing your own adapter
 
 The same pattern works for adapters you write yourself. The shape is:
 hold a source iterator (and any state you need), implement `Iterator` on
-the struct — binding `Item` to whatever it yields — and write `next()` to
+the struct (binding `Item` to whatever it yields), and write `next()` to
 pull from `self.src.next()`:
 
 ```pith
@@ -162,13 +162,14 @@ A few practical notes:
   source's `next` at IR time.
 - When you've already checked an optional, `n.value()` extracts the
   inner value: `if n == none: return none; return f(n.value())`.
-- The element type is the source's associated `Item` — no redundant type
-  parameter to thread. `I.Item` resolves through a chain of adapters, so
-  `Take[MapIter[Range, Int]]` yields the right element type on its own.
+- The element type is the source's associated `Item`, so there is no
+  redundant type parameter to thread. `I.Item` resolves through a chain of
+  adapters, so `Take[MapIter[Range, Int]]` yields the right element type on
+  its own.
 
-## when to use what
+## When to use what
 
-Use `for i in 0..n:` for counted loops over integers — it doesn't
+Use `for i in 0..n:` for counted loops over integers; it doesn't
 allocate. Use `xs.map(...)` / `xs.filter(...)` when you're transforming
 a list and want the result list right there. Reach for the `std.iter`
 adapters when fusion matters (long sources, multiple stages, early

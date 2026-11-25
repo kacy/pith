@@ -1,4 +1,4 @@
-# generics: how a generic body is checked
+# Generics: how a generic body is checked
 
 A generic function, a generic method on a concrete type, a method of a
 generic struct, and a generic method of a generic struct all have bodies with
@@ -6,7 +6,7 @@ no concrete types of their own. `T` is a name until something instantiates the
 declaration. This page describes when those bodies are type-checked, what the
 check knows, and how to read what it reports.
 
-## the two passes
+## The two passes
 
 Pass 2 of the checker (`c_check_all` in `self-host/checker.pith`) walks every
 concrete body with every top-level name in scope. It skips a generic body: with
@@ -15,23 +15,23 @@ an error reported there would name a type the program may never use.
 
 The generic-body pass runs after it, once per module, over a work queue:
 
-- every generic call the concrete code makes records the type arguments the
+- Every generic call the concrete code makes records the type arguments the
   checker inferred for it (or resolved from an explicit `f[Int](x)` or
   `x.describe[Int](v)` spelling) and queues the pair (declaration, type
   arguments);
-- every method call whose receiver is a generic struct instance
+- Every method call whose receiver is a generic struct instance
   (`holder.size()` on a `Holder[String]`, or the `next` a `for` loop calls on
   an iterator instance) queues that method against that instance. A method
   the program never calls at some instance is not walked there: `size()`
   reading `self.item.len()` is fine on a `Holder[List[Int]]` and would be a
   fault on a `Holder[Int?]` the program only ever builds;
-- a method with type parameters of its own on a generic struct
+- A method with type parameters of its own on a generic struct
   (`fn map[U](f: fn(T) -> U) -> Box[U]` in `impl Box:` for a `Box[T]`) queues the triple
   (declaration, receiver instance, method type arguments): `Box[Int].map` at
   `String` and `Box[String].map` at `String` are two entries, and each is
   walked with the owner's parameters resolving to the instance's arguments
   and the method's to the call's;
-- a queued body is walked with its type parameters resolving to the concrete
+- A queued body is walked with its type parameters resolving to the concrete
   types, `self` bound to the instance where there is one, and the associated
   types of the instance's impl in force. A generic call met inside the body
   queues in turn, so the pass reaches every specialization the program can
@@ -40,7 +40,7 @@ The generic-body pass runs after it, once per module, over a work queue:
 Each (declaration, types) pair is walked once per build. A body a program
 never instantiates is still never checked.
 
-## what a report looks like
+## What a report looks like
 
 A fault inside a generic body is reported at the line it sits on, with the
 specialization it was found at appended to the message:
@@ -57,20 +57,20 @@ what the suffix is for. A generic method of a generic struct names both lists,
 
 The check does not verify that a body uses only what its bounds promise. A body
 that compiles at every type the program instantiates it at is accepted, even if
-another type satisfying the same bound would not compile. That is a known
-limitation, not a guarantee.
+another type satisfying the same bound would not compile. This is a known
+limitation.
 
-## the mode switch
+## The mode switch
 
 `PITH_CHECK_GENERIC_BODIES` selects what the pass does. It is read once per
 check run.
 
-| value | effect |
+| Value | Effect |
 |---|---|
-| `off` | the pass does not run; generic bodies are left as pass 2 leaves them |
-| `silent` | the pass runs and records nothing; the emitter's type reads still benefit |
-| `count` | faults are recorded as warnings, so `pith check --json` prints them and exits 0 (plain `pith check` prints `ok`) |
-| `on` | faults are recorded as errors |
+| `off` | The pass does not run; generic bodies are left as pass 2 leaves them |
+| `silent` | The pass runs and records nothing; the emitter's type reads still benefit |
+| `count` | Faults are recorded as warnings, so `pith check --json` prints them and exits 0 (plain `pith check` prints `ok`) |
+| `on` | Faults are recorded as errors |
 
 The default is `on`: a fault inside a generic body is an error. The pass ran
 silently for a while so the corpus could be surveyed for faults inside bodies
@@ -81,7 +81,7 @@ and tallies what it finds by code and by file, which is how a large body of
 new code is surveyed before its faults become errors. `silent` keeps the walk
 (the emitter still needs it) and drops the reports for one run.
 
-## what the emitter reads
+## What the emitter reads
 
 The expression types the pass computes are one specialization's answers for
 the body's nodes. The pass keeps them out of the cache pass 2 filled, so a
@@ -105,7 +105,7 @@ spelling denote the same type, which is what dedupes them, since optional and
 tuple types are not interned. The record exists for every generic call the
 checker resolves, including a bare call to a generic imported by name and the
 builtin spelling of `assert_eq`; the emitter has no type inference of its own.
-A request that arrives with no call node (a json or config decode target) is
+A request that arrives with no call node (a JSON or config decode target) is
 still keyed by emission kinds, and a body requested both ways is emitted once.
 
 A specialization is emitted in the module whose code instantiates it, which
@@ -120,16 +120,16 @@ own `MapIter`.
 
 For a generic method of a generic struct the record is the whole key: the
 receiver instance's type arguments first, then the method's own. The symbol
-keeps the two lists apart by putting them where each already lives — the
-instance arguments between the owner and the method name, as the per-instance
-copies of the struct's plain methods spell them (`Box_int_show`), and the
-method's own after the method name as every specialization does:
-`Box_int_map__string` is `Box[Int].map[String]`, and `Box_string_map__string`
-is a different body. The emitter splits the record at the owner's parameter
+keeps the two lists apart by putting them where each already lives. The
+instance arguments go between the owner and the method name, as the
+per-instance copies of the struct's plain methods spell them (`Box_int_show`),
+and the method's own go after the method name, as every specialization does.
+So `Box_int_map__string` is `Box[Int].map[String]`, and
+`Box_string_map__string` is a different body. The emitter splits the record at the owner's parameter
 count, finds the instance the leading arguments name, and emits the body in
 that instance's context with both lists substituting.
 
-## writing the type arguments
+## Writing the type arguments
 
 A generic function's type arguments can be written at the call, `f[Int](x)`,
 and so can a generic method's, `x.describe[Int](v)` or `x.blank[Int]()`. The
@@ -148,13 +148,12 @@ index into a field of closures followed by a call, `t.items[0](y)` or
 `t.items[i](y)`, holds a literal or a lowercase binding and stays an index; a
 module function called with type arguments, `json.decode[Row](s)`, has an
 import alias as its receiver and stays the shape the module paths read. The
-spellings the rule misreads are an index that is itself type-shaped — a
-SCREAMING_CASE constant or an enum variant indexing a field of closures,
-`t.items[MAX](y)`, `t.handlers[Kind.Click](ev)`; the checker names the repair
-(E209), which is to group the index, `(t.items[MAX])(y)`, or bind the element
-first.
+rule misreads an index that is itself type-shaped: a SCREAMING_CASE constant
+or an enum variant indexing a field of closures, `t.items[MAX](y)` or
+`t.handlers[Kind.Click](ev)`. The checker names the repair (E209), which is to
+group the index, `(t.items[MAX])(y)`, or bind the element first.
 
-## a generic that never stops
+## A generic that never stops
 
 A generic that calls itself at a larger type (`grow(x)` calling `grow([x])`)
 asks for `T`, then `List[T]`, then `List[List[T]]`. The queue refuses a

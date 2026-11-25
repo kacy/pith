@@ -1,17 +1,16 @@
-# pith
+# Pith
 
 [![ci](https://github.com/kacy/pith/actions/workflows/ci.yml/badge.svg)](https://github.com/kacy/pith/actions/workflows/ci.yml)
 [![license: mit](https://img.shields.io/badge/license-mit-blue.svg)](LICENSE)
 
-a small language for writing servers. python-shaped syntax, native
-binaries, result types instead of exceptions, reference counting
-instead of a garbage collector, and memory safe across tasks: the
-compiler refuses a program that would let two tasks change one
-buffer. the compiler is written in pith, and so is the standard
-library: the tls 1.2 and 1.3 protocol, the http/2
-client and server, the postgres and mysql wire protocols, the regex
-engine, gzip. when something goes wrong in the stack, you can read the
-code that did it.
+Pith is a small language for writing servers, with Python-shaped syntax,
+native binaries, result types instead of exceptions, reference counting
+instead of a garbage collector, and memory safety across tasks: the
+compiler refuses a program that would let two tasks change one buffer.
+The compiler is written in Pith, and so is the standard library,
+including the TLS 1.2 and 1.3 protocol, the HTTP/2 client and server,
+the Postgres and MySQL wire protocols, the regex engine and gzip. When
+something goes wrong in the stack, you can read the code that did it.
 
 ```pith
 import std.web as web
@@ -27,19 +26,19 @@ fn main() -> Int!:
     return app.listen("0.0.0.0", 8080)!
 ```
 
-that is a complete http server, and it comes with more than it shows.
-every route is already wrapped in a trace span and red metrics; an
-inbound `traceparent` joins the caller's trace, `GET /metrics` serves
-prometheus text, and one `obs.init()` call ships spans and metrics to
-an opentelemetry collector. `listen_tls` negotiates http/2 or http/1.1
-over tls 1.2 and 1.3, one `shutdown.on_signals()` call makes a sigterm
-drain in-flight requests before the process exits, and rate limiting,
-circuit breaking, sessions, csrf and
-cors are middleware you add one line at a time. no dependencies, one
-static binary, and all of it is standard library you can read
+That is a complete HTTP server. Every route is already wrapped in a
+trace span and RED metrics. An inbound `traceparent` joins the caller's
+trace, `GET /metrics` serves Prometheus text, and one `obs.init()` call
+ships spans and metrics to an OpenTelemetry collector. `listen_tls`
+negotiates HTTP/2 or HTTP/1.1 over TLS 1.2 and 1.3, and one
+`shutdown.on_signals()` call makes a SIGTERM drain in-flight requests
+before the process exits. Rate limiting, circuit breaking, sessions,
+CSRF and CORS are middleware you add one line at a time. There are no
+dependencies, the program builds to one static binary, and all of it is
+standard library code you can read
 ([docs/web.md](docs/web.md), [docs/telemetry.md](docs/telemetry.md)).
 
-## the language in one file
+## The language in one file
 
 ```pith
 enum Shape:
@@ -72,171 +71,173 @@ fn main() -> Int!:
     return 0
 ```
 
-enums carry payloads and `match` takes them apart. errors are values:
-`T!` is a result, `fail` makes one, `!` passes it up, `catch` supplies
-a fallback. a function that cannot fail cannot pretend otherwise.
-interpolation takes format specs. there is no null and there are no
-exceptions. an out-of-range index or a missing map key propagates as
-an error inside a `T!` or `T!String` function and stops the process
-elsewhere. integer arithmetic traps on overflow at every width, and so
-do integer conversions, `abs`, `Float.to_int` and shift counts outside
-0 to 63; the `wrapping_*` methods opt out
+Enums carry payloads, and `match` takes them apart. Errors are values:
+`T!` is a result, `fail` makes one, `!` passes it up, and `catch`
+supplies a fallback. A function that cannot fail cannot pretend
+otherwise. Interpolation takes format specs. There is no null and there
+are no exceptions. An out-of-range index or a missing map key
+propagates as an error inside a `T!` or `T!String` function and stops
+the process elsewhere. Integer arithmetic traps on overflow at every
+width, and so do integer conversions, `abs`, `Float.to_int` and shift
+counts outside 0 to 63. The `wrapping_*` methods opt out
 ([docs/numbers.md](docs/numbers.md)).
 
-## why you might want it
+## Why you might want it
 
-**the whole stack is readable.** 134 standard library modules, 51,000
-lines of pith: the tls implementation, http/1.1 and http/2,
-websockets, grpc, the database wire protocols, json, toml, yaml,
-compression, hashing, a linear-time regex engine. when the language
-could not express something well, that became a language feature to
-build rather than a foreign library to hide behind. the exceptions
-live in the rust runtime: the cryptographic primitives (aead ciphers,
-key exchange, signatures) come from the `ring` crate, zstd links the
-reference libzstd, and a few hot loops such as the sha block functions
-have native versions.
+**The whole stack is readable.** The standard library is 134 modules
+and 51,000 lines of Pith: the TLS implementation, HTTP/1.1 and HTTP/2,
+WebSockets, gRPC, the database wire protocols, JSON, TOML, YAML,
+compression, hashing and a linear-time regex engine. When the language
+could not express something well, the project added a language feature
+instead of wrapping a foreign library. The exceptions are in the Rust
+runtime: the cryptographic primitives (AEAD ciphers, key exchange,
+signatures) come from the `ring` crate, zstd links the reference
+libzstd, and a few hot loops such as the SHA block functions have
+native versions.
 
-**it compiles itself, and ci proves it.** the lexer, parser, checker,
-formatter, linter, language server and ir emitter are pith. the build
-reaches a fixed point: the compiler compiles a compiler that compiles
-an identical compiler, verified on every merge.
+**It compiles itself, and CI checks it.** The lexer, parser, checker,
+formatter, linter, language server and IR emitter are written in Pith.
+The build reaches a fixed point: the compiler compiles a compiler that
+compiles an identical compiler, and CI verifies this on every merge.
 
-**errors are data.** `T!E` carries a typed payload when callers need
+**Errors are data.** `T!E` carries a typed payload when callers need
 to inspect a failure, and `defer` / `errdefer` run cleanup on every
-exit or only the failing one. see [docs/errors.md](docs/errors.md) and
-[docs/defer.md](docs/defer.md).
+exit or only on the failing one. See [docs/errors.md](docs/errors.md)
+and [docs/defer.md](docs/defer.md).
 
-**one bad request does not take down the server.** a runtime error
-inside an http or grpc handler, such as an out-of-range index, a
+**One bad request does not take down the server.** A runtime error
+inside an HTTP or gRPC handler, such as an out-of-range index, a
 missing map key, a division by zero or an integer overflow, fails that
-request with a 500 (`INTERNAL` for grpc) and the server keeps serving.
-a stack overflow still ends the process, and so does a runtime error
+request with a 500 (`INTERNAL` for gRPC), and the server keeps serving.
+A stack overflow still ends the process, and so does a runtime error
 in a task the handler spawned
 ([docs/failure_isolation.md](docs/failure_isolation.md)).
 
-**memory is managed at compile time.** the compiler emits retain and
+**Memory is managed at compile time.** The compiler emits retain and
 release pairs under a borrowed-by-default discipline
-([docs/ownership.md](docs/ownership.md)), so there are no gc pauses and
-no runtime to tune. a struct graph breaks its own cycles with a `weak`
-field. a checker in ci follows every retain and release the compiler
+([docs/ownership.md](docs/ownership.md)), so there are no GC pauses and
+no runtime to tune. A struct graph breaks its own cycles with a `weak`
+field. A checker in CI follows every retain and release the compiler
 emits and fails the build when a function's counts do not balance on
-every path. over the test corpus it proves over 99% of functions balanced and
-leaves the rest undecided ([docs/ir-contract.md](docs/ir-contract.md)).
-valgrind and leak-growth gates also run on every merge, and asan and tsan run
-nightly ([docs/testing.md](docs/testing.md)).
+every path. Over the test corpus it proves over 99% of functions
+balanced and leaves the rest undecided
+([docs/ir-contract.md](docs/ir-contract.md)). Valgrind and leak-growth
+checks also run on every merge, and ASan and TSan run nightly
+([docs/testing.md](docs/testing.md)).
 
-**concurrency is structured, and green by default.** `spawn` and
-`await` with `Task[T]`, channels, `select`, mutexes, wait groups,
-contexts and timers, on an m:n green runtime with an epoll reactor
-([docs/concurrency.md](docs/concurrency.md)). the os-thread backend is
-one environment variable away.
+**Concurrency is structured, and green by default.** Pith has `spawn`
+and `await` with `Task[T]`, channels, `select`, mutexes, wait groups,
+contexts and timers, on an M:N green runtime with an epoll reactor
+([docs/concurrency.md](docs/concurrency.md)). One environment variable
+switches to the OS-thread backend.
 
-**shared state needs its lock, and the compiler checks.** a `guard`
+**Shared state needs its lock, and the compiler checks.** A `guard`
 block ties a mutex to the data it protects, and touching that data
-outside a `locked` block on that mutex is a compile error. so is a
-mutable global, in a program that spawns, that is neither guarded nor
-`threadlocal`, and so is a spawn or channel send that would leave a
-collection reachable from two tasks. `pith lint` reports a call that
-parks while holding a mutex, two mutexes taken in opposite orders, and a
-call that retakes a mutex its caller holds
+outside a `locked` block on that mutex is a compile error. In a program
+that spawns, a mutable global that is neither guarded nor `threadlocal`
+is also a compile error, and so is a spawn or channel send that would
+leave a collection reachable from two tasks. `pith lint` reports a call
+that parks while holding a mutex, two mutexes taken in opposite orders,
+and a call that retakes a mutex its caller holds
 ([docs/concurrency.md](docs/concurrency.md)).
 
-**the tooling talks json.** `check`, `lint` and `doc` all take
+**The tooling speaks JSON.** `check`, `lint` and `doc` all take
 `--json`, every diagnostic has a stable code, `fmt` has one canonical
-style, and `pith lsp` speaks the language server protocol to neovim or
-vs code ([docs/editors.md](docs/editors.md)).
+style, and `pith lsp` speaks the Language Server Protocol to Neovim or
+VS Code ([docs/editors.md](docs/editors.md)).
 
-**builds are fast.** on the benchmark machine below, hello world
-compiles in about 40 ms, the http benchmark server in about 1.6
+**Builds are fast.** On the benchmark machine below, hello world
+compiles in about 40 ms, the HTTP benchmark server in about 1.6
 seconds, and the entire self-hosted compiler in about 1.3.
 
-## the numbers
+## The numbers
 
-measured 2026-11-12 on a ryzen 9 9950x, every language pinned to the same
-eight cores, against go 1.27 and rust 1.99 ports that do the same work and
-print the same checksums. the full tables, one row per benchmark, are in
-[bench/README.md](bench/README.md); the history and the profiling behind
+These numbers were measured on 2026-11-12 on a Ryzen 9 9950X, with every
+language pinned to the same eight cores. The Go 1.27 and Rust 1.99 ports
+do the same work and print the same checksums. The full tables, one row per benchmark, are in
+[bench/README.md](bench/README.md). The history and the profiling behind
 them are in [docs/performance.md](docs/performance.md).
 
-| workload | pith | go | rust |
+| Workload | Pith | Go | Rust |
 |---|---:|---:|---:|
-| json decode, 20M small objects | **710 ms** | 3523 ms | 1118 ms |
-| substring search | **45 ms** | 221 ms | 220 ms |
-| channel fan-out, 1M messages | **40 ms** | 49 ms | 465 ms |
-| event ledger, 200k events (json, collections, crypto) | 65 ms | 95 ms | 51 ms |
-| sort 100k ints, 30 rounds | 300 ms | 504 ms | 59 ms |
-| csv encode | 224 ms | 309 ms | 131 ms |
-| error handling through closures | 289 ms | 182 ms | 163 ms |
-| sha256, 256 MB | 110 ms | 95 ms | 97 ms |
-| http server at 256 connections, req/s | 1.92M | 2.23M (minimal), 1.00M (net/http) | 1.74M (hyper) |
-| api gateway, plain forwarding at 64 / 1024 connections, req/s | **473k / 474k** | 283k / 346k (net/http) | no port |
+| JSON decode, 20M small objects | **710 ms** | 3523 ms | 1118 ms |
+| Substring search | **45 ms** | 221 ms | 220 ms |
+| Channel fan-out, 1M messages | **40 ms** | 49 ms | 465 ms |
+| Event ledger, 200k events (JSON, collections, crypto) | 65 ms | 95 ms | 51 ms |
+| Sort 100k ints, 30 rounds | 300 ms | 504 ms | 59 ms |
+| CSV encode | 224 ms | 309 ms | 131 ms |
+| Error handling through closures | 289 ms | 182 ms | 163 ms |
+| SHA-256, 256 MB | 110 ms | 95 ms | 97 ms |
+| HTTP server at 256 connections, req/s | 1.92M | 2.23M (minimal), 1.00M (net/http) | 1.74M (hyper) |
+| API gateway, plain forwarding at 64 / 1024 connections, req/s | **473k / 474k** | 283k / 346k (net/http) | No port |
 
-- pith is faster than go on json decoding, text search, the event ledger
-  and catalog workloads, csv encoding, map updates, int sorting, channels,
-  spawning and parallel compute. it is faster than rust on half the json shapes, text search,
-  channels, task churn and grpc calls. its http server handles more
-  requests per second than hyper up to 256 connections, and has the lowest
-  p99 latency of every go and rust server measured at every connection
-  count.
+- Pith is faster than Go on JSON decoding, text search, the event ledger
+  and catalog workloads, CSV encoding, map updates, int sorting, channels,
+  spawning and parallel compute. It is faster than Rust on half the JSON
+  shapes, text search, channels, task churn and gRPC calls. Its HTTP server
+  handles more requests per second than hyper up to 256 connections, and
+  has the lowest p99 latency of every Go and Rust server measured at every
+  connection count.
 - `examples/gateway`, a reverse proxy with auth, retries and a circuit
   breaker, forwards 1.2 to 1.7x as many requests per second as the same
-  gateway in go's net/http, with a p99 3.6 to 5.7x lower and 40 to 70% less
-  memory. with es256 tokens to check, the two are level at 256 and 1024
+  gateway in Go's net/http, with a p99 3.6 to 5.7x lower and 40 to 70% less
+  memory. With ES256 tokens to check, the two are level at 256 and 1024
   connections.
-- go is ahead on closures, reference cycles, task scheduling, concurrent
-  grpc calls and raw http throughput against a minimal server.
-- rust is ahead on most single-threaded compute, mostly by 1.3x to 5.6x.
-  the outlier is walking decoded json (6.0x).
+- Go is ahead on closures, reference cycles, task scheduling, concurrent
+  gRPC calls and raw HTTP throughput against a minimal server.
+- Rust is ahead on most single-threaded compute, mostly by 1.3x to 5.6x.
+  The outlier is walking decoded JSON (6.0x).
 
-these come from one machine, with clients and servers on the same box over
-loopback. the gateway has no rust port. one change behind its numbers makes
-a mutex wait longer when cpu-bound tasks share its worker.
+These numbers come from one machine, with clients and servers on the same
+box over loopback. The gateway has no Rust port. One change behind its
+numbers makes a mutex wait longer when CPU-bound tasks share its worker.
 [examples/gateway/README.md](examples/gateway/README.md)
 has the details.
 
-## what it does not do
+## What it does not do
 
-the current list lives in [docs/limitations.md](docs/limitations.md),
-kept current with the compiler and carrying issue numbers for the
-open defects. the ones to know before you start:
+The current list is in [docs/limitations.md](docs/limitations.md),
+which is kept current with the compiler and gives issue numbers for the
+open defects. These are the ones to know before you start:
 
-- a strong reference cycle with no `weak` edge leaks. an opt-in
+- A strong reference cycle with no `weak` edge leaks. An opt-in
   trial-deletion collector exists behind `PITH_CYCLE_GC`, off by default.
-- tls 1.2 is a fallback: ecdhe with aead suites only, and no session
-  resumption. client certificates work on both versions. 1.3 is the full
-  implementation, and `require_tls13()` refuses the fallback.
-- no package registry. dependencies are local paths in `pith.toml`,
-  with `lock` and `install` but nothing that fetches.
-- no debugger, and a runtime error prints its message without a stack
-  trace.
+- TLS 1.2 is a fallback: ECDHE with AEAD suites only, and no session
+  resumption. Client certificates work on both versions. TLS 1.3 is the
+  full implementation, and `require_tls13()` refuses the fallback.
+- There is no package registry. Dependencies are local paths in
+  `pith.toml`, with `lock` and `install` but nothing that fetches.
+- There is no debugger, and a runtime error prints its message without a
+  stack trace.
 - `.value()` on a `none` propagates as an error inside a `T!` or `T!String`
-  function and stops the program elsewhere; use `if let`, `match` or `unwrap_or`
-  when the optional can be empty.
-- gzip compresses with fixed huffman only, and the regex engine leaves
-  out backreferences, lazy quantifiers and lookaround on purpose. compile
-  refuses them with an error that names the feature.
+  function and stops the program elsewhere. Use `if let`, `match` or
+  `unwrap_or` when the optional can be empty.
+- Gzip compresses with fixed Huffman codes only, and the regex engine
+  leaves out backreferences, lazy quantifiers and lookaround on purpose.
+  Compiling a pattern that uses one fails with an error that names the
+  feature.
 
-## install
+## Install
 
 ```
 curl -fsSL https://pithlang.com/install.sh | sh
 ```
 
-the script installs the toolchain in `~/.pith` and prints the line to add
-to your `PATH`. set `PITH_HOME` to install somewhere else, or
-`PITH_VERSION` to pin a release such as `v0.2.12`. prebuilt toolchains
-cover linux and macos on x86_64 and arm64. pith links each program with
-the system c compiler, so you also need `cc`: the xcode command line tools
-on macos, gcc or clang on linux.
+The script installs the toolchain in `~/.pith` and prints the line to add
+to your `PATH`. Set `PITH_HOME` to install somewhere else, or
+`PITH_VERSION` to pin a release such as `v0.2.12`. Prebuilt toolchains
+cover Linux and macOS on x86_64 and arm64. Pith links each program with
+the system C compiler, so you also need `cc`: the Xcode command line tools
+on macOS, or GCC or Clang on Linux.
 
 ```
 printf 'fn main():\n    print("hello")\n' > hello.pith
 pith run hello.pith
 ```
 
-## build from source
+## Build from source
 
-you need [rust and cargo](https://rustup.rs/) for the native backend.
+You need [Rust and Cargo](https://rustup.rs/) for the native backend.
 
 ```
 cargo build --release
@@ -253,62 +254,62 @@ compiler (`check`, `fmt`, `lint`, `doc`, `lsp`, `new`, `package`):
 ./self-host/pith_main check examples/hello.pith
 ```
 
-the first build compiles the ir driver from a tracked seed at
-`self-host/bootstrap/ir_driver.ir`, which is what breaks the circular
-dependency of a compiler written in its own language. after that
+The first build compiles the IR driver from a tracked seed at
+`self-host/bootstrap/ir_driver.ir`. The seed breaks the circular
+dependency of a compiler written in its own language. After that,
 everything rebuilds from source.
 
-## the standard library
+## The standard library
 
-134 modules, all pith. the areas, with the doc that goes deepest:
+The standard library has 134 modules, all written in Pith. The table
+lists the areas, each with the doc that covers it in the most depth:
 
-| area | modules | read |
+| Area | Modules | Read |
 |---|---|---|
-| networking | tcp, unix, dns, url, http, http2, websocket, tls, sse, grpc, socks5 | [tls](docs/tls.md), [grpc](docs/grpc.md), [web](docs/web.md) |
-| databases | sql, postgres, mysql, redis, and `db` on top | [db](docs/db.md) |
-| web apps | web: routing, middleware, sessions, csrf, cors, markdown pages | [http apps](docs/http_apps.md) |
-| data | json, toml, yaml, csv, config, table | [yaml](docs/yaml.md) |
-| exact numbers | bigint, decimal | [numbers](docs/numbers.md) |
-| bytes and crypto | hash, checksum, encoding, crypto, bits, binary | [auth](docs/auth.md) |
-| compression | gzip, zlib, zstd, tar, zip | |
-| text | regex, scanner, fmt, html, template, markdown, text, strings | [unicode](docs/unicode.md), [html](docs/html.md), [markdown](docs/markdown.md) |
-| i18n | locales, message catalogs, cldr plural rules | [i18n](docs/i18n.md) |
-| app plumbing | log, metrics, cli, env, testing, time, datetime, rand, uuid, math | [logging](docs/logging.md) |
-| resilience | retry, rate limiting, circuit breaking | [resilience](docs/resilience.md) |
-| observability | trace, prometheus, otlp, obs | [telemetry](docs/telemetry.md) |
-| terminals | term: raw mode, input, styling, widgets, an elm-style runtime | [tui](docs/tui.md) |
-| concurrency | concurrent: contexts, groups, timers; iter for lazy pipelines | [concurrency](docs/concurrency.md) |
+| Networking | tcp, unix, dns, url, http, http2, websocket, tls, sse, grpc, socks5 | [TLS](docs/tls.md), [gRPC](docs/grpc.md), [web](docs/web.md) |
+| Databases | sql, postgres, mysql, redis, and `db` on top | [db](docs/db.md) |
+| Web apps | web: routing, middleware, sessions, CSRF, CORS, Markdown pages | [HTTP apps](docs/http_apps.md) |
+| Data | json, toml, yaml, csv, config, table | [YAML](docs/yaml.md) |
+| Exact numbers | bigint, decimal | [numbers](docs/numbers.md) |
+| Bytes and crypto | hash, checksum, encoding, crypto, bits, binary | [auth](docs/auth.md) |
+| Compression | gzip, zlib, zstd, tar, zip | |
+| Text | regex, scanner, fmt, html, template, markdown, text, strings | [Unicode](docs/unicode.md), [HTML](docs/html.md), [Markdown](docs/markdown.md) |
+| i18n | Locales, message catalogs, CLDR plural rules | [i18n](docs/i18n.md) |
+| App plumbing | log, metrics, cli, env, testing, time, datetime, rand, uuid, math | [logging](docs/logging.md) |
+| Resilience | Retry, rate limiting, circuit breaking | [resilience](docs/resilience.md) |
+| Observability | trace, prometheus, otlp, obs | [telemetry](docs/telemetry.md) |
+| Terminals | term: raw mode, input, styling, widgets, an Elm-style runtime | [TUI](docs/tui.md) |
+| Concurrency | concurrent: contexts, groups, timers; iter for lazy pipelines | [concurrency](docs/concurrency.md) |
 
-the stdlib reference site is generated from the source comments, so
-what you read there is what the compiler read.
+The stdlib reference site is generated from the source comments, so it
+documents the same source the compiler reads.
 
-## proof it is usable
+## Proof it is usable
 
-real programs live in `tools/` and run against golden output or integration
-suites in ci: `purl` (a `curl`-compatible http/1.1 and http/2 client), a
-static site generator, a web log analyzer, a json api client talking
-to a pith http server, a worker pool over spawn and channels, the
+Real programs in `tools/` run against golden output or integration
+suites in CI: `purl` (a `curl`-compatible HTTP/1.1 and HTTP/2 client), a
+static site generator, a web log analyzer, a JSON API client talking
+to a Pith HTTP server, a worker pool over spawn and channels, the
 protobuf code generator, and the documentation site generator that
-builds the stdlib reference. they are the answer to "what does
-non-trivial pith look like."
+builds the stdlib reference. They show what non-trivial Pith looks like.
 
-## cli
+## CLI
 
-| command | what it does |
+| Command | What it does |
 |---|---|
-| `pith run <file>` | compile and run |
-| `pith build <file>` | compile to a native binary |
-| `pith test <file>` | run `test` blocks; `--filter <substr>` and `--tag <name>` select, `--json` reports records |
-| `pith check <file>` | type check; `--json` for machine output |
-| `pith fmt <file>` | format; `--check` to verify |
-| `pith lint <file>` | conventions; `--json` available |
-| `pith doc <file>` | api docs; `--check` requires every pub item documented, or that a `.md` file's pith code type checks |
-| `pith doc <topic>` | show a guide from `docs/` in the terminal, such as `pith doc markdown` |
-| `pith lsp` | language server over stdio |
-| `pith new <dir>` | scaffold a package |
+| `pith run <file>` | Compile and run |
+| `pith build <file>` | Compile to a native binary |
+| `pith test <file>` | Run `test` blocks; `--filter <substr>` and `--tag <name>` select, `--json` reports records |
+| `pith check <file>` | Type check; `--json` for machine output |
+| `pith fmt <file>` | Format; `--check` to verify |
+| `pith lint <file>` | Conventions; `--json` available |
+| `pith doc <file>` | API docs; `--check` requires every pub item documented, or that a `.md` file's Pith code type checks |
+| `pith doc <topic>` | Show a guide from `docs/` in the terminal, such as `pith doc markdown` |
+| `pith lsp` | Language server over stdio |
+| `pith new <dir>` | Scaffold a package |
 | `pith package <cmd>` | check, test, lint, doc, deps, lock, install, inspect, context |
 
-local packages resolve through `pith.toml`:
+Local packages resolve through `pith.toml`:
 
 ```toml
 [dependencies]
@@ -319,7 +320,7 @@ greeter = { path = "../greeter" }
 from greeter import greet
 ```
 
-## building and testing
+## Building and testing
 
 ```
 make build            # native backend
@@ -329,7 +330,7 @@ make run-examples     # 128 deterministic example programs against snapshots
 make status-audit     # current corpus and size numbers
 ```
 
-## project layout
+## Project layout
 
 ```
 self-host/     the compiler, in pith: lexer, parser, checker,
@@ -345,17 +346,18 @@ docs/          architecture, ownership, errors, grammar, limitations
 ```
 
 `make status-audit` prints line counts, with comments and blank lines
-excluded. start with [docs/architecture.md](docs/architecture.md) to
-change the compiler, [docs/contributing.md](docs/contributing.md) for
-the development loop, and [docs/testing.md](docs/testing.md) for how
-tests are written and run.
+excluded. To change the compiler, start with
+[docs/architecture.md](docs/architecture.md). Read
+[docs/contributing.md](docs/contributing.md) for the development loop,
+and [docs/testing.md](docs/testing.md) for how tests are written and
+run.
 
-## syntax highlighting on github
+## Syntax highlighting on GitHub
 
-`.pith` files map to python highlighting via `.gitattributes` as a
-stopgap. the textmate grammar and the linguist submission checklist
-live in `tooling/highlighting/`.
+`.pith` files map to Python highlighting through `.gitattributes` as a
+stopgap. The TextMate grammar and the Linguist submission checklist
+are in `tooling/highlighting/`.
 
-## license
+## License
 
-mit
+MIT

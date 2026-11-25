@@ -1,6 +1,6 @@
-# pith -> github-linguist PR checklist
+# Pith -> github-linguist PR checklist
 
-## 1) fork and branch
+## 1) Fork and branch
 
 ```bash
 git clone https://github.com/<your-user>/linguist.git
@@ -10,28 +10,28 @@ git fetch upstream
 git checkout -b pith-language upstream/main
 ```
 
-## 2) add pith language metadata
+## 2) Add Pith language metadata
 
-- update `lib/linguist/languages.yml` with the entry from `languages.yml.snippet.yml`
+- Update `lib/linguist/languages.yml` with the entry from `languages.yml.snippet.yml`
 
-## 3) add grammar
+## 3) Add grammar
 
-- add `grammars/pith.tmLanguage.json` (or the exact grammar location expected by linguist)
-- ensure grammar scope is `source.pith`
+- Add `grammars/pith.tmLanguage.json` (or the exact grammar location expected by Linguist)
+- Ensure the grammar scope is `source.pith`
 
-## 4) add samples
+## 4) Add samples
 
-- add representative files under `samples/Pith/`
-- include declarations, interpolation, generics, match, impl/interface, and indentation blocks
+- Add representative files under `samples/Pith/`
+- Include declarations, interpolation, generics, match, impl/interface, and indentation blocks
 
-## 5) run local checks in linguist
+## 5) Run local checks in Linguist
 
-- run linguist test suite commands expected by the repo
-- verify `.pith` resolves to pith in local linguist output
+- Run the Linguist test suite commands the repo expects
+- Verify that `.pith` resolves to Pith in local Linguist output
 
-## 6) open PR
+## 6) Open PR
 
-include:
-- concise language rationale
-- link to pith repo and language docs
-- note that `.pith` is currently mapped as a temporary workaround in the pith repo
+Include:
+- A concise language rationale
+- A link to the Pith repo and language docs
+- A note that `.pith` is currently mapped as a temporary workaround in the Pith repo

@@ -1,7 +1,7 @@
-# structured logging
+# Structured logging
 
-`std.log` is the blessed logging layer for pith programs. it keeps the old
-simple helpers, but the main path for application code is now a structured
+`std.log` is the recommended logging layer for Pith programs. It keeps the old
+simple helpers, and the main path for application code is now a structured
 logger with typed fields.
 
 ```pith
@@ -12,9 +12,9 @@ logger := log.root().with([log.str("service", "api")]).target("http").json()
 logger.info().str("route", "/health").int("status", 200).duration_ms("elapsed_ms", 4).msg("request complete")
 ```
 
-## compatibility
+## Compatibility
 
-the existing global helpers still work:
+The existing global helpers still work:
 
 ```pith
 log.info("started")
@@ -22,12 +22,12 @@ log.warn_kv("cache miss", "key=user:1")
 log.set_level(log.warn_level())
 ```
 
-console output stays the default so local tools remain easy to read. use
-`log.set_json()` globally or `log.root().json()` for newline-delimited json.
+Console output stays the default so local tools remain easy to read. Use
+`log.set_json()` globally or `log.root().json()` for newline-delimited JSON.
 
-## fields and context
+## Fields and context
 
-use typed field constructors instead of formatting key/value strings by hand:
+Use typed field constructors instead of formatting key/value strings by hand:
 
 - `log.str(key, value)`
 - `log.int(key, value)`
@@ -36,20 +36,19 @@ use typed field constructors instead of formatting key/value strings by hand:
 - `log.err(value)`
 - `log.duration_ms(key, value)`
 
-`logger.with(fields)` returns a child logger with context fields. event fields
+`logger.with(fields)` returns a child logger with context fields. Event fields
 are added fluently before `msg(...)`.
 
-for generated ids, use:
+For generated IDs, use:
 
 - `log.new_trace_id()`
 - `log.new_span_id()`
 - `logger.with_new_trace()`
 - `logger.child_span()`
 
-that keeps trace ids compact and avoids every app inventing its own uuid
-formatting.
+These keep trace IDs compact, so no app has to invent its own UUID formatting.
 
-## metrics
+## Metrics
 
 `std.metrics` is the matching in-memory metrics layer for apps and tools.
 
@@ -65,14 +64,14 @@ latency.observe(12.0)
 print(metrics.snapshot_text())
 ```
 
-the text snapshot is stable and readable enough for tests, local tools, and
+The text snapshot is stable, and readable enough for tests, local tools and
 simple export paths.
 
-## otel-ready shape
+## OTel-ready shape
 
-json logs intentionally keep stable mapping points for otel log records:
+JSON logs keep stable mapping points for OTel log records:
 
-- `time` maps to otel `Timestamp`
+- `time` maps to OTel `Timestamp`
 - `level` maps to `SeverityText`
 - `severity` maps to `SeverityNumber`
 - `message` maps to `Body`
@@ -80,4 +79,4 @@ json logs intentionally keep stable mapping points for otel log records:
 - `trace_id` and `span_id` map to trace context fields
 
 `std.otlp` exports traces and metrics but not log records, so nothing sends
-this shape to a collector yet. see [telemetry.md](telemetry.md).
+this shape to a collector yet. See [telemetry.md](telemetry.md).

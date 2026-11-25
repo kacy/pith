@@ -1,32 +1,31 @@
 # fuzz
 
-an adversarial harness that feeds the frontend programs it never
-asked for and checks that it always answers loudly.
+The fuzzer is an adversarial harness that feeds the compiler frontend
+programs it never asked for and checks that it always answers loudly.
 
-the fuzzer is itself a pith program (`fuzz.pith` drives it,
-`fuzz_gen.pith` builds and mutates the inputs). it leans on the
-compiler's loud-failure gates: because a healthy compiler never exits
-silently, "the compiler said nothing" is a reliable signal that
-something is wrong.
+It is itself a Pith program (`fuzz.pith` drives it, `fuzz_gen.pith`
+builds and mutates the inputs). It relies on the compiler's loud-failure
+gates: a healthy compiler never exits silently, so "the compiler said
+nothing" is a reliable signal that something is wrong.
 
-## the three oracles
+## The three oracles
 
-1. **it never goes quiet.** for any input, `check` exits 0 or 1 with a
-   message. a crash, a hang, or an empty-handed exit is a bug.
-2. **formatting is a fixed point.** anything that checks clean formats
+1. **It never goes quiet.** For any input, `check` exits 0 or 1 with a
+   message. A crash, a hang, or an exit with no message is a bug.
+2. **Formatting is a fixed point.** Anything that checks clean formats
    idempotently, and the formatted output still checks clean.
-3. **checked means buildable.** a program the checker accepts must
-   compile. a clean check followed by a failed build is a silent seam
-   — the class this harness exists to find.
+3. **Checked means buildable.** A program the checker accepts must
+   compile. A clean check followed by a failed build is a silent seam,
+   and this harness exists to find that class of bug.
 
-## running it
+## Running it
 
 ```
 make fuzz-check     # generated + mutated corpus, fixed seed, deterministic (ci gate)
 make fuzz           # generated + corpus mutation, wider net
 ```
 
-direct, with options:
+To run it directly, with options:
 
 ```
 ./target/release/pith build tools/fuzz/fuzz.pith
@@ -34,20 +33,20 @@ direct, with options:
 ./tools/fuzz/fuzz --no-mutate          # skip the corpus-mutation pass
 ```
 
-findings are written to `tools/fuzz/findings/` (gitignored) as the
-exact program that triggered them, ready to minimize.
+Findings are written to `tools/fuzz/findings/` (gitignored) as the exact
+program that triggered them, ready to minimize.
 
-## two halves
+## Two halves
 
-the **generated** half builds small programs from the grammar out.
-most don't type-check, which is fine — the point is that lex, parse,
-and check survive anything (with `fmt` and `build` exercised on programs
-that check clean). `make fuzz-check` runs both halves plus `tools/fuzz-tls`
-with a fixed seed.
+The **generated** half builds small programs from the grammar out. Most
+don't type-check, which is expected: the harness tests that lex, parse, and
+check survive anything (with `fmt` and `build` exercised on programs that
+check clean). `make fuzz-check` runs both halves plus `tools/fuzz-tls` with a
+fixed seed.
 
-the **mutation** half takes working programs from `tests/cases` and
-damages them the way a hasty edit might — dropping lines, splicing in
-stray punctuation, truncating mid-block. it first surfaced two
-silent-input gaps (a stray character dropped between valid tokens, an
-unresolvable import accepted quietly); with those closed it runs
-inside the gate too. `make fuzz` runs a wider, longer search on top.
+The **mutation** half takes working programs from `tests/cases` and damages
+them the way a hasty edit might: dropping lines, splicing in stray
+punctuation, truncating mid-block. It first surfaced two silent-input gaps (a
+stray character dropped between valid tokens, and an unresolvable import
+accepted quietly). With those closed, it runs inside the CI gate too.
+`make fuzz` runs a wider, longer search on top.

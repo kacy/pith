@@ -1,4 +1,4 @@
-# Native Backend Roadmap
+# Native backend roadmap
 
 This document was the execution plan for the Cranelift backend: what should
 stay Rust, what should move into Pith, and which language features would make
@@ -12,24 +12,24 @@ figures: it reports library code and test code separately for `self-host/`,
 `std/`, and `cranelift/`, with comments and blank lines excluded. For per-file
 Rust sizes, `wc -l` over `cranelift/*/src` answers the question directly.
 
-## Keep In Rust
+## Keep in Rust
 
 These should remain Rust for the foreseeable future:
 
 - Cranelift lowering and machine-code generation
-- object emission and linker integration
+- Object emission and linker integration
 - ARC and heap object management
-- string storage and FFI representation
-- list/map/set storage
+- String storage and FFI representation
+- List/map/set storage
 - OS, process, DNS, and socket syscalls
 
-The desired end state is not zero Rust. It is a thin Rust backend/runtime with
-the language, compiler policy, and most standard-library logic living in Pith.
+The desired end state keeps some Rust: a thin Rust backend/runtime with the
+language, compiler policy, and most standard-library logic living in Pith.
 TLS already follows that line: it lives in `std.net.tls`, `std.net.tls13`,
 `std.net.tls12`, and the Pith-side crypto helpers rather than in a Rust runtime
 module.
 
-## Migration Phases (done)
+## Migration phases (done)
 
 1. **Delete Rust-side backend guessing.** The IR is self-describing and the
    consumer trusts it. Calls carry an explicit return kind
@@ -59,7 +59,7 @@ See `cranelift/runtime/src/string.rs`.
 The compiler also reached a self-hosting fixed point, enforced by
 `make bootstrap-verify`.
 
-## Example Ergonomics
+## Example ergonomics
 
 The example corpus showed where the language read like ceremony. Status of each
 item:
@@ -83,10 +83,9 @@ item:
 
 ## Non-goals
 
-Do not try to:
+Do not try to do any of the following. Each would fight the architecture
+instead of tightening it.
 
-- rewrite Cranelift lowering in Pith
-- replace low-level runtime storage with Pith code
-- eliminate Rust entirely
-
-That would fight the architecture instead of tightening it.
+- Rewrite Cranelift lowering in Pith
+- Replace low-level runtime storage with Pith code
+- Eliminate Rust entirely

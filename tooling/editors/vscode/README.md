@@ -1,13 +1,13 @@
-# pith for vs code
+# Pith for VS Code
 
-syntax highlighting for `.pith` files plus a client for the pith
-language server: diagnostics, hover, document and workspace symbols,
-formatting, go-to-definition, references, completion, semantic tokens,
-signature help, inlay hints, rename, and code actions.
+This extension adds syntax highlighting for `.pith` files and a client for the
+Pith language server. The client supports diagnostics, hover, document and
+workspace symbols, formatting, go-to-definition, references, completion,
+semantic tokens, signature help, inlay hints, rename, and code actions.
 
-## running from source
+## Running from source
 
-there is no build step. install the one dependency, then launch vs code
+There is no build step. Install the one dependency, then launch VS Code
 with this directory as a development extension:
 
 ```
@@ -16,12 +16,12 @@ npm install
 code --extensionDevelopmentPath="$PWD" /path/to/your/pith/project
 ```
 
-open a `.pith` file and the extension activates, starting `pith lsp`
+Open a `.pith` file and the extension activates, starting `pith lsp`
 over stdio.
 
-## the server executable
+## The server executable
 
-the extension runs the `pith` binary from your PATH by default. if it
+The extension runs the `pith` binary from your PATH by default. If it
 lives somewhere else, point the `pith.serverPath` setting at it:
 
 ```json
@@ -30,9 +30,9 @@ lives somewhere else, point the `pith.serverPath` setting at it:
 }
 ```
 
-## troubleshooting
+## Troubleshooting
 
-the server logs to stderr, which vs code collects in the output panel:
-view -> output, then pick "Pith Language Server" from the dropdown. a
-spawn failure (wrong `pith.serverPath`, binary not executable) shows up
-there too.
+The server logs to stderr, which VS Code collects in the Output panel:
+choose View -> Output, then pick "Pith Language Server" from the dropdown. A
+spawn failure (a wrong `pith.serverPath`, or a binary that is not executable)
+shows up there too.

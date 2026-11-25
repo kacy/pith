@@ -1,22 +1,22 @@
-# architecture
+# Architecture
 
-## compiler map
+## Compiler map
 
-pith currently has one active compiler pipeline:
+Pith currently has one active compiler pipeline:
 
 - `self-host/`: the Pith frontend, tools, import resolution, checking, and IR emission
 - `cranelift/`: the Rust/Cranelift backend, runtime, object generation, and linking
 
-the active pipeline is:
+The active pipeline is:
 
-1. lex source text into tokens
-2. parse tokens into an AST
-3. type-check and resolve imports
-4. emit Pith text IR
-5. lower text IR to Cranelift IR
-6. emit an object file and link it with the Rust runtime using the system C compiler (`$CC`, defaulting to `cc`)
+1. Lex source text into tokens
+2. Parse tokens into an AST
+3. Type-check and resolve imports
+4. Emit Pith text IR
+5. Lower text IR to Cranelift IR
+6. Emit an object file and link it with the Rust runtime using the system C compiler (`$CC`, defaulting to `cc`)
 
-end to end, that is:
+End to end, that is:
 
 ```
 pith source (.pith)
@@ -29,97 +29,97 @@ pith source (.pith)
   -> native executable
 ```
 
-steps 1 through 4 are pith compiling pith: the frontend builds itself.
-`make bootstrap` rebuilds the compiler with the cranelift-compiled version of
-itself, and `make bootstrap-ir-checks` verifies the ir contract, its
-invariants, and that the emitted ir reaches a fixed point on the deterministic
+Steps 1 through 4 are Pith compiling Pith: the frontend builds itself.
+`make bootstrap` rebuilds the compiler with the Cranelift-compiled version of
+itself, and `make bootstrap-ir-checks` verifies the IR contract, its
+invariants, and that the emitted IR reaches a fixed point on the deterministic
 corpus.
 
-networking and protocol layers now live mostly in the Pith stdlib. that
+Networking and protocol layers now live mostly in the Pith stdlib. That
 includes `std.net.http`, `std.net.websocket`, and the native TLS stack (1.3 with a 1.2 fallback) in
 `std.net.tls` / `std.net.tls13` / `std.net.tls12`. Rust stays on the lower-level runtime side for
 storage, syscall-facing helpers, and the Cranelift backend.
 
-## ownership boundaries
+## Ownership boundaries
 
-- lexer/parser own syntax-only concerns and should never guess at types
-- checker owns name resolution, type resolution, imports, and diagnostics
+- The lexer and parser own syntax-only concerns and should never guess at types
+- The checker owns name resolution, type resolution, imports, and diagnostics
 - IR emission assumes checked input and focuses on stable text IR
 - CLI modules should only coordinate user-facing flows; they should not duplicate compiler setup
-- stdlib protocol layers should own wire semantics and user-facing behavior;
+- Stdlib protocol layers should own wire semantics and user-facing behavior;
   lower-level runtime code should stay boring and explicit
 
-if a change requires repeated lex/parse/check setup, it belongs in
+If a change requires repeated lex/parse/check setup, it belongs in
 `self-host/driver.pith` or the relevant self-hosted tool module.
-if a change only affects object output or linking, it belongs in `cranelift/`.
+If a change only affects object output or linking, it belongs in `cranelift/`.
 
-## change map
+## Change map
 
-### add a token or keyword
+### Add a token or keyword
 
-- the lexer: `std/pith/lexer.pith`. the compiler reads it through
+- The lexer: `std/pith/lexer.pith`. The compiler reads it through
   `self-host/lexer.pith`, and `std/pith/highlight.pith` colors code from it,
   so a new token kind may need a class there too
-- if syntax changes: update `docs/grammar.ebnf`
+- If syntax changes: update `docs/grammar.ebnf`
 
-### add syntax
+### Add syntax
 
-- parser: `self-host/parser.pith`
+- Parser: `self-host/parser.pith`
 - AST shape: `self-host/ast.pith`
-- examples/docs: add or update an example under `examples/`
+- Examples and docs: add or update an example under `examples/`
 
-### add or change a type rule
+### Add or change a type rule
 
-- self-hosted checker: `self-host/checker.pith`
-- diagnostics reference: `docs/errors.md` if a new stable code is introduced
+- Self-hosted checker: `self-host/checker.pith`
+- Diagnostics reference: `docs/errors.md` if a new stable code is introduced
 
-### add or change code generation
+### Add or change code generation
 
-- lowering engine (expressions, statements, ownership, function
+- Lowering engine (expressions, statements, ownership, function
   lifecycle): `self-host/ir_emitter_core.pith`
-- its satellites, each owning one concern, include `ir_builder` (output
+- Its satellites, each owning one concern, include `ir_builder` (output
   buffer and per-function state), `ir_alias_registry` (aliases,
   import renames, global kinds), `ir_struct_registry` and
   `ir_method_tables` (shapes and symbols), `ir_generics`
-  (declarations and specializations), `ir_decode_emit` (json/toml/
-  config decode calls), `ir_match_emit` (match lowering),
+  (declarations and specializations), `ir_decode_emit` (JSON/TOML/config
+  decode calls), `ir_match_emit` (match lowering), and
   `ir_call_emit` (call/label wrappers)
-- the satellites never import the core back; where one needs an
-  expression emitted in place it takes the emitter as an explicit
+- The satellites never import the core back. Where one needs an
+  expression emitted in place, it takes the emitter as an explicit
   fn-value parameter (grep for `emit_expr`)
 - IR driver: `self-host/ir_driver.pith`
-- Cranelift lowering: `cranelift/codegen/src/ir_consumer.rs` (the ir
+- Cranelift lowering: `cranelift/codegen/src/ir_consumer.rs` (the IR
   instruction format is specified in [ir-contract.md](ir-contract.md), which
   is authoritative for both sides)
-- runtime support: `cranelift/runtime/src/` if native code needs new helpers
+- Runtime support: `cranelift/runtime/src/` if native code needs new helpers
 
-### add or change tls or protocol behavior
+### Add or change TLS or protocol behavior
 
 - Pith stdlib protocol logic: `std/net/tls.pith`, `std/net/tls13.pith`, `std/net/tls12.pith`, `std/net/http.pith`, `std/net/http2/*.pith`, `std/net/grpc.pith`, `std/net/websocket.pith`
-- crypto helpers used by tls: `std/crypto/*.pith`
-- only add Rust runtime support when the stdlib truly needs a new low-level primitive
+- Crypto helpers used by TLS: `std/crypto/*.pith`
+- Add Rust runtime support only when the stdlib truly needs a new low-level primitive
 
-### change CLI behavior
+### Change CLI behavior
 
-- self-hosted CLI: `self-host/pith_main.pith`
-- native backend CLI: `cranelift/cli/src/main.rs`
+- Self-hosted CLI: `self-host/pith_main.pith`
+- Native backend CLI: `cranelift/cli/src/main.rs`
 
-### change language server behavior
+### Change language server behavior
 
-- server loop and routing: `self-host/lsp_server.pith`
-- documents and position conversion: `self-host/lsp_state.pith`
-- diagnostics, hover, symbols, formatting, code actions: `self-host/lsp_features.pith`
-- definition, references, completion, rename: `self-host/lsp_navigation.pith`
-- semantic tokens, signature help, inlay hints: `self-host/lsp_tokens.pith`
-- framing and json-rpc envelope: `std/lsp/transport.pith`, `std/lsp/protocol.pith`
+- Server loop and routing: `self-host/lsp_server.pith`
+- Documents and position conversion: `self-host/lsp_state.pith`
+- Diagnostics, hover, symbols, formatting, code actions: `self-host/lsp_features.pith`
+- Definition, references, completion, rename: `self-host/lsp_navigation.pith`
+- Semantic tokens, signature help, inlay hints: `self-host/lsp_tokens.pith`
+- Framing and JSON-RPC envelope: `std/lsp/transport.pith`, `std/lsp/protocol.pith`
 
-## mental model for new contributors
+## Mental model for new contributors
 
-start at the CLI entrypoint, then follow one command end to end:
+Start at the CLI entry point, then follow one command end to end:
 
 1. `cranelift/cli/src/main.rs`
 2. `self-host/pith_main.pith`
 3. `self-host/driver.pith`
 4. `self-host/checker.pith`
 
-that path shows most of the compiler lifecycle with minimal generated-output noise.
+That path shows most of the compiler lifecycle with minimal generated-output noise.

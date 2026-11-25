@@ -1,25 +1,25 @@
-# text and bytes
+# Text and bytes
 
-pith keeps text and raw bytes separate on purpose.
+Pith keeps text and raw bytes separate on purpose.
 
-that means most code should stay in one of two lanes:
+That means most code should stay in one of two lanes:
 - `std.strings` when you are shaping text
 - `std.bytes` when you are moving raw data around
 
-cross the boundary explicitly when you need to.
+Cross the boundary explicitly when you need to.
 
 `std.strings` works in bytes, which is the same thing as characters only while
-the text is ascii. when the text is not — a name, a chat message, anything a
-user typed — counting, slicing and truncating belong in `std.text`. see
+the text is ASCII. When the text is not ASCII (a name, a chat message, anything
+a user typed), counting, slicing and truncating belong in `std.text`. See
 [unicode.md](unicode.md).
 
-## text helpers
+## Text helpers
 
 `std.strings` already had the lower-level pieces like `split_lines`,
-`partition`, and trimming helpers. the newer surface is meant for the more
+`partition`, and trimming helpers. The newer surface is meant for the more
 common "read a blob, break it up, shape it, move on" flow.
 
-use these for the usual cases:
+Use these for the usual cases:
 - `lines(text)` for read-style line splitting
 - `lines_keep_empty(text)` when exact empty segments matter
 - `words(text)` for whitespace tokenization
@@ -38,14 +38,14 @@ if pair.found:
     print(pair.right)
 ```
 
-that shape ended up being clearer than a magic sentinel and easier to work
-with in examples.
+That shape is clearer than a magic sentinel and easier to work with in
+examples.
 
-## bytes helpers
+## Bytes helpers
 
 `std.bytes` is the explicit text/bytes boundary.
 
-the low-level wrappers are there when you want a module-qualified surface:
+The low-level wrappers are there when you want a module-qualified surface:
 - `bytes.len(data)`
 - `bytes.is_empty(data)`
 - `bytes.get(data, idx)`
@@ -53,7 +53,7 @@ the low-level wrappers are there when you want a module-qualified surface:
 - `bytes.concat(left, right)`
 - `bytes.eq(left, right)`
 
-utf-8 decoding now has two paths:
+UTF-8 decoding has two paths:
 
 ```pith
 raw := bytes.from_string_utf8("pith")
@@ -66,14 +66,14 @@ legacy := bytes.to_string_utf8(raw)!
 print(legacy)
 ```
 
-use `decode_utf8(...)` when callers should be able to inspect the error.
-keep `to_string_utf8(...)` when a plain string error is enough.
+Use `decode_utf8(...)` when callers should be able to inspect the error.
+Keep `to_string_utf8(...)` when a plain string error is enough.
 
-## byte buffers
+## Byte buffers
 
 `ByteBuffer` is still the simplest way to assemble raw data incrementally.
 
-the newer helpers are just there to make the common utf-8 path shorter:
+The newer helpers make the common UTF-8 path shorter:
 
 ```pith
 buf := bytes.buffer()
@@ -83,18 +83,18 @@ print(buf.bytes().to_string_utf8()!)
 buf.reset()
 ```
 
-`reset()` is just a clearer alias for `clear()`.
+`reset()` is a clearer alias for `clear()`.
 
-a buffer frees its storage when the last value naming it dies. `free()`
+A buffer frees its storage when the last value naming it dies. `free()`
 releases the contents early and `take_bytes()` moves them out as `Bytes`; both
-leave an empty buffer that still works. the buffer's handle is private to
+leave an empty buffer that still works. The buffer's handle is private to
 `std.bytes`, and the `byte_buffer_*` builtins behind it are callable only
 there, so a program never holds a handle to freed memory.
 
-a buffer counts as a collection for the task rules: hand it to a `spawn` or a
-channel whole, as a list would be (E248). it cannot become an interface value
+A buffer counts as a collection for the task rules: hand it to a `spawn` or a
+channel whole, as a list would be (E248). It cannot become an interface value
 such as `io.BytesWriter`, since the checks could not follow it from there; a
-generic function bounded by the interface still takes it. to give a writer to
+generic function bounded by the interface still takes it. To give a writer to
 code that takes a `BytesWriter`, use `io.memory_writer()`, whose bytes sit
 behind a lock:
 
@@ -106,13 +106,13 @@ print(out.string())
 ```
 
 `write` and `write_string_utf8` return the number of bytes appended, so
-appending an empty value succeeds and returns 0. text built piece by piece, such
+appending an empty value succeeds and returns 0. Text built piece by piece, such
 as a blank header value or an empty field, needs no guard around the write.
 
-## practical rule
+## Practical rule
 
-if data came from a file, socket, process, or protocol layer, keep it as
+If data came from a file, socket, process, or protocol layer, keep it as
 `Bytes` until you have a reason to decode it.
 
-if you are already in text land, stay in `std.strings` and use the higher-level
-helpers instead of rebuilding split/join loops by hand.
+If you are already working with text, stay in `std.strings` and use the
+higher-level helpers instead of rebuilding split/join loops by hand.

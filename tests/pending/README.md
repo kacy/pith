@@ -1,4 +1,4 @@
-# pending reproducers
+# Pending reproducers
 
 Programs that describe a defect the compiler still has. Nothing runs this
 directory. No target globs it, no gate registers it, and a case here is

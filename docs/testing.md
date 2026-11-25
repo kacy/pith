@@ -1,6 +1,6 @@
-# testing
+# Testing
 
-pith tests live next to the code they cover. a `test` block is a named body that
+Pith tests live next to the code they cover. A `test` block is a named body that
 the compiler collects and runs when you ask it to:
 
 ```pith
@@ -10,7 +10,7 @@ test "scan maps rows into typed values":
     assert_eq(ids, [1, 2])
 ```
 
-run the tests in a file with `pith test`:
+Run the tests in a file with `pith test`:
 
 ```
 $ pith test std/sql.pith --filter scan
@@ -20,48 +20,48 @@ $ pith test std/sql.pith --filter scan
 2 passed, 0 failed, 8 filtered out
 ```
 
-## how the runner works
+## How the runner works
 
 `pith test` compiles the file's `test` blocks into a small binary and runs it.
-each test runs in its own forked process. that isolation matters: a failing
+Each test runs in its own forked process. Because of that isolation, a failing
 assertion, or even a hard crash like an out-of-bounds index, ends only that one
-test. the rest still run, and every result is reported. the process exits
+test. The rest still run, and every result is reported. The process exits
 non-zero if any test failed, so `pith test` fits straight into a `make` target or
 CI step.
 
-there is no shared state between tests. one test cannot leave a global, an open
+There is no shared state between tests. One test cannot leave a global, an open
 handle, or a spawned thread behind for the next one, because the next test starts
 from a fresh copy of the process.
 
-## assertions
+## Assertions
 
-the built-in assertions are `assert`, `assert_eq` and `assert_ne`:
+The built-in assertions are `assert`, `assert_eq` and `assert_ne`:
 
 - `assert(cond)` fails when `cond` is false.
 - `assert_eq(a, b)` fails when the two values differ, and `assert_ne(a, b)` when
-  they do not. both compare by value: integers, floats, strings, bytes, integer
+  they do not. Both compare by value: integers, floats, strings, bytes, integer
   lists, and string lists all compare their contents, not their heap identity.
-  the failure message shows both sides decoded:
+  The failure message shows both sides decoded:
 
   ```
   assertion failed: [1, 2] != [1, 3]
   assertion failed: "hello" != "world"
   ```
 
-maps, sets, and structs still compare by identity: `assert_eq` on those checks
-whether they are the same value, not whether their contents match. compare their
+Maps, sets, and structs still compare by identity: `assert_eq` on those checks
+whether they are the same value, not whether their contents match. Compare their
 fields or elements directly when you need a deep check; `sets_equal` in
 `std.collections` compares two sets.
 
-a failed assertion ends the process on the spot. under `pith test` that process
+A failed assertion ends the process on the spot. Under `pith test` that process
 is the forked child running one test, so the runner records one failure and
 carries on with the rest.
 
-### assertions in helpers
+### Assertions in helpers
 
-the assertions are ordinary calls, not a `test` block dialect, so they work in
-any function. a check that takes a few lines to set up belongs in a helper, and
-the test body calls it once per input:
+The assertions are ordinary calls and not a `test` block dialect, so they work
+in any function. A check that takes a few lines to set up belongs in a helper,
+and the test body calls it once per input:
 
 ```pith
 fn assert_parses(input: String, want: Int):
@@ -74,16 +74,16 @@ test "the parser handles every documented form":
     assert_parses("0x10", 16)
 ```
 
-if a module defines or imports its own function called `assert_eq`, that one
-wins; the built-in only fills a name nothing else has claimed. that is the
+If a module defines or imports its own function called `assert_eq`, that one
+wins; the built-in only fills a name nothing else has claimed. That is the
 switch behind the table-driven form below: `std.testing`'s assertions record a
 failure and carry on where the built-ins end the process.
 
-## table-driven cases
+## Table-driven cases
 
-a list of inputs checked by one body is a common shape, and written as a loop it
+A list of inputs checked by one body is a common shape. Written as a loop, it
 loses what the runner is for: the first row that fails ends the whole block, the
-failure names the assertion rather than the row that provoked it, and there is
+failure names the assertion instead of the row that provoked it, and there is
 no way to ask for one row back.
 
 `each` runs a body once per labeled row and reports every row as a result of its
@@ -104,8 +104,8 @@ test "an origin is matched whole, not by prefix or suffix":
 ], fn(spoofed: String) => guard(ok_handler, cross_origin("GET", spoofed)).header_value(ALLOW_ORIGIN) == "")
 ```
 
-a row passes when the body answers true and nothing inside it recorded a failed
-check. one that does not is named where it sits, and the rows after it still
+A row passes when the body answers true and nothing inside it recorded a failed
+check. One that does not is named where it sits, and the rows after it still
 run:
 
 ```
@@ -117,10 +117,10 @@ run:
   an origin is matched whole, not by prefix or suffix ... FAILED
 ```
 
-for a list of lookalikes that matters, because one that gets through is rarely
+This matters for a list of lookalikes, because one that gets through is rarely
 the only one.
 
-a row carries whatever the body needs, so the input-and-expected table is a
+A row carries whatever the body needs, so the input-and-expected table is a
 table of pairs:
 
 ```pith
@@ -131,12 +131,12 @@ each([
 ], fn(c: (String, Int)) => c.0.len() == c.1)
 ```
 
-### reporting both sides
+### Reporting both sides
 
-a body that answers yes or no reports its label and nothing else. when the two
+A body that answers yes or no reports its label and nothing else. When the two
 values are worth seeing, check them with `std.testing`'s assertions inside the
 body and return `true`: the check prints both sides and `each` names the row it
-belonged to underneath. a multi-line body can be written inline inside the call
+belonged to underneath. A multi-line body can be written inline inside the call
 or bound to a name first for readability:
 
 ```pith
@@ -150,9 +150,9 @@ test "doubling":
     each([case("one", 1), case("two", 2)], doubled)
 ```
 
-reach for `std.testing`'s assertions rather than the built-ins inside a case
-body. the built-ins end the process where they fail, which under `each` takes
-every row after the failing one with it, and the row that failed is never named:
+Inside a case body, use `std.testing`'s assertions instead of the built-ins. The
+built-ins end the process where they fail, which under `each` takes every row
+after the failing one with it, and the row that failed is never named:
 
 ```
   ok   [1] first
@@ -164,12 +164,12 @@ assertion failed
 says which row it was.
 
 `pith fmt` closes a multi-line list at column zero, which is why the `]` above
-sits where it does — the same shape the tables in `std/crypto/password.pith` and
-`std/hash.pith` already have.
+sits where it does. The tables in `std/crypto/password.pith` and
+`std/hash.pith` already have the same shape.
 
-### selecting one row
+### Selecting one row
 
-a row's identity is the test's name, ` / `, and the row's label, and `--filter`
+A row's identity is the test's name, ` / `, and the row's label, and `--filter`
 matches on that:
 
 ```
@@ -180,11 +180,11 @@ $ pith test std/web/cors.pith --filter "an origin is matched whole, not by prefi
 1 passed, 0 failed, 10 filtered out
 ```
 
-the number in brackets is the row's position in the table, not in the run, so a
-filtered run names the same row the full run did. a filter that matches the
+The number in brackets is the row's position in the table, not in the run, so a
+filtered run names the same row the full run did. A filter that matches the
 test's name alone runs the whole table, the way it always has.
 
-a filter that names a row which is not there runs the test with no rows
+A filter that names a row which is not there runs the test with no rows
 selected, and a test that checked nothing reports as passing:
 
 ```
@@ -194,17 +194,17 @@ $ pith test rows.pith --filter "rows / gamma"
 1 passed, 0 failed, 1 filtered out
 ```
 
-there is no result line above it, which is the tell — a table that ran prints
-one line per row. the test cannot skip itself instead, because a test is free
-to hold more than one table and the first of them cannot know whether a later
-one matches.
+The sign is the missing result line above it: a table that ran prints one line
+per row. The test cannot skip itself instead, because a test is free to hold
+more than one table and the first of them cannot know whether a later one
+matches.
 
-## skipping a test
+## Skipping a test
 
 `skip_test(reason)` marks the current test skipped and stops it right there.
-nothing after the call runs, the runner counts it as skipped rather than passed
-or failed, and a skipped test never fails the run. it is the way to fold a test
-that needs something it might not have — a database, a network peer — into the
+Nothing after the call runs, the runner counts it as skipped instead of passed
+or failed, and a skipped test never fails the run. It is the way to fold a test
+that needs something it might not have (a database, a network peer) into the
 same file as everything else:
 
 ```pith
@@ -220,9 +220,9 @@ test "reads rows from the live database":
 0 passed, 0 failed, 1 skipped
 ```
 
-## running a subset
+## Running a subset
 
-pass `--filter` to run only the tests whose name contains a substring:
+Pass `--filter` to run only the tests whose name contains a substring:
 
 ```
 $ pith test std/mysql.pith --filter scramble
@@ -232,14 +232,14 @@ $ pith test std/mysql.pith --filter scramble
 2 passed, 0 failed, 7 filtered out
 ```
 
-the filter also reads from the `PITH_TEST_FILTER` environment variable, which is
-handy when you drive the tests through a wrapper script. one row of a
-table-driven test is reachable the same way — see [selecting one
+The filter also reads from the `PITH_TEST_FILTER` environment variable, which is
+handy when you drive the tests through a wrapper script. One row of a
+table-driven test is reachable the same way; see [selecting one
 row](#selecting-one-row).
 
-## tagging tests
+## Tagging tests
 
-a test can carry labels, and a run can select or exclude them. the labels are
+A test can carry labels, and a run can select or exclude them. The labels are
 identifiers in brackets between the name and the colon:
 
 ```pith
@@ -247,10 +247,10 @@ test "reads rows from the live database" [slow, database]:
     ...
 ```
 
-that is the bracketed list the language spells everywhere else, so a tagged
-test brings in no new punctuation and nothing to quote. a tag is a name rather
-than a string because it is used as one: a run asks for it and it is either
-there or it is not. matching text is what `--filter` is for.
+That is the bracketed list the language spells everywhere else, so a tagged
+test brings in no new punctuation and nothing to quote. A tag is a name instead
+of a string because it is used as one: a run asks for it and it is either there
+or it is not. Matching text is what `--filter` is for.
 
 `--tag` runs only the tests carrying that label, `--exclude-tag` runs
 everything but them, and either can be passed more than once:
@@ -260,21 +260,21 @@ $ pith test std/sql.pith --tag slow
 $ pith test std/sql.pith --exclude-tag slow --exclude-tag database
 ```
 
-with no `--tag` every test qualifies. with a selection a test needs one of the
-selected labels, so two `--tag`s are a union. an excluded label removes a test
+With no `--tag` every test qualifies. With a selection a test needs one of the
+selected labels, so two `--tag`s are a union. An excluded label removes a test
 either way, so exclusion wins over selection when a test carries both.
 
-tags and `--filter` compose as one conjunction: the tags say which tests the
-run is about, the filter picks a name out of those. `--tag slow --filter
+Tags and `--filter` compose as one conjunction: the tags say which tests the
+run is about, and the filter picks a name out of those. `--tag slow --filter
 scramble` runs the slow tests whose name contains scramble and nothing else.
-neither widens the other, and a test the tags excluded is not reachable by
+Neither widens the other, and a test the tags excluded is not reachable by
 naming it in a filter.
 
-a tag on a test that holds a table covers the whole table. selecting the tag
+A tag on a test that holds a table covers the whole table. Selecting the tag
 runs every row, and one row is still reachable on its own through `--filter`,
 exactly as it was before the test was tagged.
 
-a run that names a tag no test in the file carries says so and fails:
+A run that names a tag no test in the file carries says so and fails:
 
 ```
 $ pith test std/sql.pith --tag databse
@@ -283,14 +283,14 @@ $ pith test std/sql.pith --tag databse
 no test carries the tag "databse"
 ```
 
-a mistyped tag would otherwise be a green run of nothing, which is the one
+A mistyped tag would otherwise be a green run of nothing, which is the one
 failure a CI step cannot catch by itself. `--exclude-tag` is held to the same
 rule: excluding a label nothing carries means the invocation is not doing what
 it says.
 
-## machine-readable output
+## Machine-readable output
 
-`--json` reports the run as one json object per line instead of prose. three of
+`--json` reports the run as one JSON object per line instead of prose. Three of
 the lines that run prints:
 
 ```
@@ -300,22 +300,22 @@ $ pith test tests/testrunner/fixture.pith --json
 {"type":"summary","passed":2,"failed":2,"skipped":1,"filtered_out":0,"unmatched_tags":[]}
 ```
 
-a `test` record carries the test's name, the file it came from, its tags, its
-outcome — `passed`, `failed`, `skipped` or `filtered` — and how long it took in
-milliseconds. a failed one also carries the assertion's message and the
-position it failed at; a skipped one carries the reason. a `case` record is one
+A `test` record carries the test's name, the file it came from, its tags, its
+outcome (`passed`, `failed`, `skipped` or `filtered`), and how long it took in
+milliseconds. A failed one also carries the assertion's message and the
+position it failed at; a skipped one carries the reason. A `case` record is one
 row of a table or one `std.testing` check, and names the test it belongs to as
-well as itself, because a row labeled `[3] gamma` says nothing on its own. the
+well as itself, because a row labeled `[3] gamma` says nothing on its own. The
 run ends with one `summary` record holding the tally and any tag the run named
 that nothing carries.
 
-it is json lines rather than one json document because a run is a stream
-written by more than one process: the child prints its own rows and its own
-skip, the parent prints the verdict once the child is gone, and a test that
-crashes still leaves every record written before it. a document has to be
+The output is JSON Lines instead of one JSON document because a run is a
+stream written by more than one process: the child prints its own rows and its
+own skip, the parent prints the verdict once the child is gone, and a test that
+crashes still leaves every record written before it. A document has to be
 closed by whoever opened it, which a process that died cannot do, and buffering
 the whole run to close it would throw away the streaming the fork-per-test
-design is built on. every reader already handles a line at a time — `jq` reads
+design is built on. Every reader already handles a line at a time: `jq` reads
 it without a flag, and so does anything that loops over lines:
 
 ```
@@ -323,33 +323,33 @@ $ pith test std/sql.pith --json | jq -r 'select(.outcome == "failed" and .positi
     | "\(.position.file):\(.position.line): \(.name): \(.message)"'
 ```
 
-the position is where a built-in assertion in the file under test failed. only
+The position is where a built-in assertion in the file under test failed. Only
 the module being tested is compiled with those positions in it, so an assertion
-that fails inside an imported helper reports its message and a null position. a
+that fails inside an imported helper reports its message and a null position. A
 `std.testing` check reports its own message, which already names both sides, and
 no position.
 
-a test's own output is not a record. what a test prints still goes to stdout
+A test's own output is not a record. What a test prints still goes to stdout
 where it printed it, and a failing built-in assertion still prints its message
-to stderr, so a reader takes the lines that parse as json and leaves the rest.
+to stderr, so a reader takes the lines that parse as JSON and leaves the rest.
 
 `--json`, `--tag` and `--exclude-tag` also read from the environment
 (`PITH_TEST_JSON`, `PITH_TEST_TAGS`, `PITH_TEST_EXCLUDE_TAGS`) the way
-`--filter` reads `PITH_TEST_FILTER`. a wrapper script that drives the tests
+`--filter` reads `PITH_TEST_FILTER`. A wrapper script that drives the tests
 sets those and needs to know nothing about the flags.
 
-the self-hosted compiler forwards every argument after the file to the same
+The self-hosted compiler forwards every argument after the file to the same
 runner, so `self-host/pith_main test <file> --tag fast --json` selects the same
-tests as the native binary does. it spawns the backend without a shell, so a
+tests as the native binary does. It spawns the backend without a shell, so a
 value carrying a space cannot travel as an argument and is refused by name; the
 environment variables above are the way to pass one through that entry point.
 
 ## std.testing
 
 `std.testing` is a helper library for a different shape of test: a standalone
-`fn main()` that checks a great many things and reports them all. its checks
+`fn main()` that checks a great many things and reports them all. Its checks
 (`assert_eq`, `assert_ne`, `check_true`, and friends) count passes and failures
-and print them as they go, then `done()` prints a summary. a failure does not
+and print them as they go, then `done()` prints a summary. A failure does not
 stop the run, so one broken case does not hide the next twenty:
 
 ```pith
@@ -360,89 +360,89 @@ fn main():
     done()
 ```
 
-these also work inside a `test` block: a check that fails there fails the block,
+These also work inside a `test` block: a check that fails there fails the block,
 because recording a failure sets the same process verdict a built-in assertion
-does. prefer the built-ins anyway — they read better and they print both sides
+does. Prefer the built-ins anyway: they read better and they print both sides
 of the comparison.
 
-what `std.testing` adds beyond the built-ins is the utilities they do not cover:
+What `std.testing` adds beyond the built-ins is the utilities they do not cover:
 `assert_contains(text, part)`, `assert_file_exists(path)`,
 `assert_dir_exists(path)`, `with_temp_dir(prefix, run)` for a scoped filesystem
 sandbox, and `case`/`each` for the table-driven form above.
 
-## the other test suites
+## The other test suites
 
-colocated `test` blocks are the everyday path, but the project leans on a few
+Colocated `test` blocks are the everyday path, but the project relies on a few
 other kinds of test, all wired through the `Makefile`:
 
-- **golden output** — a program under `tests/cases/` whose stdout is compared
-  against `tests/expected/<name>.txt`. good for end-to-end behavior. run with
-  `make run-regressions`. a failing case prints its exit status, a diff of the
-  expected and actual stdout, and its stderr, each cut to 60 lines. a case that
-  listens on a socket uses a fixed port in the 20xxx range, outside linux's
-  ephemeral range (32768-60999). the kernel assigns ephemeral ports to outgoing
+- **Golden output.** A program under `tests/cases/` whose stdout is compared
+  against `tests/expected/<name>.txt`. Good for end-to-end behavior. Run with
+  `make run-regressions`. A failing case prints its exit status, a diff of the
+  expected and actual stdout, and its stderr, each cut to 60 lines. A case that
+  listens on a socket uses a fixed port in the 20xxx range, outside Linux's
+  ephemeral range (32768-60999). The kernel assigns ephemeral ports to outgoing
   connections, and a client socket that closes first holds its port in
   TIME_WAIT for a minute; a listen on that number fails with EADDRINUSE until
   it expires, even with SO_REUSEADDR set. `make check-test-ports` enforces the
   rule.
-- **rejected programs** — files under `tests/invalid/` (run with
+- **Rejected programs.** Files under `tests/invalid/` (run with
   `make check-invalid`) and `tests/invalid_parse/` (run with
   `make check-parse-invalid`) that must fail to compile, guarding error
   messages and negative cases.
-- **live servers** — integration tests under `tests/live/` that need a real
-  server and are run on demand. the seven database files (`db_postgres_live`,
+- **Live servers.** Integration tests under `tests/live/` that need a real
+  server and are run on demand. The seven database files (`db_postgres_live`,
   `db_mysql_live`, `db_redis_live`, `db_postgres_pool_live`,
   `db_mysql_pool_live`, `db_postgres_tx_live`, `db_mysql_tx_live`) are `test`
   blocks that `skip_test` when their server is not reachable, so
   `make db-live-tests` stays green with or without a running server and verifies
   the drivers where one exists.
-- **invalid access** — `make memcheck` runs a curated set under valgrind, so an
-  arc regression that double-frees or reads freed memory is caught before it
+- **Invalid access.** `make memcheck` runs a curated set under Valgrind, so an
+  ARC regression that double-frees or reads freed memory is caught before it
   lands.
-- **sanitizers** — `make sanitize-asan` links the whole regression corpus,
-  the deterministic examples (http, grpc, websocket, worker pools) and every
+- **Sanitizers.** `make sanitize-asan` links the whole regression corpus,
+  the deterministic examples (HTTP, gRPC, WebSocket, worker pools) and every
   std test file against a runtime built with AddressSanitizer and runs
   them on both backends with the struct freelist off; `make sanitize-tsan`
-  does the same with ThreadSanitizer. valgrind misses a freed
-  struct the freelist hands straight back out, which is how a double free in
-  a weak field read went unseen, and these do not. the nightly `sanitizers`
-  workflow runs both gates. the gate builds with `PITH_SANITIZE`, so the
-  field and global accesses generated code makes are checked too. details are
+  does the same with ThreadSanitizer. Valgrind misses a freed struct the
+  freelist hands straight back out, which is how a double free in a weak field
+  read went unseen; the sanitizers do not miss it. The nightly `sanitizers`
+  workflow runs both gates. The gate builds with `PITH_SANITIZE`, so the
+  field and global accesses generated code makes are checked too. Details are
   in `tooling/sanitize.sh`.
-- **the nightly hunt** — the same workflow spends about two hours generating
+- **The nightly hunt.** The same workflow spends about two hours generating
   programs with pithgen from a fresh seed range each night and running them
-  against the asan runtime (`tooling/pithgen_hunt.sh`). each distinct
-  signature it finds is filed as an issue labelled `pithgen`, with the seed
+  against the ASan runtime (`tooling/pithgen_hunt.sh`). Each distinct
+  signature it finds is filed as an issue labeled `pithgen`, with the seed
   that reproduces it, the report and the program; a signature that already
-  has an open issue gets a comment instead. the findings are also kept as a
+  has an open issue gets a comment instead. The findings are also kept as a
   workflow artifact for 30 days.
-- **leak growth** — `make leak-check` runs the cases under `tests/leaks/` at two
-  round counts and fails when memory grew between them. this is the other half
+- **Leak growth.** `make leak-check` runs the cases under `tests/leaks/` at two
+  round counts and fails when memory grew between them. This is the other half
   of `memcheck`, which has its leak check switched off on purpose.
-- **crash sites** — `make check-no-panics` scans the rust sources for anything
+- **Crash sites.** `make check-no-panics` scans the Rust sources for anything
   that can stop the process and fails on any site that is not justified in
-  place. see below.
-- **the runner's own output** — `make test-runner-goldens` runs
+  place. See below.
+- **The runner's own output.** `make test-runner-goldens` runs
   `tests/testrunner/fixture.pith` eleven ways and compares every line against
-  `tests/testrunner/expected/`. the json records are a contract with whatever
-  reads them, so they are pinned line for line rather than grepped: a record
-  that quietly drops a field still passes a grep and breaks every reader.
-  durations vary, so `"duration_ms":<n>` is rewritten to `"duration_ms":<ms>`
-  before the comparison — the field stays pinned present and well-formed, only
-  its value is dropped.
+  `tests/testrunner/expected/`. The JSON records are a contract with whatever
+  reads them, so they are pinned line for line instead of grepped: a record
+  that silently drops a field still passes a grep and breaks every reader.
+  Durations vary, so `"duration_ms":<n>` is rewritten to `"duration_ms":<ms>`
+  before the comparison. The field stays pinned as present and well-formed;
+  only its value is dropped.
 
-## the crash guard
+## The crash guard
 
-the rust runtime is linked into every pith program, so a panic in it is a crash
+The Rust runtime is linked into every Pith program, so a panic in it is a crash
 in somebody's server. `make check-no-panics` scans `cranelift/*/src` and
 `cranelift/codegen/build.rs` for the
-constructs that stop a process — `panic!`, `unreachable!`, `.unwrap()`,
-`.expect(...)` — plus `std::mem::transmute`, `std::mem::forget` and
+constructs that stop a process (`panic!`, `unreachable!`, `.unwrap()`,
+`.expect(...)`), plus `std::mem::transmute`, `std::mem::forget` and
 `from_utf8_unchecked`, which reinterpret memory and want the same scrutiny. `std::process::exit` is scanned
-in the runtime and the codegen crate only: the cli and the build script are
+in the runtime and the codegen crate only: the CLI and the build script are
 programs, and a program exiting non-zero after printing a diagnostic is normal.
 
-a deliberate site is justified with a marker comment on the line directly above
+A deliberate site is justified with a marker comment on the line directly above
 it:
 
 ```rust
@@ -450,68 +450,69 @@ it:
 std::process::exit(1);
 ```
 
-the marker moves with the code. the gate also reports a marker whose next line
+The marker moves with the code. The gate also reports a marker whose next line
 is not a guarded site, so a marker left behind by a deleted trap is a failure
 too.
 
-test code is skipped: `tests.rs` files, `*/loom_models/*`, and `#[cfg(test)]`
+Test code is skipped: `tests.rs` files, `*/loom_models/*`, and `#[cfg(test)]`
 items are compiled out of the shipped
-runtime, and an `.unwrap()` in a test is how a test reports failure. the skip
+runtime, and an `.unwrap()` in a test is how a test reports failure. The skip
 runs from the attribute line to the closing brace at the attribute's own
-indentation; an item whose brace never turns up is reported rather than
+indentation; an item whose brace never turns up is reported instead of
 silently swallowing the rest of the file.
 
-prefer `runtime_fatal!` over `panic!` for a condition the runtime cannot
-recover from. a panic on a runtime thread does not reliably stop the process:
+Prefer `runtime_fatal!` over `panic!` for a condition the runtime cannot
+recover from. A panic on a runtime thread does not reliably stop the process:
 `run_task` catches every panic a green task raises, so a panic anywhere the
 spawn path reaches kills the task with `join.done` never set and hangs its
 awaiters forever, and a panic inside a `Once` poisons it for every later caller.
 `runtime_fatal!` prints a `pith runtime error:` line and exits, which is one
 diagnosable death instead of a silent wedge.
 
-## the leak growth gate
+## The leak growth gate
 
 `make leak-check` builds each program under `tests/leaks/` and runs it twice, once
 at `PITH_LEAK_ROUNDS=200000` and once at `800000`, then compares the peak resident
-set the two runs reported. a program that leaks k bytes per round moves its peak
-by k times the six hundred thousand extra rounds. a correct one parks at its
-working set and reports the same number either way. the target prints the
-difference for every case and exits non-zero when one of them clears 2 mb.
+set the two runs reported. A program that leaks k bytes per round moves its peak
+by k times the six hundred thousand extra rounds. A correct one parks at its
+working set and reports the same number either way. The target prints the
+difference for every case and exits non-zero when one of them clears 2 MB.
 
-the number to watch is that difference and not a ceiling, because a ceiling is a
-fact about the runtime rather than about the case. it drifts whenever the
-allocator, the freelists or the stack pool change size, so it has to be retuned
-to stay meaningful, and a gate that gets retuned is a gate that gets waved
-through. a difference only cares about the slope, which is zero for every program
-that does not leak, whatever the runtime is doing underneath it.
+The number to watch is that difference. A ceiling would be a fact about the
+runtime and not about the case. It drifts whenever the allocator, the freelists
+or the stack pool change size, so it has to be retuned to stay meaningful, and a
+gate that gets retuned is a gate that gets waved through. A difference only
+cares about the slope, which is zero for every program that does not leak,
+whatever the runtime is doing underneath it.
 
-valgrind's own leak check is the obvious tool here and the wrong one. the runtime
-keeps a struct freelist, a coroutine stack pool, per-arena node pools and its
-worker threads alive for the life of the process. all of that is still reachable
-at exit and none of it is a bug, so a real leak would arrive buried in megabytes
-of output nobody would read twice.
+Valgrind's own leak check is the obvious tool here, but it does not fit. The
+runtime keeps a struct freelist, a coroutine stack pool, per-arena node pools
+and its worker threads alive for the life of the process. All of that is still
+reachable at exit and none of it is a bug, so a real leak would arrive buried in
+megabytes of output nobody would read twice.
 
-the leaks this was built from ran twenty to ninety bytes a round, so the quietest
-of them still moves the peak by twelve megabytes over the extra rounds. noise on
-a flat case measures under two hundred kilobytes run to run. 2 mb sits an order
-of magnitude above the noise and well under the smallest real signal. a case that
-clears the limit is measured again before it is called a failure, so one spike on
-a loaded machine cannot turn the gate red by itself. each unique `.pith` file is
-compiled once in parallel, then every entry is measured serially.
+The leaks this gate was built from ran twenty to ninety bytes a round, so the
+quietest of them still moves the peak by twelve megabytes over the extra rounds.
+Noise on a flat case measures under two hundred kilobytes run to run. The 2 MB
+limit sits an order of magnitude above the noise and well under the smallest
+real signal. A case that clears the limit is measured again before it is called
+a failure, so one spike on a loaded machine cannot turn the gate red by itself.
+Each unique `.pith` file is compiled once in parallel, then every entry is
+measured serially.
 
-to add a case, drop a `.pith` file in `tests/leaks/` that imports `leakprobe`,
+To add a case, drop a `.pith` file in `tests/leaks/` that imports `leakprobe`,
 runs its churn `probe.rounds()` times, and prints `probe.peak_kb()` and nothing
-else. then list it in the `cases` array in `tooling/leak_check.sh`. keep the round
+else. Then list it in the `cases` array in `tooling/leak_check.sh`. Keep the round
 body allocation-heavy and free of anything that is supposed to grow: a collection
 that keeps filling up looks exactly like a leak.
 
-## sanitizers
+## Sanitizers
 
-threadsanitizer and addresssanitizer both run pith programs on either backend.
-the nightly `sanitizers` workflow runs both gates over the corpus, the
+ThreadSanitizer and AddressSanitizer both run Pith programs on either backend.
+The nightly `sanitizers` workflow runs both gates over the corpus, the
 examples and the std tests (`make sanitize-asan` and `make sanitize-tsan`,
 above); this section is the recipe for one
-program by hand. they need a runtime built with the sanitizer, and
+program by hand. Both need a runtime built with the sanitizer, and
 the stable toolchain accepts `-Zsanitizer` only with `RUSTC_BOOTSTRAP=1`:
 
 ```sh
@@ -520,7 +521,7 @@ RUSTC_BOOTSTRAP=1 RUSTFLAGS="-C relocation-model=pie -Zsanitizer=thread -Cforce-
   --target x86_64-unknown-linux-gnu --target-dir target/tsan
 ```
 
-for asan, use `-Zsanitizer=address` and leave out `-Zbuild-std`. a program
+For ASan, use `-Zsanitizer=address` and leave out `-Zbuild-std`. A program
 is then built against that archive, linked through a `CC` that appends
 rustc's own sanitizer runtime (`librustc-stable_rt.tsan.a` or `.asan.a` from
 the toolchain's `lib/rustlib/<target>/lib`, inside `--whole-archive`, plus
@@ -533,44 +534,45 @@ PITH_STRUCT_FREELIST=0 ./prog
 ```
 
 `pith test` honors the same variables. `PITH_STRUCT_FREELIST=0` matters for
-asan: a freed struct goes back on the freelist instead of to `free`, so a
-use after free reads a recycled struct and asan sees nothing.
+ASan: a freed struct goes back on the freelist instead of to `free`, so a
+use after free reads a recycled struct and ASan sees nothing.
 
-a sanitized build differs from a plain one in three places:
+A sanitized build differs from a plain one in three places:
 
-- the runtime's build script turns `-Zsanitizer=thread` into `cfg(pith_tsan)`
+- The runtime's build script turns `-Zsanitizer=thread` into `cfg(pith_tsan)`
   and `address` into `cfg(pith_asan)`, because `cfg(sanitize)` itself is
-  unstable even with `RUSTC_BOOTSTRAP`. under `pith_tsan`, a last release
-  pairs with the earlier releases through an acquire load of the count rather
-  than `fence(Acquire)`, which tsan does not model. without it, every free on
+  unstable even with `RUSTC_BOOTSTRAP`. Under `pith_tsan`, a last release
+  pairs with the earlier releases through an acquire load of the count instead
+  of `fence(Acquire)`, which TSan does not model. Without it, every free on
   one thread of an object last used on another came out as a data race.
-- the green backend tells both sanitizers about each coroutine stack switch
-  (`concurrency/green/fiber.rs`): asan through
+- The green backend tells both sanitizers about each coroutine stack switch
+  (`concurrency/green/fiber.rs`): ASan through
   `__sanitizer_start_switch_fiber` / `__sanitizer_finish_switch_fiber` on both
-  sides of a switch, tsan through one fiber per task that the worker switches
-  to before a resume and away from after it. a plain build compiles none of
-  this.
+  sides of a switch, and TSan through one fiber per task that the worker
+  switches to before a resume and away from after it. A plain build compiles
+  none of this.
 - `PITH_SANITIZE=thread` or `address` makes the compiler report every struct
   field, optional payload and global that generated code reads or writes to
   the sanitizer (`__tsan_read8` / `__tsan_write8`, `__asan_load8` /
   `__asan_store8`), and drops the inline fast paths for list, bytes and string
-  reads in favor of the runtime calls they stand in for. without it, a race or
-  a freed read in generated code is invisible. retains and releases are always
+  reads in favor of the runtime calls they stand in for. Without it, a race or
+  a freed read in generated code is invisible. Retains and releases are always
   runtime calls, so the counts need nothing extra.
 
-tsan reports a `thread leak` for a task on the os-thread backend whose handle
-was passed on or stored and was never awaited before the process exits. a
+TSan reports a `thread leak` for a task on the OS-thread backend whose handle
+was passed on or stored and was never awaited before the process exits. A
 discarded `spawn` and a handle left unawaited in a local are detached
 automatically, and so is a handle whose local is assigned a new `spawn`.
 `TSAN_OPTIONS=report_thread_leaks=0` turns those off, and the gate runs with
 it.
 
-## on the roadmap
+## On the roadmap
 
-one thing is not here yet: benchmarks. tagging, machine-readable output and
-skipping have all landed — see [tagging tests](#tagging-tests),
-[machine-readable output](#machine-readable-output) and `skip_test` above, the
-last of which is what lets the live suites fold in and skip themselves when
-their service is not reachable. the leak gate covers a curated set of ownership shapes rather than
-every program; a case is added as the last step of fixing a shape, not the
-first, which is why the gate reads as a list of leaks that no longer happen.
+Benchmarks are not here yet. Tagging, machine-readable output and skipping have
+all landed: see [tagging tests](#tagging-tests),
+[machine-readable output](#machine-readable-output) and `skip_test` above. The
+last of these is what lets the live suites fold in and skip themselves when
+their service is not reachable. The leak gate covers a curated set of ownership
+shapes instead of every program. A case is added as the last step of fixing a
+shape, not the first, which is why the gate reads as a list of leaks that no
+longer happen.

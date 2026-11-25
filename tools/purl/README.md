@@ -1,8 +1,10 @@
 # purl
 
-A `curl`-compatible HTTP client written in Pith on top of Pith's standard library (`std.net.http`, `std.net.http2.{connection,frames,hpack}`, `std.net.socks5`, `std.net.unix`, `std.net.tls`, `std.net.dns`, `std.net.url`, `std.compress.{gzip,zlib,inflate,zstd}`, `std.hash`, `std.crypto.{hmac,random}`, `std.datetime`, `std.bytes`, `std.encoding`, `std.strings`, `std.json`, `std.io`, `std.fs`, `std.os`, `std.os.path`, `std.time`) and Pith's green-thread concurrency (`spawn`, `Semaphore`).
+This is a `curl`-compatible HTTP client written in Pith, built on Pith's standard library and its green-thread concurrency.
 
-The goal is a practical drop-in for everyday `curl` workflows — including aliasing `curl` to `purl` — while dogfooding as much of Pith's standard library as possible.
+It uses `std.net.http`, `std.net.http2.{connection,frames,hpack}`, `std.net.socks5`, `std.net.unix`, `std.net.tls`, `std.net.dns`, `std.net.url`, `std.compress.{gzip,zlib,inflate,zstd}`, `std.hash`, `std.crypto.{hmac,random}`, `std.datetime`, `std.bytes`, `std.encoding`, `std.strings`, `std.json`, `std.io`, `std.fs`, `std.os`, `std.os.path`, and `std.time` from the standard library, and `spawn` and `Semaphore` for concurrency.
+
+The goal is a practical drop-in for everyday `curl` workflows, including aliasing `curl` to `purl`, while using as much of Pith's standard library as possible.
 
 ## Build & install
 
@@ -185,11 +187,11 @@ sh tools/purl/run_integration.sh
 
 ## Binary size
 
-`pith build tools/purl/purl.pith` produces a single standalone static-stdlib native binary (~4.6 MiB / 4.8 MB stripped, 1,701 compiled functions after #1454's dead cycle-collector tracer, global, and string pruning — down from 5.9 MB / 3,369 functions) with TLS 1.2/1.3, HTTP/1.1, HTTP/2, SOCKS5, `AF_UNIX`, gzip/deflate/zstd, and crypto built in, requiring only `libc` at runtime.
+`pith build tools/purl/purl.pith` produces a single standalone static-stdlib native binary with TLS 1.2/1.3, HTTP/1.1, HTTP/2, SOCKS5, `AF_UNIX`, gzip/deflate/zstd, and crypto built in, requiring only `libc` at runtime. Stripped, it is ~4.6 MiB (4.8 MB) with 1,701 compiled functions, down from 5.9 MB and 3,369 functions before #1454 pruned the dead cycle-collector tracer, globals, and strings.
 
 ## Pith language & stdlib findings uncovered while building `purl`
 
-Building a real CLI HTTP client surfaced several concrete compiler, codegen, runtime, and standard-library gaps. All of the initial compiler and stdlib gaps have now been resolved and dogfooded directly in `purl`:
+Building a real CLI HTTP client surfaced several concrete compiler, codegen, runtime, and standard-library gaps. All of the initial compiler and stdlib gaps are now resolved, and `purl` uses the fixes directly:
 
 ### Resolved
 

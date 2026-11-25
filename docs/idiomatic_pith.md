@@ -1,10 +1,10 @@
-# idiomatic pith
+# Idiomatic Pith
 
 This is the current style for everyday Pith code. It favors direct data flow,
 small helpers, and examples that read like application code instead of compiler
 tests. For naming, layout and comments, see [STYLE.md](STYLE.md).
 
-## printing and strings
+## Printing and strings
 
 Prefer interpolation for one-off values:
 
@@ -33,13 +33,13 @@ print("names: {fmt.join_strings(names, ", ")}")
 
 Use `std.io.string_buffer()` for builders and parsers that append in a loop.
 Do not build long strings by repeatedly adding `value.to_string()` unless that
-really is the clearest expression.
+is the clearest expression.
 
-## collections
+## Collections
 
 Use `for item in items` or `for item, index in items` before reaching for a
-manual `while index < items.len()` loop. When you actually need an integer
-index, use range-for instead of building a list of integers:
+manual `while index < items.len()` loop. When you need an integer index, use
+range-for instead of building a list of integers:
 
 ```pith
 for i in 0..items.len():
@@ -52,7 +52,7 @@ for i in 0..=10:    # inclusive upper bound
 Both forms compile to a counted loop with no allocation. They're the
 default for "do this N times" or "index into a parallel list".
 
-For everyday list transforms, prefer the method form on the list — it
+For everyday list transforms, prefer the method form on the list, which
 reads top to bottom and chains:
 
 ```pith
@@ -108,7 +108,7 @@ protocol and worked examples.
 An empty literal takes its element type from an annotation when you give one
 (`mut names: List[String] := []`), from the parameter it is written into
 (`f([])` where `f` takes a `List[String]`), and otherwise from the first value
-stored into it — `mut tasks := []` followed by `tasks.push(spawn worker())`
+stored into it: `mut tasks := []` followed by `tasks.push(spawn worker())`
 types `tasks` as a list of tasks. Annotate when the first store sits far from
 the declaration and a reader would have to hunt for it.
 
@@ -148,8 +148,8 @@ if lists_equal(parts, ["a", "b"]):
 
 Struct fields can be updated in place. Structs are heap-allocated reference
 values, so a write through one handle is visible through every other handle
-to the same instance — useful for stateful iterators and small caches, and a
-foot-gun when you actually wanted a copy:
+to the same instance. That is useful for stateful iterators and small caches,
+and a foot-gun when you wanted a copy:
 
 ```pith
 struct Counter:
@@ -181,7 +181,7 @@ prod := Config(host: "example.com", port: 443, tls: true)
 Named fields work on generic structs too, whether the type argument is
 written out (`Box[Int](value: 5)`) or inferred (`Box(value: 5, label: "hi")`).
 
-## sorting
+## Sorting
 
 `std.collections` holds the generic sorts. `sorted_by` (and its alias
 `sort_by`) takes a comparator, `sort_by_key` takes an integer key, and
@@ -200,14 +200,14 @@ by_age := collections.sorted_by(players, fn(l: Player, r: Player) => l.age < r.a
 
 They are stable merge sorts, so elements that compare equal keep their input
 order. Sort on a secondary key first and a primary key second and you get a
-compound order. `algo.sort_by_key_desc` is the one exception worth knowing: it
-sorts ascending and then reverses, so equal keys come back in reverse input
+compound order. `algo.sort_by_key_desc` is the one exception: it sorts
+ascending and then reverses, so equal keys come back in reverse input
 order rather than input order.
 
 The key-taking sorts call the key function exactly once per element, in input
-order, before any comparison happens, and sort against the cached keys. That
-matters twice over. An expensive key, one that formats a string or hashes a
-field, is paid for n times instead of n log n. And a key function with a side
+order, before any comparison happens, and sort against the cached keys. This
+matters in two ways. An expensive key, one that formats a string or hashes a
+field, is paid for n times instead of n log n, and a key function with a side
 effect runs exactly n times.
 
 The comparator in `sorted_by` carries no such promise. It runs O(n log n) times
@@ -221,7 +221,7 @@ elements out in a given order. The other sorts are built on that pair. Use it
 directly to reorder two parallel lists by the same key, or when what you want
 is where an element moved rather than the element itself.
 
-## errors and tests
+## Errors and tests
 
 Use bare `T!` for simple string errors. Use `T!SomeError` when callers need to
 inspect the error payload.
@@ -229,10 +229,10 @@ inspect the error payload.
 Prefer `catch`, `unwrap_or`, and `or_else` when they make recovery clearer than
 manual `is_err` branching.
 
-## cleanup with `defer` and `errdefer`
+## Cleanup with `defer` and `errdefer`
 
 Pair a cleanup with the thing it cleans up, right where you acquire it. `defer`
-schedules a statement to run on every exit from the block — falling off the end,
+schedules a statement to run on every exit from the block: falling off the end,
 a `return`, a `fail`, or a `!` that propagates. You write the close once, next to
 the open, and the error path can't skip it:
 
@@ -252,7 +252,7 @@ inside a loop belongs to that iteration.
 
 `errdefer` is the error-only sibling: it runs when the block exits through a
 `fail` or a `!`, and stays quiet on a normal return. Use it to undo a
-half-finished change — the transaction rollback is the motivating case:
+half-finished change. A transaction rollback is the motivating case:
 
 ```pith
 fn transfer(db: Db, src: Int, dst: Int, cents: Int) -> Int!:
@@ -266,46 +266,46 @@ fn transfer(db: Db, src: Int, dst: Int, cents: Int) -> Int!:
 ```
 
 If `debit` or `credit` fails, the `!` propagates and the rollback runs. If the
-`commit` succeeds, the `errdefer` does not fire — a plain `defer` would roll back
+`commit` succeeds, the `errdefer` does not fire. A plain `defer` would roll back
 the commit you just made. See [defer.md](defer.md) for the full rules, including
 what you can and can't defer.
 
-## absence: `T?` vs `T!`
+## Absence: `T?` vs `T!`
 
-Pith has two distinct shapes for "no value here". Pick by intent, not by mood:
+Pith has two distinct shapes for "no value here". Pick by intent:
 
-- **`T?` (Optional)** — for *predictable* absence the caller routinely
+- **`T?` (Optional)**: for *predictable* absence the caller routinely
   handles. Lookup misses, end-of-stream, optional config fields, channel
   closure. Construct with `none`; consume with `if let`, `match`,
   `unwrap_or`, or `?` inside a `T!` function. Examples: `Map.get`, `Channel.recv`,
   `std.strings.get`.
-- **`T!` (Result)** — for *unexpected* failure the caller usually wants to
+- **`T!` (Result)**: for *unexpected* failure the caller usually wants to
   propagate. I/O, parsing, network, anything with an external cause.
   Construct with `fail`; consume with `!`, `catch`, `unwrap_or`, `or_else`.
   Examples: `fs.read`, `parse_port`, `tls.dial`.
 
 Rule of thumb: if the caller would write `if x == none: ...` more often than
 `!`, use `T?`. If they'd write `v := x!` more often than `match`, use `T!`.
-Don't double-wrap (`T?!` or `T!?`) unless absence and failure are genuinely
-distinct outcomes — usually one or the other tells the whole story.
+Don't double-wrap (`T?!` or `T!?`) unless absence and failure are distinct
+outcomes; usually one or the other tells the whole story.
 
-## safe access on containers
+## Safe access on containers
 
 `map[k]`, `list[i]`, `s[i]`, and `bytes[i]` are the "I know it's there"
 form. If the key or index isn't there, the runtime prints a structured
 `pith runtime error: ...` and exits. A store `list[i] = v` with `i` outside
 the list and `.value()` on a `none` stop the same way; `map[k] = v` inserts a
-missing key. That's the right behavior for
-tables you just populated, loops that already bounded `i`, and struct
-fields you invariantly initialized — a miss is a real bug and should
-crash loudly, not flow through as a zero.
+missing key. That's the right behavior for tables you just populated, loops
+that already bounded `i`, and struct fields you invariantly initialized. There
+a miss is a real bug and should crash loudly instead of flowing through as a
+zero.
 
 Inside a `T!` function, `map[k]`, `list[i]`, `list[i] = v` and `.value()`
-instead propagate the miss as an error, which the caller can `catch` or `unwrap_or`. So the
-same syntax means "assert" outside a Result context and "propagate"
-inside — no special operator required. (The propagated error carries a
-generic message, `index out of bounds` or `value() on none`; supply your own with an explicit
-`fail` when the caller needs one.)
+instead propagate the miss as an error, which the caller can `catch` or
+`unwrap_or`. So the same syntax means "assert" outside a Result context and
+"propagate" inside, with no special operator. (The propagated error carries a
+generic message, `index out of bounds` or `value() on none`; supply your own
+with an explicit `fail` when the caller needs one.)
 
 This applies only when the error type is a String: `T!` or `T!String`. A
 `T!E` function with a struct or enum `E` has no `E` to build from a miss, so
@@ -323,8 +323,8 @@ fn main() -> Int!:
     ...
 ```
 
-When the recovery is control flow rather than a value — answer a 401, skip
-this item, stop the loop — `catch` takes a block. The block runs only on the
+When the recovery is control flow instead of a value (answer a 401, skip
+this item, stop the loop), `catch` takes a block. The block runs only on the
 error path and has to leave (`return`, `fail`, `continue` or `break`), since
 it produces no value for the binding:
 
@@ -349,9 +349,9 @@ for line in lines:
         continue
 ```
 
-When you want to _observe_ the miss without crashing or propagating —
-distinguishing "not present" from "present with value 0" — reach for
-the `.get()` methods, which return `T?`:
+When you want to _observe_ the miss without crashing or propagating, for
+example to distinguish "not present" from "present with value 0", use the
+`.get()` methods, which return `T?`:
 
 ```pith
 count := stats.get("hits").unwrap_or(0)          # None -> 0, Some(0) -> 0
@@ -368,7 +368,7 @@ Prefer `.get(k).unwrap_or(d)` over `Map.get_default(k, d)`. Both work,
 but the composed form reads left-to-right and is spelled the same on lists,
 maps and strings.
 
-`env.get(key)` returns `String?` — `Some(value)` when set (including
+`env.get(key)` returns `String?`: `Some(value)` when set (including
 empty string), `none` when unset.
 
 The same rule applies to iterators (`std.iter.next() -> T?`) and channel
@@ -380,7 +380,7 @@ use the built-in `assert` and `assert_eq` (which compares by value and reports
 decoded failures); keep golden stdout examples for end-to-end behavior. See
 [testing.md](testing.md) for the full picture.
 
-## interfaces: bound or value
+## Interfaces: bound or value
 
 An interface works two ways. As a bound, `fn total[T: Shape](items: List[T])`
 is specialized for each `T`, and every item in one call has the same type. As
@@ -398,7 +398,7 @@ interface type when the values really are mixed (handlers, plugins, a scene of
 shapes). A conversion boxes the value, so it costs an allocation, and a call
 through it cannot be inlined. See [interface values](interface_values.md).
 
-## packages
+## Packages
 
 `pith new <name>` should produce a project that can immediately run:
 

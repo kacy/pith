@@ -1,16 +1,16 @@
-# style guide
+# Style guide
 
-how to write pith that reads well. the goal is code someone else can follow
-quickly and change confidently.
+This guide covers how to write Pith that reads well. The goal is code someone
+else can follow quickly and change confidently.
 
-code is read far more often than it is written, so when the two conflict:
-clarity over brevity, explicit over clever, consistency over novelty.
+Code is read far more often than it is written, so when the two conflict,
+prefer clarity over brevity, explicit over clever, and consistency over novelty.
 
-## naming
+## Naming
 
-use descriptive names. single letters are fine in three places: loop indices
+Use descriptive names. Single letters are fine in three places: loop indices
 (`i`, `j`), a receiver in a short method (`p` for a `Point`), and mathematical
-conventions (`x`, `y` for coordinates). everywhere else, spell it out.
+conventions (`x`, `y` for coordinates). Everywhere else, spell it out.
 
 ```pith
 # good
@@ -24,7 +24,7 @@ mut cur := ""
 mut cap := 1024
 ```
 
-name a loop variable after what it holds:
+Name a loop variable after what it holds:
 
 ```pith
 # good
@@ -40,7 +40,7 @@ for n in items:
     process(n)
 ```
 
-for index-based loops, iterate a range rather than counting by hand. `i` is
+For index-based loops, iterate a range instead of counting by hand. `i` is
 fine when the body is short; use a real name when the loop runs long or nests.
 
 ```pith
@@ -48,17 +48,17 @@ for line_index in 0..lines.len():
     process_line(lines[line_index])
 ```
 
-when you need the element and its position, `for` gives you both:
+When you need the element and its position, `for` gives you both:
 
 ```pith
 for line, line_index in lines:
     print("{line_index + 1}: {line}")
 ```
 
-keep `while` for loops that do not step one element at a time, such as a
+Keep `while` for loops that do not step one element at a time, such as a
 parser that consumes a different number of characters on each pass.
 
-functions are `snake_case` and say what they do. predicates returning `Bool`
+Functions are `snake_case` and say what they do. Predicates returning `Bool`
 start with `is_`, `has_`, or `can_`.
 
 ```pith
@@ -72,7 +72,7 @@ fn calc(s: String) -> Int:
 fn check(a: String) -> Bool:
 ```
 
-types are `PascalCase`. the linter enforces both conventions (E300 and E301).
+Types are `PascalCase`. The linter enforces both conventions (E300 and E301).
 
 ```pith
 struct HttpRequest:
@@ -83,14 +83,14 @@ struct HttpRequest:
 type UserId = Int
 ```
 
-a field without `pub` belongs to its module: code in another module can't
-read it, assign it, or set it in a constructor (E251). leave a field private
+A field without `pub` belongs to its module: code in another module can't
+read it, assign it, or set it in a constructor (E251). Leave a field private
 when its value has to stay consistent with the rest of the struct, such as a
 handle the struct owns.
 
-## organization
+## Organization
 
-group related declarations and separate the groups with a blank line.
+Group related declarations and separate the groups with a blank line.
 
 ```pith
 mut input_buffer := ""
@@ -100,8 +100,8 @@ mut current_position := 0
 mut total_lines := 0
 ```
 
-keep functions small. if you cannot describe one in a sentence, it is doing
-too much. prefer early returns to deep nesting:
+Keep functions small. If you cannot describe one in a sentence, it is doing
+too much. Prefer early returns to deep nesting:
 
 ```pith
 fn find_active_user(users: List[User], target_id: Int) -> User?:
@@ -114,13 +114,13 @@ fn find_active_user(users: List[User], target_id: Int) -> User?:
     return none
 ```
 
-the nested version of the same function is harder to extend, because every new
-condition adds a level rather than a line.
+The nested version of the same function is harder to extend, because every new
+condition adds a level instead of a line.
 
-## comments
+## Comments
 
-every `pub` item needs a doc comment: a `#` comment on the line directly above
-it. the linter checks it for public functions and methods (E304), and it is
+Every `pub` item needs a doc comment: a `#` comment on the line directly above
+it. The linter checks it for public functions and methods (E304), and it is
 what the documentation site renders.
 
 ```pith
@@ -129,7 +129,7 @@ pub fn read_config(path: String) -> String!:
     return fs.read(path)!
 ```
 
-inside a function, explain *why*, not *what*. the code already says what.
+Inside a function, explain *why*, not *what*. The code already says what.
 
 ```pith
 # good: a linear scan beats a map here; the list is never above ~100 entries
@@ -139,13 +139,13 @@ mut current_index := 0
 current_index = current_index + 1
 ```
 
-## errors and optionals
+## Errors and optionals
 
-pith has two failure shapes and they mean different things. an optional (`T?`,
-returning `none`) is for an absence that is ordinary and expected. a result
+Pith has two failure shapes, and they mean different things. An optional (`T?`,
+returning `none`) is for an absence that is ordinary and expected. A result
 (`T!`, built with `fail`) is for an operation that could not be completed.
 
-propagate with `!` when the caller cannot do better:
+Propagate with `!` when the caller cannot do better:
 
 ```pith
 pub fn load_user_data(user_id: Int) -> UserData!:
@@ -153,7 +153,7 @@ pub fn load_user_data(user_id: Int) -> UserData!:
     return parse_user_data(raw)
 ```
 
-handle explicitly when you can add context. `.is_err` and `.err` are fields,
+Handle explicitly when you can add context. `.is_err` and `.err` are fields,
 not method calls:
 
 ```pith
@@ -164,8 +164,8 @@ pub fn save_configuration(config: Configuration, path: String) -> Int!:
     return 0
 ```
 
-when the recovery is control flow rather than a value, use the block form of
-`catch`. the block runs only on the error path and must leave with `return`,
+When the recovery is control flow instead of a value, use the block form of
+`catch`. The block runs only on the error path and must leave with `return`,
 `fail`, `continue` or `break`:
 
 ```pith
@@ -175,12 +175,12 @@ for line in lines:
     rows.push(row)
 ```
 
-name the error when the block uses it, as in `catch err:`. the name is bound
+Name the error when the block uses it, as in `catch err:`. The name is bound
 to the result's error inside the block only.
 
-put cleanup for the error path in an `errdefer` right after the acquisition,
-instead of repeating it before every `fail`. use `defer` when the cleanup runs
-on every exit. see [defer.md](defer.md) for the rules.
+Put cleanup for the error path in an `errdefer` right after the acquisition,
+instead of repeating it before every `fail`. Use `defer` when the cleanup runs
+on every exit. See [defer.md](defer.md) for the rules.
 
 ```pith
 # good
@@ -205,7 +205,7 @@ fn open_session(host: String, port: Int) -> Session!:
     return Session(fd: fd, banner: reply.ok)
 ```
 
-consume an optional with `if let` when you need its value, with `unwrap_or`
+Consume an optional with `if let` when you need its value, with `unwrap_or`
 when a default will do, or with `match` when both cases do real work. `if let`
 works in any function:
 
@@ -216,14 +216,14 @@ fn describe(users: List[User], target_id: Int) -> String:
     return "no active user with that id"
 ```
 
-the checker does not narrow an optional after `if found == none: return`, so
+The checker does not narrow an optional after `if found == none: return`, so
 `found.name` on a later line is still an error. `found?.name` unwraps it, but
 `?` propagates the empty case, so it only compiles in a function that returns
 `T!`.
 
-## common patterns
+## Common patterns
 
-build a string from a few pieces with interpolation. to append in a loop, use
+Build a string from a few pieces with interpolation. To append in a loop, use
 a string buffer, which does not copy the text built so far on every append:
 
 ```pith
@@ -240,7 +240,7 @@ fn join_trimmed(input_lines: List[String]) -> String!:
     return out.string()
 ```
 
-use `+=`, `-=`, `*=` and `/=` on numeric variables, fields, and list or map
+Use `+=`, `-=`, `*=` and `/=` on numeric variables, fields, and list or map
 elements:
 
 ```pith
@@ -251,11 +251,11 @@ for chunk in chunks:
 counts[key] += 1
 ```
 
-compound assignment does not work on strings (E217), so write `s = s + ...`
+Compound assignment does not work on strings (E217), so write `s = s + ...`
 or use `io.string_buffer()` in a loop.
 
-name the fields when you build a struct whose fields share a type, or one that
-takes booleans. a reader should not have to open the declaration to know which
+Name the fields when you build a struct whose fields share a type, or one that
+takes booleans. A reader should not have to open the declaration to know which
 `""` is which:
 
 ```pith
@@ -266,11 +266,11 @@ ParseResult(is_error: true, key: "", value: "", error_message: "missing '='")
 ParseResult(true, "", "", "missing '='")
 ```
 
-positional construction is fine for small structs whose order is obvious, such
+Positional construction is fine for small structs whose order is obvious, such
 as `Point(3, 4)`.
 
-match on an enum instead of chaining `if` tests, so the checker reports a
-variant you forgot to handle (E204). a pattern names the enum
+Match on an enum instead of chaining `if` tests, so the checker reports a
+variant you forgot to handle (E204). A pattern names the enum
 (`Shape.Circle(radius)`); a bare name in a pattern is a binding that matches
 every value:
 
@@ -281,7 +281,7 @@ fn area(shape: Shape) -> Float:
         Shape.Rect(width, height) => width * height
 ```
 
-a collection literal with no elements needs a type, either from an annotation
+A collection literal with no elements needs a type, either from an annotation
 or from the first thing stored into it:
 
 ```pith
@@ -292,7 +292,7 @@ for user in all_users:
     active_users.push(user)
 ```
 
-mathematical code may use conventional short names:
+Mathematical code may use conventional short names:
 
 ```pith
 fn calculate_distance(x1: Float, y1: Float, x2: Float, y2: Float) -> Float:
@@ -301,15 +301,15 @@ fn calculate_distance(x1: Float, y1: Float, x2: Float, y2: Float) -> Float:
     return math.sqrt(dx * dx + dy * dy)
 ```
 
-## what to avoid
+## What to avoid
 
-**cryptic abbreviations.** `g_ooff` is not a name. `buf`, `tmp`, and `cur` are
-barely better. write `buffer`, `temporary_file`, `current_user`.
+**Cryptic abbreviations.** `g_ooff` is not a name. `buf`, `tmp`, and `cur` are
+barely better. Write `buffer`, `temporary_file`, `current_user`.
 
-**mixing abbreviation styles.** pick one and hold it. `current_position` next
+**Mixing abbreviation styles.** Pick one and hold it. `current_position` next
 to `pos` next to `idx` next to `current_pos` means four names for one idea.
 
-**deep nesting.** invert the conditions and return early instead:
+**Deep nesting.** Invert the conditions and return early instead:
 
 ```pith
 if not condition_a:
@@ -319,29 +319,29 @@ if not condition_b:
 do_something()
 ```
 
-**long chains of single letters.** cryptographic and codec code attracts these,
-and it is exactly the code that most needs to be checkable by eye. name the
+**Long chains of single letters.** Cryptographic and codec code attracts these,
+and it is the code that most needs to be checkable by eye. Name the
 state (`hash_state_a`) or, when the spec's own letters are the clearest
 reference, say so in a comment above the block.
 
-## abbreviations that are fine
+## Abbreviations that are fine
 
-these are common enough to read as words:
+These are common enough to read as words:
 
-| short | means | use it for |
+| Short | Means | Use it for |
 |-------|-------|------------|
-| `ctx` | context | request or execution context |
-| `cfg` | configuration | when `config` is already taken |
-| `err` | error | a local error value |
-| `id` | identifier | ids of any kind |
-| `req` | request | http and rpc handlers |
-| `resp` | response | http and rpc handlers |
+| `ctx` | Context | Request or execution context |
+| `cfg` | Configuration | When `config` is already taken |
+| `err` | Error | A local error value |
+| `id` | Identifier | IDs of any kind |
+| `req` | Request | HTTP and RPC handlers |
+| `resp` | Response | HTTP and RPC handlers |
 
-when in doubt, spell it out.
+When in doubt, spell it out.
 
-## file structure
+## File structure
 
-start a file with a short description of what the module is for:
+Start a file with a short description of what the module is for:
 
 ```pith
 # std.net.http - http/1.1 client with connection pooling
@@ -351,8 +351,8 @@ start a file with a short description of what the module is for:
 import std.net.tcp as tcp
 ```
 
-imports go at the top, grouped standard library first and then modules from
-your own package. there is no relative-import syntax: every import names a
+Imports go at the top, grouped standard library first and then modules from
+your own package. There is no relative-import syntax: every import names a
 module path.
 
 ```pith
@@ -362,20 +362,20 @@ import std.json as json
 import myapp.types as types
 ```
 
-## before you submit
+## Before you submit
 
-- every `pub` item has a doc comment
-- names are descriptive, and abbreviations are from the table above
-- functions do one thing
-- early returns instead of nesting
-- cleanup sits next to the acquisition, in a `defer` or `errdefer`
-- structs with same-typed or boolean fields are built with named fields
-- comments explain why
+- Every `pub` item has a doc comment
+- Names are descriptive, and abbreviations are from the table above
+- Functions do one thing
+- Early returns instead of nesting
+- Cleanup sits next to the acquisition, in a `defer` or `errdefer`
+- Structs with same-typed or boolean fields are built with named fields
+- Comments explain why
 
-`pith fmt --check` and `pith lint` check the mechanical half of this list. the rest is
-what review is for.
+`pith fmt --check` and `pith lint` check the mechanical half of this list. The
+rest is what review is for.
 
-## a worked example
+## A worked example
 
 ```pith
 # config_parser.pith - parse key=value configuration files
@@ -436,16 +436,16 @@ fn parse_setting_line(line: String, line_number: Int) -> ParseResult:
     return ParseResult(is_error: false, key: setting_key, value: setting_value, error_message: "")
 ```
 
-what the example is demonstrating: descriptive names, small functions with one
-job each, early returns, a `for` that supplies the line index instead of a
-hand-kept counter, named fields where several values share a type, a doc
-comment that says what the caller needs to know rather than restating the
-signature, and errors collected instead of thrown away.
+The example demonstrates descriptive names, small functions with one job each,
+early returns, a `for` that supplies the line index instead of a hand-kept
+counter, named fields where several values share a type, a doc comment that
+says what the caller needs to know instead of restating the signature, and
+errors collected instead of thrown away.
 
-## contributing
+## Contributing
 
-follow this guide, and update it when you introduce a pattern it does not
+Follow this guide, and update it when you introduce a pattern it does not
 cover. [idiomatic_pith.md](idiomatic_pith.md) covers which library calls and
 language features to reach for; this guide covers how to name, lay out and
-comment the code that uses them. the question worth asking before you submit is whether someone reading
+comment the code that uses them. Before you submit, ask whether someone reading
 this in six months will understand it.

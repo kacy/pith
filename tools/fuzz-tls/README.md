@@ -1,13 +1,15 @@
-# tls/x509 parser fuzzing
+# TLS/X.509 parser fuzzing
 
 `fuzz_tls.pith` feeds mutated real inputs to every attacker-reachable parser in
-the TLS and X.509 stack — certificate DER and PEM, ClientHello/ServerHello,
+the TLS and X.509 stack: certificate DER and PEM, ClientHello/ServerHello,
 HelloRetryRequest, EncryptedExtensions, NewSessionTicket, CertificateRequest,
-alerts, and the record layer — and holds them to two oracles:
+alerts, and the record layer.
 
-1. no call crashes the process or hangs; `ok` and `err` are both answers, a
+It holds every parser to two oracles:
+
+1. No call crashes the process or hangs. `ok` and `err` are both answers; a
    signal or a timeout is a bug.
-2. a parser that accepted a mutation must return a value the accessors can walk
+2. A parser that accepted a mutation must return a value the accessors can walk
    without dying.
 
 The corpus is built from the repo's certificate fixtures and from the stack's

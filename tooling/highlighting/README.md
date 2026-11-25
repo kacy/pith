@@ -1,21 +1,21 @@
-# pith syntax highlighting
+# Pith syntax highlighting
 
-this folder is the source of truth for pith syntax highlighting assets.
+This folder is the source of truth for Pith syntax highlighting assets.
 
-## contents
+## Contents
 
 - `pith.tmLanguage.json`: TextMate grammar for `.pith` files
-- `samples/*.pith`: representative pith snippets used to keep grammar coverage stable
-- `validate.sh`: non-destructive checks for grammar json validity and baseline scope/sample coverage
-- `linguist/`: files and notes to prepare the upstream github-linguist pull request
+- `samples/*.pith`: representative Pith snippets used to keep grammar coverage stable
+- `validate.sh`: non-destructive checks for grammar JSON validity and baseline scope and sample coverage
+- `linguist/`: files and notes to prepare the upstream GitHub Linguist pull request
 
-## local validation
+## Local validation
 
 ```bash
 ./tooling/highlighting/validate.sh
 ```
 
-## temporary github workaround
+## Temporary GitHub workaround
 
-the repo currently forces `.pith` to python highlighting through `.gitattributes`.
-this is temporary and will be removed once pith lands in github linguist.
+The repo currently forces `.pith` to Python highlighting through `.gitattributes`.
+This is temporary and will be removed once Pith lands in GitHub Linguist.

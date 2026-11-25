@@ -1,17 +1,18 @@
-# grpc client benchmark
+# gRPC client benchmark
 
-a small, fair comparison of three grpc clients making unary calls against one
-server: pith (`std.net.grpc` over its own tls + http/2 + protobuf), go
-(`grpc-go`), and rust (`tonic`). zig is left out — it has no grpc.
+This benchmark is a small, fair comparison of three gRPC clients making unary
+calls against one server: Pith (`std.net.grpc` over its own TLS, HTTP/2 and
+protobuf), Go (`grpc-go`), and Rust (`tonic`). Zig is left out because it has
+no gRPC.
 
-the server is a local `grpc-go` echo service over tls, using the repo's
-`tests/live/fixtures` localhost certificate so every client trusts the same ca
-and the whole thing runs on loopback. because all three clients hit the same
-server, the numbers reflect the clients, not the server.
+The server is a local `grpc-go` echo service over TLS. It uses the repo's
+`tests/live/fixtures` localhost certificate, so every client trusts the same CA
+and everything runs on loopback. All three clients hit the same server, so the
+differences in the numbers come from the clients.
 
-## running
+## Running
 
-from the repo root:
+From the repo root:
 
 ```
 bash bench/grpc/build.sh   # builds the go and rust binaries (needs go, cargo, protoc)
@@ -22,17 +23,17 @@ bash bench/grpc/run.sh     # starts the server and runs all three clients
 8-way concurrent over a single connection. `CALLS` and `WARMUP` override the
 call counts.
 
-## what it measures
+## What it measures
 
-throughput (calls/sec over a batch) is the common metric — all three compute it
-the same way, total calls over wall time. all three clients also time each call
-with a monotonic clock (`time.mono_nanos()` in pith) and print per-call median
-and p99 alongside throughput.
+Throughput (calls/sec over a batch) is the common metric. All three clients
+compute it the same way, as total calls over wall time. They also time each
+call with a monotonic clock (`time.mono_nanos()` in Pith) and print the
+per-call median and p99 alongside throughput.
 
-## the proto
+## The proto
 
-one bytes field, so the payload size is easy to vary. the service declares
-all four call shapes; the benchmark below exercises `Unary`:
+Each message has one bytes field, so the payload size is easy to vary. The
+service declares all four call shapes, and the benchmark exercises `Unary`:
 
 ```proto
 service Echo {

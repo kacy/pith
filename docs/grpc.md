@@ -1,20 +1,22 @@
-# grpc
+# gRPC
 
-pith speaks grpc end to end, in pure pith: no C, no tokio, no rustls. you write a
-`.proto`, run one codegen step, and get typed messages, a typed client, and a
-typed server. http/2, tls (1.2 and 1.3), hpack, and flow control are all handled underneath.
+Pith speaks gRPC end to end, in pure Pith, with no C, no tokio and no rustls. You
+write a `.proto`, run one codegen step, and get typed messages, a typed client,
+and a typed server. HTTP/2, TLS (1.2 and 1.3), HPACK, and flow control are all
+handled underneath.
 
-there's one idea worth holding onto: **codegen owns the wire; you own the
-handlers.** protogen turns a `.proto` into messages, their encoders and decoders,
-a client, and a server router. all you write is the business logic, one typed
-handler per rpc, plus one call to start serving.
+Codegen owns the wire, and you own the handlers. The protogen tool turns a
+`.proto` into messages, their encoders and decoders, a client, and a server
+router. All you write is the business logic, one typed handler per RPC, plus
+one call to start serving.
 
-the whole example below runs as `examples/grpc_catalog.pith` (server and client
-in one process); `pith run examples/grpc_catalog.pith` to see it round-trip.
+The whole example below runs as `examples/grpc_catalog.pith` (server and client
+in one process). Run `pith run examples/grpc_catalog.pith` to see it round-trip.
 
-## the proto
+## The proto
 
-nothing pith-specific. plain proto3. a small product catalog:
+The proto is plain proto3, with nothing Pith-specific. Here is a small product
+catalog:
 
 ```proto
 syntax = "proto3";
@@ -54,24 +56,24 @@ service Catalog {
 }
 ```
 
-## generate
+## Generate
 
 ```
 ./tools/protogen/protogen catalog.proto catalog_gen.pith
 ```
 
-`catalog_gen.pith` is generated — don't edit it. import it like any module.
+`catalog_gen.pith` is generated, so don't edit it. Import it like any module.
 
-## what you get
+## What you get
 
-**enums** become named `Int` constants:
+Enums become named `Int` constants:
 
 ```pith
 pub Category_ELECTRONICS := 1
 ```
 
-**each message** becomes a struct plus a codec pair. proto types map to pith
-types the obvious way: `int32` → `Int`, `double` → `Float`, `repeated T` →
+Each message becomes a struct plus a codec pair. Proto types map to Pith types
+the obvious way: `int32` → `Int`, `double` → `Float`, `repeated T` →
 `List[T]`, a nested message field → an optional, `bytes` → `Bytes`.
 
 ```pith
@@ -87,14 +89,14 @@ pub fn encode_Product(m: Product) -> Bytes
 pub fn decode_Product(data: Bytes) -> Product!ProtoError
 ```
 
-**the service** becomes a typed client and a typed server. those wrap the codecs,
+The service becomes a typed client and a typed server. Those wrap the codecs,
 so you rarely call `encode_`/`decode_` yourself.
 
-## the server
+## The server
 
-implement one handler per rpc, `(Req) -> Resp!grpc.GrpcError`, and hand them to
-the generated `serve_Catalog`. the generated router decodes each request,
-dispatches by method path, and encodes the reply. you never touch a byte:
+Implement one handler per RPC, `(Req) -> Resp!grpc.GrpcError`, and hand them to
+the generated `serve_Catalog`. The generated router decodes each request,
+dispatches by method path, and encodes the reply, so you never touch a byte:
 
 ```pith
 import catalog_gen as cat
@@ -129,13 +131,13 @@ fn main() -> Int!:
 ```
 
 `serve_Catalog` blocks and serves connections concurrently on the green-thread
-runtime. it takes a handler per rpc, in proto order. a request for an unknown
+runtime. It takes a handler per RPC, in proto order. A request for an unknown
 method comes back as `UNIMPLEMENTED`, and a request that fails to decode comes
-back as `INVALID_ARGUMENT`. neither is code you write.
+back as `INVALID_ARGUMENT`. You write no code for either.
 
-a streaming rpc changes the handler's shape, not its nature: a streamed side
-becomes a `List`. server-streaming returns one, client-streaming receives one,
-bidi does both:
+In a streaming RPC, each streamed side of the handler becomes a `List`. A
+server-streaming handler returns one, a client-streaming handler receives one,
+and a bidi handler does both:
 
 ```pith
 # rpc ListProducts(SearchRequest) returns (stream Product)
@@ -147,20 +149,20 @@ fn batch_add(reqs: List[cat.Product]) -> cat.SearchResponse!grpc.GrpcError:
     ...
 ```
 
-the generated router frames each element as one stream message; the client reads
-them back one at a time (or `collect()`s them). generated streams under
-`serve_Catalog` are *buffered* — a handler receives the complete request list
+The generated router frames each element as one stream message, and the client
+reads them back one at a time (or `collect()`s them). Generated streams under
+`serve_Catalog` are *buffered*: a handler receives the complete request list
 and returns the complete reply list, so the whole stream passes through memory.
-that fits bounded streams (search results, batch writes, event replay), not
-endless ones.
+That suits bounded streams (search results, batch writes, event replay), but
+not endless ones.
 
-### streaming, incrementally
+### Streaming, incrementally
 
-for interactive or endless streams, protogen also generates an incremental
-server: `serve_Catalog_streaming` (and `_tls`). one listener serves the whole
-service — unary handlers keep the `(Req) -> Resp` shape above, while each
-streaming rpc's handler works a typed `<Svc><Rpc>ServerCall` message by
-message. nothing is buffered end to end, so a bidi handler can answer message 1
+For interactive or endless streams, protogen also generates an incremental
+server: `serve_Catalog_streaming` (and `_tls`). One listener serves the whole
+service. Unary handlers keep the `(Req) -> Resp` shape above, while each
+streaming RPC's handler works through a typed `<Svc><Rpc>ServerCall` message by
+message. Nothing is buffered end to end, so a bidi handler can answer message 1
 while the client is still composing message 2:
 
 ```pith
@@ -187,29 +189,29 @@ fn import_products(call: cat.CatalogImportServerCall) -> Int!grpc.GrpcError:
 cat.serve_Catalog_streaming("0.0.0.0", 50051, get_product, search, tail, import_products)!
 ```
 
-a bidi handler looks like the client-streaming one — `recv()` and `send()`
-interleave however the conversation needs. the call also carries `metadata()`,
+A bidi handler looks like the client-streaming one, with `recv()` and `send()`
+interleaved however the conversation needs. The call also carries `metadata()`,
 `deadline_ms()`, and `finish(status, message)` for ending with a non-OK status
-mid-stream; a handler that fails before sending anything becomes a compact
-trailers-only error response. a message that fails to decode surfaces from
-`recv()` as `INVALID_ARGUMENT`. a runtime error inside a handler (an index out
+mid-stream. A handler that fails before sending anything becomes a compact
+trailers-only error response. A message that fails to decode surfaces from
+`recv()` as `INVALID_ARGUMENT`. A runtime error inside a handler (an index out
 of range, a missing map key, a division by zero) fails that call with
-`INTERNAL` and the message `internal error`; the error itself goes to the
+`INTERNAL` and the message `internal error`. The error itself goes to the
 server's stderr, and the server keeps serving (docs/failure_isolation.md).
 
-pick the listener by the service's needs: `serve_Catalog` when every stream is
-bounded (the `List` shapes are the simplest to write), `serve_Catalog_streaming`
-when any rpc is interactive or long-lived. underneath both sit on
-`std.net.grpc`; `grpc.serve_stream` remains the low-level api when you want to
-route and encode by hand — `examples/grpc_chat.pith` does that, and
+Pick the listener by the service's needs: `serve_Catalog` when every stream is
+bounded (the `List` shapes are the simplest to write), and
+`serve_Catalog_streaming` when any RPC is interactive or long-lived. Both sit on
+`std.net.grpc`. `grpc.serve_stream` remains the low-level API when you want to
+route and encode by hand. `examples/grpc_chat.pith` does that, and
 `examples/grpc_reflect.pith` is the same idea through the generated stubs.
 
-one thing to watch: the accept loop is concurrent, so if a handler *mutates*
-shared state (a seeded read-only store is fine), guard it with a `Mutex`.
+The accept loop is concurrent, so if a handler *mutates* shared state (a seeded
+read-only store is fine), guard it with a `Mutex`.
 
-## the client
+## The client
 
-the generated client is a thin typed wrapper over a connection:
+The generated client is a thin typed wrapper over a connection:
 
 ```pith
 import catalog_gen as cat
@@ -233,29 +235,29 @@ fn main() -> Int!:
     return 0
 ```
 
-a call that returns a non-OK status fails with a `grpc.GrpcError` carrying the
-status code and message — the same `NOT_FOUND` your handler raised arrives here as
-`err.status == grpc.GRPC_NOT_FOUND`. the calls sit in their own function because
-`!` only propagates an error of the enclosing function's error type, and
-`dial_h2c` fails with a `String` rather than a `GrpcError`.
+A call that returns a non-OK status fails with a `grpc.GrpcError` carrying the
+status code and message. The same `NOT_FOUND` your handler raised arrives here
+as `err.status == grpc.GRPC_NOT_FOUND`. The calls sit in their own function
+because `!` only propagates an error of the enclosing function's error type,
+and `dial_h2c` fails with a `String`, not a `GrpcError`.
 
-### streaming calls
+### Streaming calls
 
-a streaming rpc's client method returns a typed `<Svc><Rpc>Call` handle. on the
+A streaming RPC's client method returns a typed `<Svc><Rpc>Call` handle. On the
 request side, `send(req)` encodes and frames one message and `close_send()`
-half-closes. on the response side, `recv()` reads one reply,
-`recv_response()` reads the single reply of a client-streaming rpc, and
-`collect()` gathers every remaining reply into a `List`. every handle has a
-`close()` that releases the stream; call it once you are done. a handle dropped
-without `close()` releases the stream as well. if the rpc was still running,
+half-closes. On the response side, `recv()` reads one reply,
+`recv_response()` reads the single reply of a client-streaming RPC, and
+`collect()` gathers every remaining reply into a `List`. Every handle has a
+`close()` that releases the stream; call it once you are done. A handle dropped
+without `close()` releases the stream as well. If the RPC was still running,
 the drop also resets it, provided the connection's send queue has room.
 
-`recv()` is on the server-streaming and bidi handles. it blocks for the next
+`recv()` is on the server-streaming and bidi handles. It blocks for the next
 response and returns a `<Svc><Rpc>Reply`, the client-side mirror of the
 server's `<Svc><Rpc>Recv`. `done` is false with the decoded `message`, or true
 once the server has finished the stream with OK (`message` is then an
-all-default value). a non-OK status or a reset fails with the `GrpcError`,
-and a reply that does not decode fails with `INTERNAL`. a bidi client can use
+all-default value). A non-OK status or a reset fails with the `GrpcError`,
+and a reply that does not decode fails with `INTERNAL`. A bidi client can use
 `recv()` to talk turn by turn, reading each answer before it composes the next
 request:
 
@@ -274,9 +276,10 @@ stream on its own: a server-streaming reply, or a bidi call after
 `close_send()`. `examples/grpc_reflect.pith` drives all four call shapes this
 way.
 
-## tls
+## TLS
 
-serve over tls with a cert and key; dial with a tls config that offers alpn `h2`:
+Serve over TLS with a cert and key, and dial with a TLS config that offers ALPN
+`h2`:
 
 ```pith
 cat.serve_Catalog_tls("0.0.0.0", 443, "server.crt", "server.key", get_product, search)!
@@ -287,18 +290,19 @@ defer cfg.close()
 conn := grpc.dial_with_config("catalog.internal", 443, cfg)!
 ```
 
-use `dial_with_config` when the server's cert is signed by a private ca; plain
+Use `dial_with_config` when the server's cert is signed by a private CA; plain
 `grpc.dial` trusts the system roots.
 
-the config is the caller's here, so the caller closes it — see
-[who closes a config](tls.md#who-closes-a-config). closing it once `dial_with_config`
-has returned is fine: the connection is already up and does not read the config
-again. `grpc.dial` builds its own config and closes it for you.
+The config is the caller's here, so the caller closes it (see
+[who closes a config](tls.md#who-closes-a-config)). Closing it once
+`dial_with_config` has returned is fine: the connection is already up and does
+not read the config again. `grpc.dial` builds its own config and closes it for
+you.
 
-## deadlines and metadata
+## Deadlines and metadata
 
-a client attaches metadata — custom request headers, as a flat `[k1, v1, ...]`
-list — and a deadline to a unary call:
+A client attaches metadata (custom request headers, as a flat `[k1, v1, ...]`
+list) and a deadline to a unary call:
 
 ```pith
 reply := conn.unary_with_headers("/pkg.Svc/Method", req, ["x-tenant", "acme"])!
@@ -306,15 +310,15 @@ reply := conn.unary_with_deadline("/pkg.Svc/Method", req, 1500)!   # 1.5s
 reply := conn.unary_with_headers_and_deadline("/pkg.Svc/Method", req, md, 1500)!
 ```
 
-a deadline does two things: the call sends the canonical `grpc-timeout` request
+A deadline does two things. The call sends the canonical `grpc-timeout` request
 header (`1500m`; whole seconds past eight digits of millis) so the server can
 stop working once the time is up, and the client itself gives up after the
-timeout, failing with `GRPC_DEADLINE_EXCEEDED`. the streaming openers have
+timeout, failing with `GRPC_DEADLINE_EXCEEDED`. The streaming openers have
 metadata variants too (`server_stream_with_headers`, `client_stream_with_headers`,
-`bidi_stream_with_headers`) but no deadline enforcement — cap a stream's
+`bidi_stream_with_headers`) but no deadline enforcement, so cap a stream's
 lifetime yourself.
 
-on the server, a dispatch reads the calling request's context back:
+On the server, a dispatch reads the calling request's context back:
 
 ```pith
 fn dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
@@ -326,51 +330,51 @@ fn dispatch(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
 `incoming_metadata()` is the request's custom headers, lowercase-keyed, minus
 the transport and reserved `grpc-*` headers. `incoming_deadline_ms()` is the
 absolute deadline as a `time.mono_millis()` timestamp, `0` when the client sent
-none. a request whose deadline is already spent when it reaches the dispatch is
-answered `DEADLINE_EXCEEDED` without the handler running at all; past that
-point enforcement is the handler's job — check the deadline between steps of
-long work. on the `serve_stream` path the live `GrpcStream` carries the same
+none. A request whose deadline is already spent when it reaches the dispatch is
+answered `DEADLINE_EXCEEDED` without the handler running at all. Past that
+point, enforcement is the handler's job: check the deadline between steps of
+long work. On the `serve_stream` path the live `GrpcStream` carries the same
 context as `metadata()` and `deadline_ms()`.
 
-this is initial (request) metadata only. trailing metadata — custom trailers
-beyond `grpc-status`/`grpc-message` — is not supported in either direction.
+This is initial (request) metadata only. Trailing metadata (custom trailers
+beyond `grpc-status`/`grpc-message`) is not supported in either direction.
 
-## status codes
+## Status codes
 
-the full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
+The full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
 `GRPC_INVALID_ARGUMENT`, `GRPC_UNIMPLEMENTED`, `GRPC_INTERNAL`, and the rest.
-`grpc.status_name(code)` gives the canonical name. raise them from a handler with
-`fail grpc.GrpcError(status: ..., message: ...)`.
+`grpc.status_name(code)` gives the canonical name. Raise them from a handler
+with `fail grpc.GrpcError(status: ..., message: ...)`.
 
-## limits
+## Limits
 
-the server refuses oversized input rather than trying to buffer it, and a
-client channel bounds what a server can make it buffer. none of these are
-configurable yet. they sit well above what ordinary traffic needs, so
+The server refuses oversized input instead of trying to buffer it, and a
+client channel bounds what a server can make it buffer. None of these limits
+are configurable yet. They sit well above what ordinary traffic needs, so
 hitting one usually means something is wrong on the wire, not that the limit is
 too low.
 
-| limit | value | what happens past it |
+| Limit | Value | What happens past it |
 | --- | --- | --- |
 | `grpc.MAX_MESSAGE_BYTES` | 4 MiB | `RESOURCE_EXHAUSTED`, refused as soon as the frame header is read |
 | `grpc.MAX_STREAM_MESSAGES` | 65536 | `RESOURCE_EXHAUSTED` on a buffered request stream |
-| `protobuf.MAX_NESTING_DEPTH` | 100 | the decode fails; a self-referential message cannot recurse without bound |
-| `http.MAX_REQUEST_BODY` | 10 MiB | the stream is reset |
-| http/2 frame payload | 16 KiB, the `SETTINGS_MAX_FRAME_SIZE` the server advertises | the connection is closed with a `FRAME_SIZE_ERROR` GOAWAY, refused from the frame header before any payload is buffered |
-| unary response on a dialed channel | `grpc.MAX_MESSAGE_BYTES` plus its 5-byte prefix | `RESOURCE_EXHAUSTED`; the http/2 stream is cancelled as soon as the body passes it |
-| concurrent streams per connection | 128 | `REFUSED_STREAM` |
-| concurrent connections per listener | 512 | the accept loop waits for one to end |
-| idle socket | 2 minutes | the connection is dropped |
+| `protobuf.MAX_NESTING_DEPTH` | 100 | The decode fails; a self-referential message cannot recurse without bound |
+| `http.MAX_REQUEST_BODY` | 10 MiB | The stream is reset |
+| HTTP/2 frame payload | 16 KiB, the `SETTINGS_MAX_FRAME_SIZE` the server advertises | The connection is closed with a `FRAME_SIZE_ERROR` GOAWAY, refused from the frame header before any payload is buffered |
+| Unary response on a dialed channel | `grpc.MAX_MESSAGE_BYTES` plus its 5-byte prefix | `RESOURCE_EXHAUSTED`; the HTTP/2 stream is cancelled as soon as the body passes it |
+| Concurrent streams per connection | 128 | `REFUSED_STREAM` |
+| Concurrent connections per listener | 512 | The accept loop waits for one to end |
+| Idle socket | 2 minutes | The connection is dropped |
 
-a body that is not framed cleanly — truncated, a length prefix that runs past
-what arrived, or bytes that were never framed at all — fails
-`INVALID_ARGUMENT` rather than decoding as an all-default message. a unary
+A body that is not framed cleanly (truncated, a length prefix that runs past
+what arrived, or bytes that were never framed at all) fails with
+`INVALID_ARGUMENT` instead of decoding as an all-default message. A unary
 request carrying more than one message fails the same way.
 
-## interceptors
+## Interceptors
 
-an interceptor wraps the dispatch the way a `std.web` middleware wraps a route
-handler. it takes the rest of the chain plus the call, so it can run code
+An interceptor wraps the dispatch the way a `std.web` middleware wraps a route
+handler. It takes the rest of the chain plus the call, so it can run code
 before or after, or answer the call itself and never reach the dispatch:
 
 ```pith
@@ -384,40 +388,41 @@ grpc.serve("0.0.0.0", 50051, guarded)!
 
 `intercept` wraps any `fn(String, Bytes) -> Bytes!grpc.GrpcError` dispatch and
 returns a dispatch of the same type, so it drops into `serve`, `serve_tls`,
-`serve_body`, or `serve_body_tls` without changing a signature. the first interceptor in
-the list runs outermost, seeing the call first and the reply last.
+`serve_body`, or `serve_body_tls` without changing a signature. The first
+interceptor in the list runs outermost, seeing the call first and the reply
+last.
 
-three come ready made:
+Three come ready-made:
 
 - `grpc.authorize(verify)` runs `verify` against the caller's metadata before
-  any method body, and answers `UNAUTHENTICATED` when it returns false. this is
-  the transport-level auth hook: one interceptor covers every rpc the server
+  any method body, and answers `UNAUTHENTICATED` when it returns false. This is
+  the transport-level auth hook: one interceptor covers every RPC the server
   exposes. `grpc.bearer_token(metadata)` pulls the token out of an
-  `authorization` header (matching the scheme case-insensitively, as rfc 7235
-  requires), so verifying a jwt is a one-liner against `std.crypto.jwt`.
+  `authorization` header (matching the scheme case-insensitively, as RFC 7235
+  requires), so verifying a JWT is a one-liner against `std.crypto.jwt`.
 - `grpc.rate_limit(limiter)` spends a token per call and answers
   `RESOURCE_EXHAUSTED` when the bucket is dry.
-- `grpc.circuit(breaker)` opens on repeated *server* faults — `INTERNAL`,
-  `UNAVAILABLE`, `DATA_LOSS`, an expired deadline — and answers `UNAVAILABLE`
-  while open. a caller's own error (`NOT_FOUND`, an invalid argument, a refused
-  credential) does not count against it: a client sending bad requests is not a
-  reason to stop serving good ones.
+- `grpc.circuit(breaker)` opens on repeated *server* faults (`INTERNAL`,
+  `UNAVAILABLE`, `DATA_LOSS`, an expired deadline) and answers `UNAVAILABLE`
+  while open. A caller's own error (`NOT_FOUND`, an invalid argument, a refused
+  credential) does not count against it, since a client sending bad requests is
+  no reason to stop serving good ones.
 
-the last two take the same `std.resilience` `Limiter` and `Breaker` that
-`web.rate_limit` and `web.circuit` take, so one limiter can cap an http surface
-and a grpc surface together.
+The last two take the same `std.resilience` `Limiter` and `Breaker` that
+`web.rate_limit` and `web.circuit` take, so one limiter can cap an HTTP surface
+and a gRPC surface together.
 
-`examples/grpc_interceptors.pith` runs the whole shape end to end — a service
+`examples/grpc_interceptors.pith` runs the whole shape end to end: a service
 that knows nothing about auth or rate limiting, guarded by both, called by a
 client that presents its credential once.
 
-writing your own: an interceptor that refuses a call returns
-`grpc.refuse(status, message)` rather than failing directly, because a pith
-lambda can neither `fail` nor use `!`. return `next(path, request)` to pass the
+When you write your own, an interceptor that refuses a call returns
+`grpc.refuse(status, message)` instead of failing directly, because a Pith
+lambda can neither `fail` nor use `!`. Return `next(path, request)` to pass the
 call along.
 
-on the client, a credential belongs on the channel rather than on every call
-site:
+On the client, a credential goes on the channel, so call sites do not repeat
+it:
 
 ```pith
 conn := grpc.dial_h2c("localhost", 50051)!
@@ -425,22 +430,22 @@ conn.set_credentials(["authorization", "Bearer " + token])
 reply := conn.unary("/chat.Chat/Send", req)!     # carries the credential
 ```
 
-per-call metadata still works through the `*_with_headers` forms and is appended
-after the channel's, so a call can add to the credentials but not silently drop
-them.
+Per-call metadata still works through the `*_with_headers` forms and is
+appended after the channel's, so a call can add to the credentials but not
+silently drop them.
 
-## graceful shutdown
+## Graceful shutdown
 
-every `serve*` entry point rides the http/2 accept loop, so they all drain on
-`SIGTERM` once `std.shutdown.on_signals()` has been called. the listener stops
-accepting, the rpcs already in progress run to their trailers, and `serve`
-returns the work left unfinished at the grace period — `0` for a clean drain. an
-rpc is never severed by the drain itself, and every peer reads a grpc-status.
+Every `serve*` entry point runs on the HTTP/2 accept loop, so they all drain on
+`SIGTERM` once `std.shutdown.on_signals()` has been called. The listener stops
+accepting, the RPCs already in progress run to their trailers, and `serve`
+returns the work left unfinished at the grace period (`0` for a clean drain).
+The drain itself never severs an RPC, and every peer reads a grpc-status.
 
-### streams that never end
+### Streams that never end
 
-a stream that never ends would outlast any grace period, so the period is split
-in half. the first half is the handler's:
+A stream that never ends would outlast any grace period, so the period is split
+in half. The first half is the handler's:
 
 ```pith
 while not call.closing():
@@ -449,36 +454,37 @@ call.finish_ok()
 ```
 
 `closing()` is on the live `GrpcStream` and on every generated typed
-`ServerCall`, and goes true the moment a drain starts. a handler that polls it
+`ServerCall`, and goes true the moment a drain starts. A handler that polls it
 ends its stream on its own terms, with its own status.
 
-the second half is the framework's. every rpc still open at the midpoint is
+The second half is the framework's. Every RPC still open at the midpoint is
 finished for it with `UNAVAILABLE` and the message `grpc: server is shutting
-down`, and then the connection is wound down: a GOAWAY, a cancel for any handler
-parked on a receive, and finally the socket. so a handler that ignores `closing()`
-entirely — even one asleep between two sends — still leaves its peer a real
-grpc-status to act on rather than a truncated body, and still lets the drain
-finish instead of burning the whole period waiting on a peer that had no reason
-to hang up.
+down`, and then the connection is wound down: a GOAWAY, a cancel for any
+handler parked on a receive, and finally the socket. A handler that ignores
+`closing()` entirely, even one asleep between two sends, still leaves its peer
+a real grpc-status to act on instead of a truncated body. It also still lets
+the drain finish instead of spending the whole period waiting on a peer that
+had no reason to hang up.
 
-that is a fallback, not a design. `grpc.streams_closed_by_shutdown()` counts the
-rpcs the framework had to close; anything but `0` names a handler to fix. see
-[docs/signals.md](signals.md) for the shared machinery.
+Handlers should not rely on this fallback. `grpc.streams_closed_by_shutdown()`
+counts the RPCs the framework had to close, and anything but `0` names a
+handler to fix. See [docs/signals.md](signals.md) for the shared machinery.
 
-## what isn't here yet
+## What isn't here yet
 
-- **protogen doesn't cover** proto2, `bool`/`fixed` map keys, repeated
-  `sint`/`fixed`/`float`/`double` fields, or the well-known types beyond
+- **Unsupported proto features**: proto2, `bool`/`fixed` map keys, repeated
+  `sint`/`fixed`/`float`/`double` fields, and the well-known types beyond
   Timestamp, Duration, Empty, and the wrappers (no Any, Struct, FieldMask, …).
-  it stops with a clear error naming the feature. `oneof` (a payload enum per
-  group) and `map<k,v>` (a pith `Map`, string or integer keys) are supported.
-- **message compression and trailing metadata** are not supported; deadlines
+  The generator stops with a clear error naming the feature. `oneof` (a payload
+  enum per group) and `map<k,v>` (a Pith `Map`, string or integer keys) are
+  supported.
+- **Message compression and trailing metadata** are not supported. Deadlines
   are enforced at the edges (client timeout, server expiry-on-arrival), not by
   cancelling a handler mid-flight.
-- **observability**: the client opens a trace span and records red metrics per
-  call automatically. the server side is your code — an interceptor is the
+- **Observability**: the client opens a trace span and records RED metrics per
+  call automatically. The server side is your code. An interceptor is the
   place to put it, since it sees every method.
-- **interceptors are server-side and unary.** the client has channel-wide
+- **Interceptors are server-side and unary.** The client has channel-wide
   credentials but no interceptor chain of its own, and a server interceptor
-  wraps the unary dispatch; the streaming serve forms take their own dispatch
+  wraps the unary dispatch. The streaming serve forms take their own dispatch
   shapes and are not wrapped by `intercept`.

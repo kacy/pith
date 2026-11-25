@@ -2,12 +2,13 @@
 #
 # concatenates docs/*.md, in name order, and repeats the result until it
 # reaches the requested size, then renders it to html `rounds` times with the
-# safe defaults. the document is built outside the timed section. the checksum
-# is the html length folded with a sample of its bytes, so an arm that renders
-# differently cannot look fast. run it from the repository root:
+# safe defaults, the gfm extensions on unless the third argument is `off`. the
+# document is built outside the timed section. the checksum is the html length
+# folded with a sample of its bytes, so an arm that renders differently cannot
+# look fast. run it from the repository root:
 #
 #   pith build bench/markdown_render.pith
-#   ./bench/markdown_render <megabytes> <rounds>
+#   ./bench/markdown_render <megabytes> <rounds> [off]
 import std.fs as fs
 import std.glob as glob
 import std.markdown as markdown
@@ -32,6 +33,9 @@ fn load_docs() -> String!:
 fn main() -> Int!:
     megabytes := arg_or(1, 10)
     rounds := arg_or(2, 3)
+    argv := args()
+    gfm := argv.len() <= 3 or argv[3] != "off"
+    opts := markdown.options().gfm(gfm)
     docs := load_docs()!
     target := megabytes * 1048576
     mut copies: List[String] := []
@@ -44,7 +48,7 @@ fn main() -> Int!:
     start := time()
     mut checksum := 0
     for round in 0..rounds:
-        page := markdown.to_html(source)
+        page := markdown.render(source, opts)
         checksum += page.len()
         mut i := round % 7
         while i < page.len():
@@ -55,6 +59,7 @@ fn main() -> Int!:
     print("markdown render benchmark")
     print("input_bytes=" + source.len().to_string())
     print("rounds=" + rounds.to_string())
+    print("gfm=" + gfm.to_string())
     print("elapsed_ms=" + elapsed.to_string())
     print("mb_per_s=" + (bytes * 1000 / elapsed / 1048576).to_string())
     print("checksum=" + checksum.to_string())

@@ -124,6 +124,11 @@ task the handler spawned. see
   value has every delimiter encoded, and compile refuses a value inside
   `<script>`, `<style>`, an event handler, `style` or `srcdoc`.
   see [docs/html.md](docs/html.md).
+- markdown: `std.markdown` shows raw html as text and checks link and
+  image urls after decoding them, unless the options turn that off. a
+  template's `<%md %>` always uses those defaults and compiles only in
+  element text. `std.web.pages` opens only `.md` files under its
+  directory, capped at 1 MiB. see [docs/markdown.md](docs/markdown.md).
 - yaml: no anchors, aliases or tags, with caps on depth and input
   size.
 - databases: the postgres and mysql drivers send parameters

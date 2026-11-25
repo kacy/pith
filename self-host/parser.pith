@@ -4,7 +4,8 @@
 # the entry points are parse_with_file() and parse(); parse_main.pith is
 # a small command-line wrapper around them.
 
-from lexer import Token, int_literal_magnitude, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr, interp_escape_kind, INTERP_ESCAPE_COLLAPSED, INTERP_ESCAPE_KEPT
+from lexer import int_literal_magnitude, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot
+from std.pith.lexer import Token, unescape_interp_expr, interp_raw_offsets, split_format_spec
 from ast import add_node, add_node_with_type_args, add_leaf, get_node, node_count, set_node_value, set_node_name_position, node_kind, from_import_alias_receiver
 from errors import Diagnostic
 
@@ -807,7 +808,7 @@ fn parse_postfix() -> Int:
                     for a in call_args:
                         children.push(a)
                     expr = add_node_from_mark("method_call", name_tok.value, children, mark)
-                    set_node_name_position(expr, name_tok.current_line, name_tok.current_column)
+                    set_node_name_position(expr, name_tok.line, name_tok.column)
                 elif check("lbracket") and method_type_args_follow(expr):
                     # method call with written type arguments: expr.name[T](args).
                     # the receiver and the arguments sit where every method call
@@ -826,12 +827,12 @@ fn parse_postfix() -> Int:
                         children.push(a)
                     pos := position_from_mark(mark)
                     expr = track_tree_depth(add_node_with_type_args("method_call", name_tok.value, children, type_args, pos.0, pos.1), "method_call", children)
-                    set_node_name_position(expr, name_tok.current_line, name_tok.current_column)
+                    set_node_name_position(expr, name_tok.line, name_tok.column)
                 else:
                     # field access: expr.name
                     mut children: List[Int] := [expr]
                     expr = add_node_from_mark("field_access", name_tok.value, children, mark)
-                    set_node_name_position(expr, name_tok.current_line, name_tok.current_column)
+                    set_node_name_position(expr, name_tok.line, name_tok.column)
 
         elif kind == "lbrace":
             # struct init: TypeName{...}
@@ -1406,89 +1407,6 @@ fn parse_string_interpolation() -> Int:
 
     return add_node_from_mark("string_interp", "", parts, mark)
 
-# split "expr:spec" at a top-level colon when the suffix reads as a
-# format spec: optional alignment (< > ^), optional zero flag, width
-# digits, optional .precision. colons inside strings or brackets never
-# split, and a suffix that isn't a spec leaves the text untouched.
-fn split_format_spec(text: String) -> (String, String):
-    mut depth := 0
-    mut in_str := false
-    mut i := 0
-    mut colon := 0 - 1
-    while i < text.len():
-        c := text[i]
-        if in_str:
-            if c == chr(34):
-                in_str = false
-        elif c == chr(34):
-            in_str = true
-        elif c == "(" or c == "[":
-            depth = depth + 1
-        elif c == ")" or c == "]":
-            depth = depth - 1
-        elif c == ":" and depth == 0:
-            colon = i
-            i = text.len()
-        i = i + 1
-    if colon <= 0:
-        return (text, "")
-    spec := text.substring(colon + 1, text.len())
-    if is_format_spec(spec):
-        return (text.substring(0, colon), spec)
-    return (text, "")
-
-fn is_format_spec(spec: String) -> Bool:
-    if spec.len() == 0:
-        return false
-    mut i := 0
-    c0 := spec[0]
-    if c0 == "<" or c0 == ">" or c0 == "^":
-        i = 1
-    mut digits := 0
-    mut dot := false
-    mut frac_digits := 0
-    while i < spec.len():
-        c := spec[i]
-        if c == ".":
-            if dot:
-                return false
-            dot = true
-        elif c >= "0" and c <= "9":
-            if dot:
-                frac_digits = frac_digits + 1
-            else:
-                digits = digits + 1
-        else:
-            return false
-        i = i + 1
-    if dot and frac_digits == 0:
-        return false
-    return digits > 0 or frac_digits > 0
-
-# where the character at `out_offset` of the unescaped fragment sits in
-# `raw`, the text the fragment was cut from. unescaping collapses `\"`
-# and `\\` to one character each outside a bare-quoted literal, so every
-# offset past one of those is short by one in the fragment; walking the raw
-# text the same way the unescaper does gives the source offset back.
-fn raw_offset_in_fragment(raw: String, out_offset: Int) -> Int:
-    mut i := 0
-    mut out := 0
-    mut in_literal := false
-    while i < raw.len() and out < out_offset:
-        kind := interp_escape_kind(raw, i, in_literal)
-        if kind == INTERP_ESCAPE_COLLAPSED:
-            i = i + 2
-            out = out + 1
-        elif kind == INTERP_ESCAPE_KEPT:
-            i = i + 2
-            out = out + 2
-        else:
-            if ord(raw[i]) == 34:
-                in_literal = not in_literal
-            i = i + 1
-            out = out + 1
-    return i
-
 # parse the expression inside a `{}` interpolation.
 #
 # the expression is sub-lexed as its own fragment, so its tokens come back
@@ -1520,15 +1438,16 @@ fn parse_interp_expr(text: String, base_line: Int, base_col: Int) -> Int:
 
     # sub-lex and sub-parse the interpolation expression
     raw_tokens := lex_all(unescape_interp_expr(text))
+    raw_offsets := interp_raw_offsets(text)
     mut sub_tokens: List[Token] := []
     for tok in raw_tokens:
         mut tok_line_out := base_line
         mut tok_col_out := base_col
-        if tok.current_line > 1:
-            tok_line_out = base_line + tok.current_line - 1
-            tok_col_out = tok.current_column
+        if tok.line > 1:
+            tok_line_out = base_line + tok.line - 1
+            tok_col_out = tok.column
         else:
-            tok_col_out = base_col + raw_offset_in_fragment(text, tok.offset)
+            tok_col_out = base_col + raw_offsets[tok.offset]
         sub_tokens.push(Token(tok.kind, tok.value, tok_line_out, tok_col_out, tok.offset, tok.len))
     load_tokens(sub_tokens)
     current_token_position = 0
@@ -1638,12 +1557,12 @@ fn parse_pattern_nested() -> Int:
                         fields.push(parse_pattern())
                 expect("rparen")
                 pat := add_node_from_mark("pat_variant", enum_name + "." + variant_tok.value, fields, mark)
-                set_node_name_position(pat, variant_tok.current_line, variant_tok.current_column)
+                set_node_name_position(pat, variant_tok.line, variant_tok.column)
                 return pat
 
             mut empty: List[Int] := []
             pat := add_node_from_mark("pat_variant", enum_name + "." + variant_tok.value, empty, mark)
-            set_node_name_position(pat, variant_tok.current_line, variant_tok.current_column)
+            set_node_name_position(pat, variant_tok.line, variant_tok.column)
             return pat
 
         return add_leaf_with_position("pat_binding", type_tok.value)
@@ -2159,7 +2078,7 @@ fn parse_import_decl() -> Int:
 fn parse_from_import_name(parts: List[String], names: List[Int]):
     n := expect("identifier")
     parts.push(n.value)
-    names.push(add_leaf("import_name", n.value, n.current_line, n.current_column))
+    names.push(add_leaf("import_name", n.value, n.line, n.column))
     if match_tok("kw_as"):
         alias_tok := expect("identifier")
         parts.push("as")
@@ -2211,18 +2130,18 @@ fn mutex_call_at(line: Int, col: Int) -> Int:
 fn parse_module_guard_block(decls: List[Int]):
     advance_token()
     name_tok := expect("identifier")
-    line := name_tok.current_line
-    col := name_tok.current_column
+    line := name_tok.line
+    col := name_tok.column
     mut count := 0 - 1
     if match_tok("lbracket"):
         count_tok := expect("int_lit")
         value := int_literal_magnitude(count_tok.value)
         count = value.0
         if count_tok.value.len() > 0 and (value.1 or count < 0):
-            parser_report_error_at(count_tok.current_line, count_tok.current_column, "E319", "the guard count " + count_tok.value + " does not fit in an Int", "")
+            parser_report_error_at(count_tok.line, count_tok.column, "E319", "the guard count " + count_tok.value + " does not fit in an Int", "")
             count = 1
         if count < 1:
-            parser_report_error_at(count_tok.current_line, count_tok.current_column, "E274", "a sharded guard needs a count of at least 1", "write the number of mutexes: `guard " + name_tok.value + "[8]:`")
+            parser_report_error_at(count_tok.line, count_tok.column, "E274", "a sharded guard needs a count of at least 1", "write the number of mutexes: `guard " + name_tok.value + "[8]:`")
             count = 1
         expect("rbracket")
     expect("colon")
@@ -2398,7 +2317,7 @@ fn parse_optional_where_clause(generics: List[Int], owner_name: String):
                 generics[gp_i] = merge_generic_param_bounds(gp_idx, extra)
                 found = true
         if found == false:
-            parser_report_error_at(wn_tok.current_line, wn_tok.current_column, "E264", "where clause names '" + wn_tok.value + "', which is not a type parameter of '" + owner_name + "'", "declare it in the bracket list: fn " + owner_name + "[" + wn_tok.value + "](...)")
+            parser_report_error_at(wn_tok.line, wn_tok.column, "E264", "where clause names '" + wn_tok.value + "', which is not a type parameter of '" + owner_name + "'", "declare it in the bracket list: fn " + owner_name + "[" + wn_tok.value + "](...)")
         more = match_tok("comma")
 
 # `Bound + Bound + ...` after a colon — one bound list, shared by the
@@ -2548,8 +2467,8 @@ fn parse_struct_decl() -> Int:
 fn parse_struct_guard_block(children: List[Int], guard_fields: List[Int]):
     advance_token()
     name_tok := expect("identifier")
-    line := name_tok.current_line
-    col := name_tok.current_column
+    line := name_tok.line
+    col := name_tok.column
     if check("lbracket"):
         guard_error_here("a sharded guard is only allowed on module globals", "use one mutex per struct value: `guard " + name_tok.value + ":`")
         while not check("rbracket") and not check("newline") and not check("eof"):

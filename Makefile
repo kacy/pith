@@ -1431,6 +1431,7 @@ MEMCHECK_OSTHREAD_CASES := \
 MEMCHECK_CASES := \
 	tests/cases/test_drop_hook \
 	tests/cases/test_markdown_commonmark \
+	tests/cases/test_markdown_gfm \
 	tests/cases/test_nested_patterns \
 	tests/cases/test_byte_buffer_ownership \
 	tests/cases/test_drop_lend \
@@ -1572,6 +1573,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_map_take_remove_counts \
 	tests/cases/test_bytes_keyed_containers \
 	tests/cases/test_web_session_ownership \
+	tests/cases/test_web_pages \
 	tests/cases/test_fn_value_optional \
 	tests/cases/test_optional_arg_callee_spellings \
 	tests/cases/test_result_arg_callee_spellings \

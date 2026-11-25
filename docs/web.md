@@ -855,6 +855,26 @@ paths](#canonical-paths)). a `..` that reaches the handler through an encoded
 slash, such as `..%2Fsecret`, gets `404`, and a NUL byte gets `400`. symbolic
 links under `root` are followed, as they are in net/http.
 
+## markdown pages
+
+`std.web.pages` serves a directory of markdown files through a
+`std.template` layout, with front matter, a table of contents and heading
+ids:
+
+```pith
+import std.web.pages as pages
+
+# layout is a compiled template, such as template.load("layout.html")
+app := web.new().get("/docs/*path", pages.handler("docs", layout))
+```
+
+it keeps the rules of static files: nothing outside the directory is read, a
+symbolic link is followed, and the validators and conditional requests come
+from `http.serve_content`. only `.md` files are ever opened. the layout writes
+the body with `<%md content %>`, so it needs no `<%raw %>`.
+[docs/markdown.md](markdown.md#pages-in-stdweb) covers the layout's context
+and the rest.
+
 ## forms and basic auth
 
 `req.form_value(name)` reads one form field. it looks in an

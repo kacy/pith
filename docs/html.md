@@ -180,6 +180,7 @@ survived.
 | tag | does |
 | --- | ---- |
 | `<%= path %>` | escaped output — the default |
+| `<%md path %>` | the value rendered as markdown with the safe defaults |
 | `<%raw path %>` | unescaped output |
 | `<% if path %> … <% end %>` | conditional |
 | `<% if not path %> … <% end %>` | negated conditional |
@@ -220,6 +221,28 @@ filters the scheme and escapes.
 `<%raw %>` is allowed in every position, including the ones where `<%= %>` is
 refused below. compile assumes that what it writes does not move the page into
 a different context, such as opening a tag or an attribute it does not close.
+
+### markdown
+
+`<%md path %>` renders the value as markdown with `std.markdown`'s safe
+defaults and writes the html in place. raw html in the value is shown as text,
+and link and image urls go through `html.safe_url` after their entities are
+decoded. no tag and no option lets raw html through, so every `<%md` is safe
+and the `<%raw` audit can skip it. text that should keep its raw html is
+rendered in pith with `markdown.options().allow_html(true)` and written with
+`<%raw %>`, where the audit finds it.
+
+```
+<article><h1><%= post.title %></h1><%md post.body %></article>
+```
+
+the html it writes is block content, so compile accepts `<%md %>` only in
+element text, where a `<div>` could go. in an attribute value, a tag, a
+comment, `<script>`, `<style>`, `<title>` or `<textarea>`, the template fails
+to compile. `heading_ids(true)` and `heading_anchors(true)` on a compiled
+template give the headings it renders ids and links to themselves.
+[docs/markdown.md](markdown.md) has the markdown side, and `std.web.pages`
+serves whole directories of markdown through a layout.
 
 ### the context
 

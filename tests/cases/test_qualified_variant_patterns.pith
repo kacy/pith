@@ -1,0 +1,45 @@
+# a pattern can name an enum through a module alias, `alias.Enum.Variant`,
+# with or without a payload, in match arms, nested sub-patterns, if let and
+# while let, the way an expression already could.
+import qualified_pattern_events as ev
+
+fn describe(e: ev.Event) -> String:
+    return match e:
+        ev.Event.Start(ev.Tag.Heading(level)) => "start h{level}"
+        ev.Event.Start(ev.Tag.Link(url)) => "start link " + url
+        ev.Event.Start(_) => "start other"
+        ev.Event.End(ev.Tag.Heading(_)) => "end heading"
+        ev.Event.End(tag) => "end other"
+        ev.Event.Text(t) => "text " + t
+        ev.Event.Rule => "rule"
+
+fn is_text(e: ev.Event) -> Bool:
+    if let ev.Event.Text(_) = e:
+        return true
+    return false
+
+fn slot_len(s: ev.Slot[String]) -> Int:
+    match s:
+        ev.Slot.Full(v) => return v.len()
+        ev.Slot.Empty => return 0
+
+fn main():
+    events := ev.sample()
+    for e in events:
+        print(describe(e))
+    mut texts := 0
+    for e in events:
+        if is_text(e):
+            texts = texts + 1
+    print("texts {texts}")
+    if let ev.Event.Start(ev.Tag.Link(url)) = events[4]:
+        print("link to " + url)
+    maybe: ev.Event? := ev.Event.Text("maybe")
+    if let ev.Event.Text(t) = maybe:
+        print("optional " + t)
+    mut i := 1
+    while let ev.Event.Text(t) = events[i]:
+        print("while " + t)
+        i = i + 2
+    print("full {slot_len(ev.Slot.Full("four"))}")
+    print("empty {slot_len(ev.Slot.Empty)}")

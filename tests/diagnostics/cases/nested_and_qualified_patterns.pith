@@ -1,0 +1,37 @@
+# the errors a nested or module-qualified pattern can raise, each at the
+# pattern it is about: an alias that names no module, a variant the aliased
+# enum lacks, a nested value no arm matches, or-pattern alternatives that bind
+# different names, and `none` against a value that is never optional.
+import modules.pattern_events as pe
+
+enum Inner:
+    A(Int)
+    B
+
+enum Outer:
+    Wrap(Inner)
+    Other
+
+fn alias_errors(e: pe.Event) -> String:
+    match e:
+        nope.Event.Text(t) => return "text"
+        pe.Event.Missing => return "missing"
+        _ => return "other"
+
+fn nested_hole(o: Outer) -> String:
+    return match o:
+        Outer.Wrap(Inner.A(n)) => "a"
+        Outer.Other => "other"
+
+fn uneven_alternatives(o: Outer) -> Int:
+    match o:
+        Outer.Wrap(Inner.A(n) | Inner.B) => return n
+        _ => return 0
+
+fn none_on_int(o: Outer) -> String:
+    match o:
+        Outer.Wrap(Inner.A(none)) => return "never"
+        _ => return "other"
+
+fn main():
+    print(nested_hole(Outer.Other))

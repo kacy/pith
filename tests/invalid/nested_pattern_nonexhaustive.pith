@@ -1,0 +1,15 @@
+# an arm whose payload holds a sub-pattern that can fail does not cover its
+# variant on its own: Outer.Wrap(Inner.B) has no arm here.
+enum Inner:
+    A(Int)
+    B
+
+enum Outer:
+    Wrap(Inner)
+    Other
+
+fn main():
+    o := Outer.Wrap(Inner.B)
+    match o:
+        Outer.Wrap(Inner.A(n)) => print("a {n}")
+        Outer.Other => print("other")

@@ -1209,7 +1209,8 @@ test "a value in a url attribute cannot run script":
     assert_eq(link("data:text/html,<script>alert(1)</script>"), "<a href=\"about:blank\">")
     assert_eq(link("vbscript:msgbox(1)"), "<a href=\"about:blank\">")
     assert_eq(link(" javascript:alert(1)"), "<a href=\"about:blank\">")
-    assert_eq(link("\x01java\tscript:alert(1)"), "<a href=\"about:blank\">")
+    # a leading control byte, which a browser strips before reading the scheme
+    assert_eq(link(chr(1) + "java\tscript:alert(1)"), "<a href=\"about:blank\">")
     assert_eq(link("java\nscript:alert(1)"), "<a href=\"about:blank\">")
     assert_eq(link("//evil.example"), "<a href=\"about:blank\">")
     # an entity is not decoded in the value, and its `&` is escaped, so the

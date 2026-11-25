@@ -551,9 +551,9 @@ plain := markdown.render_with(source, markdown.options(), terminal.renderer(80).
 Without colors, part of this file at 40 columns reads:
 
 ```text
-## options
+## Options
 
-`options()` returns the defaults. each
+`options()` returns the defaults. Each
 builder method returns a changed copy
 and leaves the receiver alone, so a
 shared base can be specialized:

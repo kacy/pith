@@ -1,42 +1,42 @@
-# the pith ir contract
+# The Pith IR contract
 
-the pith compiler is split in two. the self-hosted front end (`self-host/*.pith`)
-type-checks a program and lowers it to a small text ir; the rust back end
-(`cranelift/codegen/src/ir_consumer.rs`) reads that text and hands it to
-cranelift for native code. this document is the contract between them — the
-instruction set, the type vocabulary, the abi conventions, and the rules about
-what the consumer accepts and what it rejects.
+The Pith compiler is split in two. The self-hosted front end
+(`self-host/*.pith`) type-checks a program and lowers it to a small text IR.
+The Rust back end (`cranelift/codegen/src/ir_consumer.rs`) reads that text and
+hands it to Cranelift for native code. This document is the contract between
+them: the instruction set, the type vocabulary, the ABI conventions, and the
+rules about what the consumer accepts and what it rejects.
 
-it is meant to be authoritative. when the emitter and the consumer disagree, one
-of them has a bug; this file says what the agreement is supposed to be.
+It is meant to be authoritative. When the emitter and the consumer disagree,
+one of them has a bug; this file says what the agreement is supposed to be.
 
-## the shape of the ir
+## The shape of the IR
 
-the ir is line-oriented text. one instruction per line, tokens separated by
-single spaces, no punctuation. the consumer splits each line on whitespace and
-dispatches on the first token. blank lines are ignored.
+The IR is line-oriented text: one instruction per line, tokens separated by
+single spaces, no punctuation. The consumer splits each line on whitespace and
+dispatches on the first token. Blank lines are ignored.
 
-there are two kinds of line: **declarations** that set up the module (strings,
+There are two kinds of line: **declarations** that set up the module (strings,
 functions, structs, globals) and **instructions** that make up a function body.
-the consumer reads the whole file in two passes — once to declare every
-function and piece of data so calls can resolve regardless of order, then again
-to compile each function body. when a `main` function is present, a reachability
-pass runs before pass 1 so only live functions, live globals, live cycle-collector
-tracer registrations, and deduplicated live string literals are declared and
-compiled.
+The consumer reads the whole file in two passes. The first declares every
+function and piece of data so calls can resolve regardless of order, and the
+second compiles each function body. When a `main` function is present, a
+reachability pass runs before pass 1 so only live functions, live globals, live
+cycle-collector tracer registrations, and deduplicated live string literals are
+declared and compiled.
 
-values inside a body live in **registers**, written as bare integers (`1`, `2`,
-`8`). a register is assigned once by the instruction that produces it and read by
-later instructions. registers are function-local. named **variables** (`store` /
-`load`) are the mutable slots that carry values across basic blocks. a register
-can be read in a later block only when the block that defines it runs on every
-path there: the inlined `contains` search, for one, keeps its list and length in
-registers across its loop. a register defined on just one branch is gone after
-the branches meet.
+Values inside a body live in **registers**, written as bare integers (`1`, `2`,
+`8`). A register is assigned once by the instruction that produces it and read
+by later instructions. Registers are function-local. Named **variables**
+(`store` / `load`) are the mutable slots that carry values across basic blocks.
+A register can be read in a later block only when the block that defines it
+runs on every path there: the inlined `contains` search, for one, keeps its
+list and length in registers across its loop. A register defined on just one
+branch is gone after the branches meet.
 
-## declarations
+## Declarations
 
-these appear at module scope. the consumer reads them in the first pass.
+These appear at module scope. The consumer reads them in the first pass.
 
 ```
 string N "content"          a string literal. N is its index; strref refers back to it.
@@ -51,17 +51,16 @@ struct_alias ALIAS TARGET    makes ALIAS resolve to TARGET's layout.
 global NAME INIT_KIND ...    a module-level global and how to initialize it.
 ```
 
-one wrinkle worth stating plainly: **a function is lowered as `nparam` i64
-parameters returning one i64, except under the register-result abi**, where it
-returns two values (see abi conventions below). apart from that case `RETTYPE`
-is descriptive, and the real return handling is driven per-call by the call's
-retkind.
+**A function is lowered as `nparam` i64 parameters returning one i64, except
+under the register-result ABI**, where it returns two values (see ABI
+conventions below). Apart from that case `RETTYPE` is descriptive, and the call's
+retkind drives the real return handling for each call.
 
-## instructions
+## Instructions
 
-these make up a function body, between `func` and `endfunc`.
+These make up a function body, between `func` and `endfunc`.
 
-**constants and string references**
+**Constants and string references**
 
 ```
 iconst REG VALUE            integer constant.
@@ -69,7 +68,7 @@ fconst REG VALUE            float constant (stored bitcast into an i64 register)
 strref REG STRIDX           load a pointer to string literal STRIDX.
 ```
 
-**integer arithmetic**
+**Integer arithmetic**
 
 ```
 add|sub|mul|div|mod REG A B   REG = A op B. div and mod are checked (a zero
@@ -86,27 +85,27 @@ addnsw REG A B                REG = A + B on an Int, where the front end proved
                               unlike `add` its result has not wrapped.
 ```
 
-the consumer narrows a check when an operand is known never to be negative: a
+The consumer narrows a check when an operand is known never to be negative: a
 constant of at least zero, a length, a load of a variable whose every store is
 one of these, or the `addc`, `mulc` or `addnsw` of two of them
-(`cranelift/codegen/src/nonneg.rs`). with such operands `a - b` needs no check,
+(`cranelift/codegen/src/nonneg.rs`). With such operands `a - b` needs no check,
 `x * c` compares `x` with the top of its range only, and `a + b` compares the
 sum with an operand instead of testing the overflow flag. `wrapping_add` lowers
 to a plain `add`, so an `add` says nothing about the sign of its result, and a
 sum the front end proved is written `addnsw`.
 
-**float arithmetic**
+**Float arithmetic**
 
 ```
 fadd|fsub|fmul|fdiv REG A B   float op on two float registers.
 ```
 
 `add|sub|mul|div` (and the checked forms) also lower as float ops when either
-operand is a float register — the consumer tracks which registers hold floats
+operand is a float register. The consumer tracks which registers hold floats
 and picks the instruction class accordingly. `add` on two string registers
 lowers to `pith_concat_cstr`.
 
-**bitwise and logical**
+**Bitwise and logical**
 
 ```
 band|bor|bxor|shl|shr REG A B    bitwise ops. a shl or shr count outside 0
@@ -116,7 +115,7 @@ bnot REG A                       bitwise complement.
 and|or REG A B                   lowered as bitwise band/bor (operands are 0/1).
 ```
 
-**comparison**
+**Comparison**
 
 ```
 eq|neq|lt|gt|lte|gte REG A B     result is 0 or 1. dispatches on operand kind:
@@ -137,7 +136,7 @@ UInt and UInt64 hold their values as the bits of an i64, so the emitter uses
 these for `/`, `%` and ordering on them; a value at or past 2^63 would read as
 negative under the signed forms.
 
-**strings**
+**Strings**
 
 ```
 concat REG A B              REG = A followed by B, as a fresh heap string.
@@ -146,12 +145,12 @@ appendn REG COUNT BASE PART...   REG = BASE with the COUNT parts appended; the
                                  result takes over BASE's count.
 ```
 
-the emitter writes only `concat`. `concatn` and `appendn` are made inside the
+The emitter writes only `concat`. `concatn` and `appendn` are made inside the
 consumer, by `fuse_concat_chains`, `fuse_self_appends`, and `fuse_int_parts`,
 from a chain of `concat`s (and adjacent `int_to_string` calls) whose
 intermediate results nothing else reads.
 
-**optionals**
+**Optionals**
 
 ```
 optflag REG OPT             1 when the optional OPT holds a value, 0 when it
@@ -160,10 +159,10 @@ optval REG OPT KIND NAME    the payload of OPT, typed by KIND, or 0 when OPT
                             is none.
 ```
 
-the emitter reads optionals through these two forms only, never with `field`,
+The emitter reads optionals through these two forms only, never with `field`,
 because a none has no shell to load from (see the optional encoding below).
 
-**calls**
+**Calls**
 
 ```
 call REG FNAME RETKIND NARGS ARG...
@@ -172,22 +171,22 @@ rcall FLAG_REG VAL_REG FNAME PAYLOAD_KIND NARGS ARG...
 
 `call` covers everything that returns a single value: runtime functions, user
 functions, struct construction, and void calls. `RETKIND` names how to treat the
-result (see the type vocabulary). a void call is a `call` with a `void` retkind
-whose result register is simply never read — there is no separate `callv`.
+result (see the type vocabulary). A void call is a `call` with a `void` retkind
+whose result register is never read. There is no separate `callv`.
 
-`rcall` is the register-result form. it calls a function that returns an
+`rcall` is the register-result form. It calls a function that returns an
 `(is_ok, payload)` pair and lands the two values in two registers: `FLAG_REG`
-takes the ok flag, `VAL_REG` the payload, interpreted as `PAYLOAD_KIND`. the
+takes the ok flag, `VAL_REG` the payload, interpreted as `PAYLOAD_KIND`. The
 callee is either a declared function whose retkind is `result_reg` or
 `result_reg_f`, or a runtime builtin whose row in `runtime_functions.txt`
-returns `I64,I64` (see the result encoding below). a `float` payload from a
+returns `I64,I64` (see the result encoding below). A `float` payload from a
 runtime builtin arrives as the f64's bits in the second integer word, where a
-`result_reg_f` function returns an actual f64; the consumer handles both. a
+`result_reg_f` function returns an actual f64; the consumer handles both. A
 plain `call` to a pair-returning callee is a consumer error, as is an `rcall`
 to anything else, and `ir_driver --validate` rejects both before the consumer
 sees them.
 
-**memory and fields**
+**Memory and fields**
 
 ```
 store VARNAME REG           write REG into the named variable slot.
@@ -200,16 +199,16 @@ field REG OBJ INDEX               legacy short form: INDEX is a field index,
 sstore STRUCT_REG FIELD_IDX VALUE_REG   store VALUE into field FIELD_IDX of a struct.
 ```
 
-`VARNAME` is one flat namespace and the consumer resolves it against the
+`VARNAME` is one flat namespace, and the consumer resolves it against the
 module-level globals before the function's own variables, so a global and a
-local of the same spelling would name the same storage. the emitter keeps them
-apart by spelling: a local, a parameter and a pattern binding reach the ir under
-the name they were written with, while a global is declared and reached under
-`__g_<name>`. nothing written in a source file produces that spelling, so the
-two can no longer meet, and `ir_global_storage_symbol` is the single place the
-mapping is applied.
+local of the same spelling would name the same storage. The emitter keeps them
+apart by spelling: a local, a parameter and a pattern binding reach the IR
+under the name they were written with, while a global is declared and reached
+under `__g_<name>`. Nothing written in a source file produces that spelling, so
+the two can no longer meet, and `ir_global_storage_symbol` is the single place
+the mapping is applied.
 
-**function values**
+**Function values**
 
 ```
 funcref REG NAME            REG = a pointer to function NAME.
@@ -237,7 +236,7 @@ tuple_stack REG N           REG = a struct of N fields in a stack slot of the
                             shell.
 ```
 
-**control flow**
+**Control flow**
 
 ```
 ret REG                     return REG from the current function.
@@ -251,10 +250,10 @@ label NAME cold             a branch target on a rare path, such as an error
                             on the branches into it.
 ```
 
-## count marks
+## Count marks
 
-with `PITH_CHECK_COUNTS=1` set, the emitter adds `mark` lines for the count
-checker. they state facts the instructions leave out: a load or a `param`
+With `PITH_CHECK_COUNTS=1` set, the emitter adds `mark` lines for the count
+checker. They state facts the instructions leave out: a load or a `param`
 doesn't say whether the value is an int or a string, and a local's exit
 cleanup doesn't say which locals the emitter believes own a count.
 
@@ -274,34 +273,34 @@ mark mixed NAME             NAME holds different kinds on different paths; a
 mark untracked NAME         NAME is never released by the cleanup.
 ```
 
-a function's `kind`, `owns`, `mixed` and `untracked` marks come just before
-its `endfunc`. a loop's marks come where the loop sets up its slots. a
+A function's `kind`, `owns`, `mixed` and `untracked` marks come just before
+its `endfunc`. A loop's marks come where the loop sets up its slots. A
 slot with no mark is one the emitter made for a scalar, such as the flag a
-short-circuit `and` keeps. an enum with no payload variant is marked `int`,
-since it lowers to an integer tag. functions the emitter makes itself, such as
+short-circuit `and` keeps. An enum with no payload variant is marked `int`,
+since it lowers to an integer tag. Functions the emitter makes itself, such as
 destructors and enum equality, carry none.
 
-a user function borrows every parameter: the caller keeps its count. a
+A user function borrows every parameter: the caller keeps its count. A
 parameter with an `owns` mark is one the function's prologue retains, and
-its exit cleanup gives that count back. runtime functions differ case by
+its exit cleanup gives that count back. Runtime functions differ case by
 case, and `cranelift/runtime-abi/runtime_ownership.txt` says how; `build.rs`
 refuses a runtime function without a row there.
 
 `PITH_CHECK_COUNTS=1 pith build file.pith` also runs the count checker
-(`cranelift/codegen/src/count_check.rs`) on the marked ir before the
-backend drops the marks. it prints, on stderr, how many functions balance,
+(`cranelift/codegen/src/count_check.rs`) on the marked IR before the
+backend drops the marks. It prints, on stderr, how many functions balance,
 how many don't, and how many it couldn't settle, with each unbalanced
-function and the instruction that made the count in question. it checks three
+function and the instruction that made the count in question. It checks three
 rules:
 
-- balance: on every path, each count a function takes is given up exactly
+- Balance: on every path, each count a function takes is given up exactly
   once, by a release, a store into a holder, or the return.
-- borrow: a loop variable marked `borrow` is not read after the loop body
+- Borrow: a loop variable marked `borrow` is not read after the loop body
   could have dropped what it borrows from, through an evicting method such
   as `clear` or `pop`, a store into the same storage, or a call into a
-  function that writes it. a call the checker knows nothing about counts as
+  function that writes it. A call the checker knows nothing about counts as
   a write.
-- untagged stores: a counted value is not stored into an untagged container
+- Untagged stores: a counted value is not stored into an untagged container
   (which cannot release it on teardown), and no struct is instantiated over an
   `<error>` placeholder type.
 
@@ -309,291 +308,291 @@ rules:
 functions. `PITH_CHECK_COUNTS=only` reports and stops before code
 generation, for tools that want only the report.
 
-the build itself never fails on a finding. `make count-marks-check-only`,
-which ci runs, checks every corpus program and example and fails on any
-unbalanced function or borrow finding. a function the checker can't settle
-is counted as undecided and doesn't fail the target. over the corpus, 7490
+The build itself never fails on a finding. `make count-marks-check-only`,
+which CI runs, checks every corpus program and example and fails on any
+unbalanced function or borrow finding. A function the checker can't settle
+is counted as undecided and doesn't fail the target. Over the corpus, 7490
 distinct functions balance and 41 are undecided: 17 locals whose kind
 changes by path, 7 slots read past a join that dropped them, 5 joins of
 match or rebinding temps, 5 calls of a generic method on `T` (`to_string`,
 `next`), 4 values of a kind no instruction settles and 3 JSON decoders' raw
 word slots.
 
-the checker models the register-pair abi (`rcall`, `ret2`): the payload holds
+The checker models the register-pair ABI (`rcall`, `ret2`): the payload holds
 one count, the ok value's or the error's, and a plain ok payload holds it
-only when the flag is clear. it reads a result box's `ok` or `err` slot as a
+only when the flag is clear. It reads a result box's `ok` or `err` slot as a
 payload the box hands over when it is freed, an optional's `optval` as a
 field read, and a channel receive's flag as a null test that follows the
-value into locals. a box passed to the emitted unshare keeps its payload,
+value into locals. A box passed to the emitted unshare keeps its payload,
 and so does one released through an emitted release helper; a destructor
-set to null leaves the box a shell. an `await` of a task returning `T!` is
+set to null leaves the box a shell. An `await` of a task returning `T!` is
 typed `tuple`, so the box it hands back is counted like a call's.
 
-a few facts come from the instructions rather than the marks. a register
-the function retains or releases by name holds a counted value, even where
-its kind is a generic body's `T`, and so does one stored into an unmarked
-temp a counted register is later loaded from. a call through a slot the
-function stores to, such as the temp an open-coded `map` keeps its function
-in, is a closure call under the user-function convention. a function the
-program defines wins over a runtime function of the same name, as it does in
-the consumer. a weak upgrade (`pith_struct_weak_upgrade`,
-`pith_struct_weak_load_field`) hands back a strong count or a null, and a
-value a weak count was taken on (`pith_struct_weak_retain`) is stored into a
-weak field or a weak capture without a strong one; weak counts themselves are
-left out. an optional given a destructor after its payload was read and
-retained (`m.get(k)` kept as an optional) takes that count. where two paths
-meet, an unmarked temp that holds a count of its own is one more owner of the
-value it shares with a local. a count given up that a path never held is
-reported even when a later join leaves the function otherwise unsettled.
+The instructions themselves supply a few facts. A register the function
+retains or releases by name holds a counted value, even where its kind is a
+generic body's `T`, and so does one stored into an unmarked temp a counted
+register is later loaded from. A call through a slot the function stores to,
+such as the temp an open-coded `map` keeps its function in, is a closure call
+under the user-function convention. A function the program defines wins over a
+runtime function of the same name, as it does in the consumer. A weak upgrade
+(`pith_struct_weak_upgrade`, `pith_struct_weak_load_field`) hands back a strong
+count or a null, and a value a weak count was taken on
+(`pith_struct_weak_retain`) is stored into a weak field or a weak capture
+without a strong one; weak counts themselves are left out. An optional given a
+destructor after its payload was read and retained (`m.get(k)` kept as an
+optional) takes that count. Where two paths meet, an unmarked temp that holds a
+count of its own is one more owner of the value it shares with a local. A count
+given up that a path never held is reported even when a later join leaves the
+function otherwise unsettled.
 
-the checker was tested by mutation: delete one release, or duplicate one, in
-a function it balances, and see whether it flags that function. a mutant
+The checker was tested by mutation: delete one release, or duplicate one, in
+a function it balances, and see whether it flags that function. A mutant
 that releases a null (a local not yet assigned on that path) changes nothing
 and is left out of the score; a retain put before the release tells which
 those are, since the checker reports the extra count only on a value that
-holds one. on `examples/api_gateway`, where 3522 functions balance, it caught
+holds one. On `examples/api_gateway`, where 3522 functions balance, it caught
 233 of 233 such mutants and 413 of 413 over two seeds; on
-`tests/cases/test_process_command` it caught 298 of 298. before the doubled
+`tests/cases/test_process_command` it caught 298 of 298. Before the doubled
 release that unsettles a later join was reported, the gateway scores were
 248 of 249 and 426 of 427, and 296 of 298.
 
-marks generate no code. the consumer drops every `mark` line before its first
+Marks generate no code. The consumer drops every `mark` line before its first
 pass, so a mark can't split a pattern its rewrites match, and a build with
-marks produces the same object code as one without. without the variable, no
-marks are written, and the dumped ir and the bootstrap seed are unchanged.
+marks produces the same object code as one without. Without the variable, no
+marks are written, and the dumped IR and the bootstrap seed are unchanged.
 
-## the type vocabulary
+## The type vocabulary
 
-types travel through the ir as short **kind strings**, not as structured data.
-the same vocabulary shows up as a call's `RETKIND`, a `field` kind, and a
-global's init kind:
+The IR carries types as flat **kind strings**. The same vocabulary shows up as
+a call's `RETKIND`, a `field` kind, and a global's init kind:
 
-| kind | meaning |
+| Kind | Meaning |
 |------|---------|
-| `int`, `bool` | a plain integer register |
-| `float` | a float, bitcast through an i64 register |
-| `string` | a heap or literal c-string pointer |
-| `bytes` | a byte buffer pointer |
-| `list`, `list_string`, `map`, `map_int`, `set`, `set_int` | a collection handle (with specialized element/key flavors) |
-| `channel`, `task` | a concurrency channel or task handle |
-| `opaque:NAME` | a runtime opaque handle (such as `opaque:Mutex`, `opaque:WaitGroup`, `opaque:Semaphore`) |
-| `struct` | a struct pointer of unspecified type |
-| `struct:NAME` | a struct pointer known to be of type NAME |
-| `tuple` | a tuple (a struct-shaped allocation) |
-| `result`, `result_int`, `result_bool` | a fallible result (see encoding below) |
-| `result_reg`, `result_reg_f` | a fallible result returned in registers: `(is_ok, payload)`, the payload i64 or f64 |
-| `optional` | an optional value |
-| `void` | no meaningful result |
-| `unknown` | the emitter did not commit to a kind |
+| `int`, `bool` | A plain integer register |
+| `float` | A float, bitcast through an i64 register |
+| `string` | A heap or literal C-string pointer |
+| `bytes` | A byte buffer pointer |
+| `list`, `list_string`, `map`, `map_int`, `set`, `set_int` | A collection handle (with specialized element/key flavors) |
+| `channel`, `task` | A concurrency channel or task handle |
+| `opaque:NAME` | A runtime opaque handle (such as `opaque:Mutex`, `opaque:WaitGroup`, `opaque:Semaphore`) |
+| `struct` | A struct pointer of unspecified type |
+| `struct:NAME` | A struct pointer known to be of type NAME |
+| `tuple` | A tuple (a struct-shaped allocation) |
+| `result`, `result_int`, `result_bool` | A fallible result (see encoding below) |
+| `result_reg`, `result_reg_f` | A fallible result returned in registers: `(is_ok, payload)`, the payload i64 or f64 |
+| `optional` | An optional value |
+| `void` | No meaningful result |
+| `unknown` | The emitter did not commit to a kind |
 
-`unknown` is an explicit admission, not a wildcard: it means the consumer will not
-track the register's kind and later kind-specific handling (string release, float
-math, struct field access) will not fire for it. an `unknown` where a concrete
-kind was knowable is a missed optimization or a latent bug, not a convenience.
+`unknown` is an explicit admission and does not act as a wildcard: the
+consumer will not track the register's kind, and later kind-specific handling
+(string release, float math, struct field access) will not fire for it. An
+`unknown` where a concrete kind was knowable is a missed optimization or a
+latent bug.
 
-## abi conventions
+## ABI conventions
 
-**i64 parameters, one or two returns.** parameters are always i64: pointers are
+**i64 parameters, one or two returns.** Parameters are always i64: pointers are
 i64, and floats are bitcast to i64 across call boundaries and cast back where
-float math is needed. returns are i64 too, except for the register-result abi.
-a function whose retkind is `result_reg` returns two values, `(is_ok: i64,
-payload: i64)`; `result_reg_f` returns `(is_ok: i64, payload: f64)`. everything
+float math is needed. Returns are i64 too, except for the register-result ABI.
+A function whose retkind is `result_reg` returns two values, `(is_ok: i64,
+payload: i64)`; `result_reg_f` returns `(is_ok: i64, payload: f64)`. Everything
 else returns a single i64. `push_return_types` in the consumer is the authority,
-and `RETTYPE` does drive the machine signature for those two kinds. the runtime
+and `RETTYPE` does drive the machine signature for those two kinds. The runtime
 builtins that return the same pair take their signature from their table row
 instead (see the result encoding below).
 
-**who owns a returned pair.** the payload a `ret2` hands out is owned by the
+**Who owns a returned pair.** The payload a `ret2` hands out is owned by the
 caller: it carries one count of its own, the same count the box's slot would
-have held for a caller that received the box. a function that returns a
+have held for a caller that received the box. A function that returns a
 whole result box as the pair (`return x` for `x: T!`) has to produce that
 count from the box it holds, and how depends on who owns the box
 (`ir_emit_return_box_as_pair`):
 
-- a box the function built (the value of a call) is its own. the payload
+- A box the function built (the value of a call) is its own. The payload
   takes over the count the box held on it, and the destructor-less shell is
   freed.
-- a borrowed box (a parameter, a field, an element, a match binding over
+- A borrowed box (a parameter, a field, an element, a match binding over
   one: whatever `ir_expr_is_borrowed` says the box return would retain)
-  belongs to the caller or to the container. the box keeps its count on the
+  belongs to the caller or to the container. The box keeps its count on the
   payload, the payload is retained by its kind (the ok kind on the ok arm,
   the error kind on the error arm), and the shell is not touched.
-- a tracked local holds one count on its box, but that box may be shared
-  (`y := x` over a parameter). the return reads `pith_struct_strong_count`:
+- A tracked local holds one count on its box, but that box may be shared
+  (`y := x` over a parameter). The return reads `pith_struct_strong_count`:
   when the local's count is the only one, it is the first case; otherwise
   the payload is retained by its kind and the local's count on the shell is
   released, the same decision the release of a result argument makes before
   it drops a payload.
 
-taking the payload out of a box that someone else still holds, without a
+Taking the payload out of a box that someone else still holds, without a
 count of its own, left the caller's box and the returned payload sharing one
 count, and whichever was released first freed what the other still read
 (#1164).
 
-**a returned box belongs to the caller alone.** every caller that opens a
+**A returned box belongs to the caller alone.** Every caller that opens a
 call's box takes over the payload's count, which is correct only when
-nothing else holds the box. so a function that returns the box itself (the
-box abi, which generic functions and most interface impl methods use) and
+nothing else holds the box. So a function that returns the box itself (the
+box ABI, which generic functions and most interface impl methods use) and
 returns a box it does not fully own (a parameter, a field, an element, or a
 local whose count is shared) passes it through `__result_unshare_<ok><err>`.
-that helper returns the same box when the caller's count is the only one,
-with its destructor cleared. otherwise it returns a fresh box holding its own
+That helper returns the same box when the caller's count is the only one,
+with its destructor cleared. Otherwise it returns a fresh box holding its own
 count on the live payload, gives the shared box the payload destructor, and
-drops the count on it. the register return clears the destructor the same
+drops the count on it. The register return clears the destructor the same
 way when a local's box is its own and the payload leaves with its count.
 
 **main's result.** `fn main() -> Int` returns its `Int` value as the process
 exit status; any non-`Int` `main` (void, `String`, etc.) pins its normal exit
-status to `0` so heap pointers are never truncated into exit codes. a
+status to `0` so heap pointers are never truncated into exit codes. A
 `fn main() -> T!` settles its result before the `ret`: a returned result that
 holds an error is reported through `pith_main_error_exit` (exit status 1), an
 ok `Int` in `fn main() -> Int!` is returned as the process exit status, and any
-other ok payload is released before exiting `0`. a `fail` or a `!` in main
+other ok payload is released before exiting `0`. A `fail` or a `!` in main
 reports the same way, before any box is built.
 
-**optional encoding.** a `T?` is the null pointer when it is none. a Some is
+**Optional encoding.** A `T?` is the null pointer when it is none. A Some is
 a two-slot struct allocation holding 1 at offset 0 and the payload at offset
-8, and it may carry a destructor that releases the payload. a none costs no
-allocation, and releasing one is a no-op. a runtime function that returns an
+8, and it may carry a destructor that releases the payload. A none costs no
+allocation, and releasing one is a no-op. A runtime function that returns an
 optional builds it with `optional_tuple`, which returns 0 for none.
 
-**result encoding.** `result_int` and `result_bool` use a zero sentinel for the
-error case: a real value `v` is carried as `v + 1`, and `0` means "error". the
-consumer's `normalize_runtime_result` applies this. it is the reason a runtime
+**Result encoding.** `result_int` and `result_bool` use a zero sentinel for the
+error case: a real value `v` is carried as `v + 1`, and `0` means "error". The
+consumer's `normalize_runtime_result` applies this. It is the reason a runtime
 function that can fail returns 0 for failure and its real (nonnegative) value
 plus one otherwise.
 
-the sentinel only works for a builtin whose success can never be a raw 0. one
+The sentinel only works for a builtin whose success can never be a raw 0. One
 whose success can be 0 returns the `(is_ok, payload)` pair in two registers
 instead, reached by `rcall`, so the error carries the runtime's own message:
 `parse_int`, `parse_float` (#1140), and the byte-count writes `file_write`,
 `file_write_bytes`, `tcp_write`, `tcp_write_bytes`, `process_write`,
 `process_write_bytes`, `byte_buffer_write` and `byte_buffer_write_string_utf8`,
-where an empty write is a success of 0 (#1153). the payload is the ok value
+where an empty write is a success of 0 (#1153). The payload is the ok value
 (a float as its bits) when `is_ok` is 1, and an owned error string when it is
 0; the caller releases that string on its error arm. `ir_builtin_result_retkind`
 in `ir_metadata.pith` is the list, and names them `tuple` because that is the
 kind of the box a call site folds the pair into wherever it keeps the result
-whole (a bound local, an argument, a field read). a call site that consumes
+whole (a bound local, an argument, a field read). A call site that consumes
 the pair on the spot (`!`, `catch`, a `catch:` block, `unwrap_or`, a pair
 return) builds no box at all (#1162).
 
-the runtime side is a `#[repr(C)]` struct of two `i64`s
-(`ffi_util::ResultPair`). every supported target returns such a struct in two
+The runtime side is a `#[repr(C)]` struct of two `i64`s
+(`ffi_util::ResultPair`). Every supported target returns such a struct in two
 integer registers, and they are the registers a Cranelift signature with two
 `I64` returns reads: `rax:rdx` under the x86-64 System V ABI, and `x0:x1`
-under AAPCS64 on linux and Apple's aarch64 variant on macOS. that is also why
+under AAPCS64 on Linux and Apple's aarch64 variant on macOS. That is also why
 a float payload travels as bits: AAPCS64 returns a mixed `{i64, f64}` struct
 in `x0:x1`, where a Cranelift `(I64, F64)` signature would read `x0` and `v0`.
 Windows x64 returns a 16-byte struct through a hidden pointer, so
 `runtime_imports.rs` refuses to declare a pair-returning runtime function under
 any calling convention other than System V or Apple aarch64.
 
-**struct construction.** a struct is built with an ordinary call whose function
-name is a declared struct: `call REG StructName NFIELDS f0 f1 ...`. the consumer
+**Struct construction.** A struct is built with an ordinary call whose function
+name is a declared struct: `call REG StructName NFIELDS f0 f1 ...`. The consumer
 recognizes the name as a struct, allocates with `pith_struct_alloc(NFIELDS)`, and
-stores each argument at offset `i * 8`. there is no dedicated construction
-instruction — the struct declaration is what makes the call special.
+stores each argument at offset `i * 8`. There is no dedicated construction
+instruction; the struct declaration is what makes the call special.
 
-**runtime functions.** the set of runtime functions and their machine signatures
+**Runtime functions.** The set of runtime functions and their machine signatures
 lives in `cranelift/runtime-abi/runtime_functions.txt`, one
 `key | symbol | params | returns` row each. `returns` is empty (void), one
 type, or `I64,I64` for a builtin that returns the result pair above; `build.rs`
 rejects any other multi-value return. `cranelift/codegen/build.rs`
-turns that file into the import table the consumer declares. the emitter has its
+turns that file into the import table the consumer declares. The emitter has its
 own, separate notion of which runtime calls exist and what kind they return
-(`ir_builtin_result_retkind`, `ir_method_tables`) — the two are not yet a single
+(`ir_builtin_result_retkind`, `ir_method_tables`). The two are not yet a single
 source of truth.
 
-## consumer-side rewrites (emitter knowledge that currently leaks downstream)
+## Consumer-side rewrites (emitter knowledge that currently leaks downstream)
 
-a handful of decisions are made by the consumer today even though they depend on
-information the emitter already has. they are documented here because they are
-part of the real contract, and because they are the natural candidates for moving
-into the emitter later.
+The consumer makes a handful of decisions today that depend on information the
+emitter already has. They are documented here because they are part of the
+real contract, and because they are the natural candidates for moving into the
+emitter later.
 
-- **`__list_get` / `__index` on a string register becomes `char_at`.** the
+- **`__list_get` / `__index` on a string register becomes `char_at`.** The
   consumer inspects whether the indexed register holds a string and rewrites the
-  call. the emitter knows the receiver's type at emission time.
-- **struct construction**, above — the consumer re-derives that a call names a
+  call. The emitter knows the receiver's type at emission time.
+- **Struct construction**, above: the consumer re-derives that a call names a
   struct.
 
-these are distinct from genuine code-generation choices that belong in the back
-end regardless: the consumer inlines `bytes_get`, `bytes_get_strict`, `byte_at`,
+These are distinct from code-generation choices that belong in the back end
+regardless: the consumer inlines `bytes_get`, `bytes_get_strict`, `byte_at`,
 `string_len`, `pith_list_get_value(_unchecked)` and `pith_list_get_value_strict`
 as fast paths (a header read instead of a call), falling back to the runtime
-helper. inlining is the back end's job; the *name rewrites and type dispatch*
+helper. Inlining is the back end's job; the *name rewrites and type dispatch*
 above are not.
 
-the two strict getters, what `bytes[i]` and `xs[i]` lower to, keep their abort
-semantics through the fallback: the inline path performs the runtime's own
+The two strict getters, what `bytes[i]` and `xs[i]` lower to, keep their abort
+semantics through the fallback. The inline path performs the runtime's own
 handle test (non-null, aligned, magic word intact), the element-size check for
 lists, and one unsigned bounds compare, and anything that fails any of them
 calls the runtime function, which re-runs its checks and prints the diagnostic
-it always printed. `tests/aborts` pins those diagnostics and exit codes. an
-earlier attempt at inlining `xs[i]` (august 2026) removed 30% of the
+it always printed. `tests/aborts` pins those diagnostics and exit codes. An
+earlier attempt at inlining `xs[i]` (August 2026) removed 30% of the
 instructions of a self-hosted type-check and still measured 1-3% slower on wall
 clock, so the shape here was accepted only after an interleaved A/B of
 `pith_main check self-host/pith_main.pith` came out neutral (21 pairs, medians
-within 0.6%); a change to this fast path needs that measurement again, not an
-instruction count.
+within 0.6%). A change to this fast path needs that measurement again; an
+instruction count is not enough.
 
-## the robustness contract
+## The robustness contract
 
-the consumer rejects malformed function bodies loudly, with a `CompileError` that
-names the function and the offending line. these are covered by tests in
-`ir_consumer.rs`:
+The consumer rejects malformed function bodies loudly, with a `CompileError`
+that names the function and the offending line. Tests in `ir_consumer.rs`
+cover these cases:
 
-- an unknown instruction opcode
-- a call to a function that was never declared
-- a `brif` or `jmp` to a label that does not exist
-- a `label` line with anything after its name other than `cold`
-- a malformed `store`, `call`, or `field`
-- a register reference that was never assigned, or a non-numeric register token
-- a `func` whose name collides with a runtime declaration
-- a `call` whose retkind promises a value when the callee returns nothing. every
-  ir-declared function returns a value (one i64, or a two-value register pair),
+- An unknown instruction opcode
+- A call to a function that was never declared
+- A `brif` or `jmp` to a label that does not exist
+- A `label` line with anything after its name other than `cold`
+- A malformed `store`, `call`, or `field`
+- A register reference that was never assigned, or a non-numeric register token
+- A `func` whose name collides with a runtime declaration
+- A `call` whose retkind promises a value when the callee returns nothing. Every
+  IR-declared function returns a value (one i64, or a two-value register pair),
   so this can only mean the emitter's idea
-  of a runtime call disagrees with `runtime_functions.txt`. before the check,
+  of a runtime call disagrees with `runtime_functions.txt`. Before the check,
   the destination register got a zero nobody wrote
 
-the driver checks the emitter's side of the same agreement before the consumer
+The driver checks the emitter's side of the same agreement before the consumer
 sees it: `ir_driver --combined --validate <file>` refuses a call whose return
 kind names a struct without the `struct:` prefix, a function defined more than
 once, and the other declaration rules the driver knows. `make
 validate-ir-contract-only` runs it over every corpus program with a `main`, and
-CI runs that target. it exists because a call to a function in another module
+CI runs that target. It exists because a call to a function in another module
 that returns a struct defined in a third module used to spell the kind bare:
 the contract was violated in 22 corpus programs and, since the classifier saw
 nothing to release, every such returned struct leaked (#1057).
 
-it also refuses a `strref` that names no `string` line anywhere in the
-combined file. each module's string table is written before its bodies, so a
+It also refuses a `strref` that names no `string` line anywhere in the
+combined file. Each module's string table is written before its bodies, so a
 literal a body interns for the first time lands after the table has been
 emitted; the consumer reads such a reference as a null string (see the
-soft spots below), and the text goes missing without a diagnostic. that is how
+soft spots below), and the text goes missing without a diagnostic. That is how
 `parse_float`'s error message came out empty (#1147) and how an index miss in
-a fallible function lost its `index out of bounds` (#1109). a string a body
+a fallible function lost its `index out of bounds` (#1109). A string a body
 refers to belongs in the string prepass in `emit_ir`.
 
-known soft spots, where the consumer is quieter than it should be — these are the
-tightening targets, not settled behavior:
+These are the known soft spots, where the consumer is quieter than it should
+be. They are the targets for tightening, not settled behavior:
 
-- an **unknown declaration** in the first pass is silently ignored rather than
+- An **unknown declaration** in the first pass is silently ignored instead of
   rejected.
-- if `pith_struct_alloc` is somehow absent, a struct construction falls back to a
+- If `pith_struct_alloc` is somehow absent, a struct construction falls back to a
   zero register instead of failing.
-- a `strref` naming no string reads as a null string instead of failing,
+- A `strref` naming no string reads as a null string instead of failing,
   because a single-module dump may name a string another compilation unit
   defines. `--validate` refuses it in a combined file, which is where every
   string the program uses is defined.
 
-## sources of truth
+## Sources of truth
 
-| concern | file |
+| Concern | File |
 |---------|------|
-| producing the ir | `self-host/ir_emitter_core.pith` and its satellites |
-| consuming the ir | `cranelift/codegen/src/ir_consumer.rs` |
-| runtime function signatures | `cranelift/runtime-abi/runtime_functions.txt` → `build.rs` |
-| what runtime functions do with counts | `cranelift/runtime-abi/runtime_ownership.txt` → `build.rs` |
-| this contract | this file |
+| Producing the IR | `self-host/ir_emitter_core.pith` and its satellites |
+| Consuming the IR | `cranelift/codegen/src/ir_consumer.rs` |
+| Runtime function signatures | `cranelift/runtime-abi/runtime_functions.txt` → `build.rs` |
+| What runtime functions do with counts | `cranelift/runtime-abi/runtime_ownership.txt` → `build.rs` |
+| This contract | This file |

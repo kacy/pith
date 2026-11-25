@@ -76,6 +76,13 @@ pub fn italic(s: String) -> String:
 pub fn strip(s: String) -> String:
     return ansi.strip(s)
 
+## whether the user asked for output without color: the NO_COLOR environment
+## variable is set to anything but the empty string, which is what the
+## convention of that name asks. a program that colors its output by default
+## checks this before it does.
+pub fn no_color() -> Bool:
+    return env_opt("NO_COLOR").unwrap_or("") != ""
+
 test "term colors and styles wrap ansi codes":
     esc := chr(27)
 
@@ -88,3 +95,12 @@ test "term strip removes ansi escape codes":
     text := red("fail") + " " + bold("now")
 
     assert_eq(strip(text), "fail now")
+
+test "no_color follows NO_COLOR and ignores it empty":
+    os_unset_env("NO_COLOR")
+    assert(not no_color())
+    os_set_env("NO_COLOR", "")
+    assert(not no_color())
+    os_set_env("NO_COLOR", "1")
+    assert(no_color())
+    os_unset_env("NO_COLOR")

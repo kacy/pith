@@ -48,8 +48,15 @@ FLOAT_LIT     = digit , { digit | "_" } , "." , digit , { digit | "_" }
 (* string literals with escape sequences and interpolation *)
 STRING_LIT    = '"' , { string_char | escape_seq | brace_escape | interpolation } , '"' ;
 string_char   = (* any unicode char except '"', '\', '{', or newline *) ;
-escape_seq    = "\" , ( "n" | "r" | "t" | "\" | '"' | "{" | "0" ) ;
-interpolation = "{" , expression , "}" ;
+(* any other escape is an error (E243). \{ and \} write a brace. *)
+escape_seq    = "\" , ( "n" | "r" | "t" | "\" | '"' | "{" | "}" | "0" ) ;
+(* spaces just inside the braces are allowed, around a format spec too: *)
+(* `{ a + b }`, `{ price:08.2 }`. the braces hold one expression.      *)
+interpolation = "{" , expression , [ ":" , format_spec ] , "}" ;
+(* alignment, a width (a leading 0 pads with zeros) and a precision.   *)
+(* a suffix that is not a spec is not split off, and is read as code.  *)
+format_spec   = [ "<" | ">" | "^" ] , ( digit , { digit } , [ "." , digit , { digit } ]
+                                       | "." , digit , { digit } ) ;
 
 (* doubled braces are literal braces, not interpolation: "{{" -> "{",     *)
 (* "}}" -> "}". this lets interpolated strings carry literal braces.       *)

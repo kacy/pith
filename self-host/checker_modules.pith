@@ -97,3 +97,16 @@ pub fn split_qualified_name(value: String) -> (String, String):
             return (value.substring(0, i), value.substring(i + 1, value.len()))
         i = i + 1
     return (value, "")
+
+# split a variant pattern's name into (enum, variant) at its last dot. the
+# enum half keeps any module alias it was written with, so
+# "markdown.Event.Text" gives ("markdown.Event", "Text") and resolves
+# through the import the way a type annotation does. a name with no dot
+# comes back as (value, "").
+pub fn split_variant_pattern_name(value: String) -> (String, String):
+    mut i := value.len() - 1
+    while i >= 0:
+        if ord(value[i]) == 46:
+            return (value.substring(0, i), value.substring(i + 1, value.len()))
+        i = i - 1
+    return (value, "")

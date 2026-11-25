@@ -93,8 +93,13 @@ fn inner_values[T](items: List[Opt[Opt[T]]]) -> List[T]:
                 continue
     return out
 
+fn some_nothing() -> Opt[Opt[String]]:
+    inner: Opt[String] := Opt.Nothing
+    return Opt.Some(inner)
+
 fn main():
-    for v in inner_values([Opt.Some(Opt.Some("x")), Opt.Nothing, Opt.Some(Opt.Nothing), Opt.Some(Opt.Some("y"))]):
+    nested: List[Opt[Opt[String]]] := [Opt.Some(Opt.Some("x")), Opt.Nothing, some_nothing(), Opt.Some(Opt.Some("y"))]
+    for v in inner_values(nested):
         print("inner " + v)
     print(describe(Outer.Wrap(Inner.A(0))))
     print(describe(Outer.Wrap(Inner.A(7))))

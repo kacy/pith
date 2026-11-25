@@ -1,0 +1,99 @@
+== the index of the directory
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+<title>Home &amp; away</title>
+<nav><a class="h1" href="#welcome">Welcome</a></nav>
+<ul><li>intro</li><li>&lt;b&gt;bold&lt;/b&gt;</li></ul>
+<main><h1 id="welcome">Welcome</h1>
+<p>See <a href="guide/setup">the guide</a>.</p>
+</main>
+
+== a nested page with toml front matter
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+<title>Setup</title>
+<nav><a class="h1" href="#install">Install</a><a class="h2" href="#run-it">Run it</a><a class="h2" href="#run-it-1">Run it</a></nav>
+<ul><li>how-to</li></ul>
+<main><h1 id="install">Install</h1>
+<h2 id="run-it">Run it</h2>
+<h2 id="run-it-1">Run it</h2>
+</main>
+
+== a nested directory's index
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+<title>Guide</title>
+<nav><a class="h1" href="#guide">Guide</a></nav>
+<main><h1 id="guide">Guide</h1>
+<p>The guide&#39;s index.</p>
+</main>
+
+== a directory without its trailing slash
+HTTP/1.1 301 Moved Permanently
+location: /docs/
+== a nested directory without its trailing slash, with a query
+HTTP/1.1 301 Moved Permanently
+location: /docs/guide/?x=1
+== a page with a trailing slash
+HTTP/1.1 301 Moved Permanently
+location: /docs/guide/setup
+== raw html and a script url stay inert
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+<title>Notes</title>
+<nav><a class="h1" href="#notes">Notes</a></nav>
+<main><h1 id="notes">Notes</h1>
+<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>
+<p><a href="">click</a></p>
+</main>
+
+== validators
+etag: true
+last-modified: true
+== a matching If-None-Match
+HTTP/1.1 304 Not Modified
+== a stale If-None-Match
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+== a matching If-Modified-Since
+HTTP/1.1 304 Not Modified
+== HEAD
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+body bytes: 0, length matches: true
+== a missing page
+HTTP/1.1 404 Not Found
+content-type: text/html
+== the markdown file by its own name
+HTTP/1.1 404 Not Found
+content-type: text/html
+== a file that is not markdown
+HTTP/1.1 404 Not Found
+content-type: text/html
+== a hidden file
+HTTP/1.1 404 Not Found
+content-type: text/html
+== a plain dot-dot
+HTTP/1.1 301 Moved Permanently
+location: /outside
+== an encoded dot-dot
+HTTP/1.1 301 Moved Permanently
+location: /outside
+== a dot-dot behind an encoded slash
+HTTP/1.1 404 Not Found
+content-type: text/html
+== a nested dot-dot behind an encoded slash
+HTTP/1.1 404 Not Found
+content-type: text/html
+== a NUL byte
+HTTP/1.1 400 Bad Request
+content-type: text/plain
+== front matter that does not parse
+HTTP/1.1 500 Internal Server Error
+content-type: text/html
+== a page past the size cap
+HTTP/1.1 500 Internal Server Error
+content-type: text/html
+== a POST
+HTTP/1.1 405 Method Not Allowed
+content-type: text/plain

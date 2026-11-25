@@ -28,6 +28,8 @@
 #   markdown.render(text, opts)                html with chosen options
 #   markdown.events(text, opts)                an iterator of `Event` values
 #   markdown.render_with(text, opts, r)        drive any `Renderer`
+#   markdown.toc(text, opts)                   the headings and their ids
+#   markdown.split_front_matter(text)          yaml or toml front matter
 #
 # `events` yields `Start(tag)` and `End(tag)` around containers, and `Text`,
 # `Code`, `Html`, `InlineHtml`, `SoftBreak`, `HardBreak`, `Rule`,
@@ -114,6 +116,7 @@ pub struct Options:
     unsafe_urls: Bool = false
     gfm_extensions: Bool = true
     heading_anchor_ids: Bool = false
+    heading_anchor_links: Bool = false
 
 # The safe defaults: raw html escaped, unsafe urls refused, gfm on.
 pub fn options() -> Options:
@@ -143,15 +146,28 @@ impl Options:
         copy.gfm_extensions = enabled
         return copy
 
-    # A copy that asks for `id` attributes on headings. reserved: headings are
-    # rendered without ids for now.
+    # A copy that gives each heading an `id` made from its text, the way
+    # github does: `## Hello, World!` becomes `<h2 id="hello-world">`. ids are
+    # unique within the document; a repeated one gets `-1`, `-2` and so on.
     fn heading_ids(enabled: Bool) -> Options:
         copy := self.copy()
         copy.heading_anchor_ids = enabled
         return copy
 
+    # A copy that also starts each heading with a link to itself,
+    # `<a class="anchor" href="#id" aria-hidden="true" tabindex="-1">#</a>`.
+    # it turns heading ids on, since the link needs one.
+    fn heading_anchors(enabled: Bool) -> Options:
+        copy := self.copy()
+        copy.heading_anchor_links = enabled
+        return copy
+
     fn copy() -> Options:
-        return Options(raw_html: self.raw_html, unsafe_urls: self.unsafe_urls, gfm_extensions: self.gfm_extensions, heading_anchor_ids: self.heading_anchor_ids)
+        return Options(raw_html: self.raw_html, unsafe_urls: self.unsafe_urls, gfm_extensions: self.gfm_extensions, heading_anchor_ids: self.heading_anchor_ids, heading_anchor_links: self.heading_anchor_links)
+
+    # whether headings get ids, asked for directly or through anchors.
+    fn wants_ids() -> Bool:
+        return self.heading_anchor_ids or self.heading_anchor_links
 
 # ---------------------------------------------------------------
 # events
@@ -160,8 +176,9 @@ impl Options:
 # A container that `Start` opens and `End` closes.
 pub enum Tag:
     Paragraph
-    # a heading and its level, 1 to 6.
-    Heading(Int)
+    # a heading: its level, 1 to 6, and its id, which is "" unless the options
+    # ask for heading ids.
+    Heading(Int, String)
     BlockQuote
     # a fenced or indented code block and its info string ("" when there is
     # none). the code itself arrives as one `Text` event.
@@ -241,7 +258,9 @@ pub fn to_html(source: String) -> String:
 
 # Renders markdown to html with the given options.
 pub fn render(source: String, opts: Options) -> String:
-    return drive(events(source, opts), html_renderer())
+    renderer := html_renderer()
+    renderer.anchors = opts.heading_anchor_links
+    return drive(events(source, opts), renderer)
 
 # Feeds the events of `source` to `renderer` and returns what it produces.
 pub fn render_with(source: String, opts: Options, renderer: Renderer) -> String:
@@ -3016,6 +3035,9 @@ pub struct Events:
     footnote_seen: Map[Int, Int]
     # which of them is being walked once the document is done, or -1.
     footnote_at: Int
+    # the heading ids given out so far, each with how many times its plain
+    # form has been taken, for numbering the repeats.
+    ids_taken: Map[String, Int] = {}
 
 impl Iterator for Events:
     type Item = Event
@@ -3073,9 +3095,14 @@ impl Events:
                 if not tight:
                     self.queue.push(Event.End(Tag.Paragraph))
             BlockKind.Heading =>
-                self.queue.push(Event.Start(Tag.Heading(block.level)))
+                opened := self.queue.len()
+                self.queue.push(Event.Start(Tag.Heading(block.level, "")))
                 self.queue_inlines(block.content)
-                self.queue.push(Event.End(Tag.Heading(block.level)))
+                mut id := ""
+                if self.opts.wants_ids():
+                    id = self.take_id(slug(heading_text(self.queue, opened + 1)))
+                    self.queue[opened] = Event.Start(Tag.Heading(block.level, id))
+                self.queue.push(Event.End(Tag.Heading(block.level, id)))
             BlockKind.Rule =>
                 self.queue.push(Event.Rule)
             BlockKind.Code =>
@@ -3347,6 +3374,168 @@ fn trim_end(content: String) -> String:
     return content.substring(0, end)
 
 # ---------------------------------------------------------------
+# heading ids, tables of contents and front matter
+# ---------------------------------------------------------------
+
+# One heading of a document, as `toc` lists it: its level, its text with the
+# markup dropped, and its id.
+pub struct Heading:
+    pub level: Int
+    pub text: String
+    pub id: String
+
+# The headings of `source` in document order, for a table of contents. each id
+# is the one `render` gives the same heading with the same options, so a link
+# to `#id` reaches it. ids are made whether or not `opts` asks for them.
+pub fn toc(source: String, opts: Options) -> List[Heading]:
+    mut headings: List[Heading] := []
+    mut pieces: List[String] := []
+    mut level := 0
+    mut id := ""
+    for event in events(source, opts.heading_ids(true)):
+        if let Event.Start(opened) = event:
+            if let Tag.Heading(depth, heading_id) = opened:
+                level = depth
+                id = heading_id
+                pieces.clear()
+                continue
+        if let Event.End(closed) = event:
+            if let Tag.Heading(depth, heading_id) = closed:
+                headings.push(Heading(level: level, text: pieces.join("").trim(), id: id))
+                level = 0
+                continue
+        if level > 0:
+            pieces.push(plain_text(event))
+    return headings
+
+# what an event inside a heading adds to its plain text: text and code as they
+# are, a line break as a space, and nothing for markup.
+fn plain_text(event: Event) -> String:
+    return match event:
+        Event.Text(content) => content
+        Event.Code(content) => content
+        Event.SoftBreak | Event.HardBreak => " "
+        _ => ""
+
+# the plain text of the heading whose inline events start at `first`.
+fn heading_text(queue: List[Event], first: Int) -> String:
+    mut pieces: List[String] := []
+    for i in first..queue.len():
+        pieces.push(plain_text(queue[i]))
+    return pieces.join("").trim()
+
+# github's id for a heading's text: lowercased, each space turned into `-`, and
+# everything but letters, marks, numbers, `-` and `_` dropped. what is left can
+# hold no quote, `<`, `&` or space, so it cannot end the attribute it is
+# written into. a heading with nothing left gets "section".
+fn slug(content: String) -> String:
+    mut pieces: List[String] := []
+    mut i := 0
+    while i < content.len():
+        c := ord(content[i])
+        if c < 128:
+            if is_ascii_alphanumeric(c) or c == 45 or c == 95:
+                pieces.push(chr(ascii_lower(c)))
+            elif c == 32:
+                pieces.push("-")
+            i += 1
+            continue
+        code_point := code_point_at(content, i)
+        if code_point == 65533:
+            i += 1
+            continue
+        if not is_unicode_whitespace(code_point) and not is_unicode_punctuation(code_point) and not is_invisible(code_point):
+            pieces.push(encode_utf8(text.fold_code_point(code_point)))
+        i += utf8_length(c)
+    if pieces.len() == 0:
+        return "section"
+    return pieces.join("")
+
+# the c1 controls and the format characters a slug drops: soft hyphens, zero
+# width spaces and joiners, bidi controls, byte order marks and tags.
+fn is_invisible(code_point: Int) -> Bool:
+    if (code_point >= 128 and code_point <= 159) or code_point == 173:
+        return true
+    if (code_point >= 1536 and code_point <= 1541) or code_point == 1564 or code_point == 1757 or code_point == 1807 or code_point == 6158:
+        return true
+    if (code_point >= 8203 and code_point <= 8207) or (code_point >= 8234 and code_point <= 8238) or (code_point >= 8288 and code_point <= 8303):
+        return true
+    if code_point == 65279 or (code_point >= 65529 and code_point <= 65531):
+        return true
+    return code_point == 917505 or (code_point >= 917536 and code_point <= 917631)
+
+impl Events:
+    # `base` as an id no earlier heading in the document has, numbered the
+    # way github numbers them: `a`, `a-1`, `a-2`. a heading whose own text
+    # ends in `-1` cannot take an id that a later repeat then also gets.
+    fn take_id(base: String) -> String:
+        mut id := base
+        while self.ids_taken.contains_key(id):
+            count := self.ids_taken[base] + 1
+            self.ids_taken.insert(base, count)
+            id = base + "-{count}"
+        self.ids_taken.insert(id, 0)
+        return id
+
+# the most bytes front matter may hold between its fences.
+pub MAX_FRONT_MATTER_BYTES := 65536
+
+# A document split by `split_front_matter`. `format` is "yaml" for a `---`
+# block, "toml" for a `+++` block, and "" when there is none, in which case
+# `data` is "" and `body` is the whole source.
+pub struct FrontMatter:
+    pub format: String
+    pub data: String
+    pub body: String
+
+# Splits the front matter off the start of `source`: a `---` line, yaml, and a
+# closing `---` line, or the same with `+++` around toml. the fences may have
+# trailing spaces and a byte order mark may come first. a first line that
+# opens a block nobody closes is not front matter, and the whole source is the
+# body. parsing the data is left to std.yaml or std.toml. it fails when the
+# data is longer than MAX_FRONT_MATTER_BYTES.
+pub fn split_front_matter(source: String) -> FrontMatter!:
+    mut start := 0
+    if source.len() >= 3 and ord(source[0]) == 239 and ord(source[1]) == 187 and ord(source[2]) == 191:
+        start = 3
+    mut fence := "---"
+    mut format := "yaml"
+    if starts_with_exactly(source, start, source.len(), "+++"):
+        fence = "+++"
+        format = "toml"
+    data_start := fence_line_end(source, start, fence)
+    if data_start < 0:
+        return FrontMatter(format: "", data: "", body: source)
+    mut line := data_start
+    while line < source.len():
+        body_start := fence_line_end(source, line, fence)
+        if body_start >= 0:
+            if line - data_start > MAX_FRONT_MATTER_BYTES:
+                fail "front matter is larger than {MAX_FRONT_MATTER_BYTES} bytes"
+            return FrontMatter(format: format, data: source.substring(data_start, line), body: source.substring(body_start, source.len()))
+        newline := find_text(source, line, source.len(), "\n")
+        if newline < 0:
+            break
+        line = newline + 1
+    return FrontMatter(format: "", data: "", body: source)
+
+# where the line at `position` ends, past its newline, when it holds `fence`
+# and nothing after it but spaces, tabs and a carriage return; -1 otherwise.
+fn fence_line_end(source: String, position: Int, fence: String) -> Int:
+    if not starts_with_exactly(source, position, source.len(), fence):
+        return -1
+    mut i := position + fence.len()
+    while i < source.len() and is_space_or_tab(ord(source[i])):
+        i += 1
+    if i < source.len() and ord(source[i]) == 13:
+        i += 1
+    if i == source.len():
+        return i
+    if ord(source[i]) == 10:
+        return i + 1
+    return -1
+
+# ---------------------------------------------------------------
 # the html renderer
 # ---------------------------------------------------------------
 
@@ -3357,6 +3546,8 @@ pub struct HtmlRenderer:
     # how many images deep the renderer is: inside an image, only the text of
     # the events is written, as the alt attribute.
     image_depth: Int
+    # whether a heading with an id starts with a link to itself.
+    anchors: Bool = false
     # heap copies of HTML_SPECIAL and HREF_SAFE, which index faster than the
     # constants (see Document.inline_special).
     html_special: String
@@ -3502,9 +3693,18 @@ impl HtmlRenderer:
             Tag.Paragraph =>
                 self.newline()
                 self.write("<p>")
-            Tag.Heading(level) =>
+            Tag.Heading(level, id) =>
                 self.newline()
-                self.write("<h{level}>")
+                if id.len() == 0:
+                    self.write("<h{level}>")
+                else:
+                    self.write("<h{level} id=\"")
+                    self.write_escaped(id)
+                    self.write("\">")
+                    if self.anchors:
+                        self.write("<a class=\"anchor\" href=\"#")
+                        self.write_url(id)
+                        self.write("\" aria-hidden=\"true\" tabindex=\"-1\">#</a>")
             Tag.BlockQuote =>
                 self.newline()
                 self.write("<blockquote>\n")
@@ -3587,7 +3787,7 @@ impl HtmlRenderer:
                     self.paragraph_held = true
                 else:
                     self.write("</p>\n")
-            Tag.Heading(level) =>
+            Tag.Heading(level, id) =>
                 self.write("</h{level}>\n")
             Tag.BlockQuote =>
                 self.newline()
@@ -3753,7 +3953,7 @@ fn describe(event: Event) -> String:
 fn describe_tag(tag: Tag) -> String:
     return match tag:
         Tag.Paragraph => "p"
-        Tag.Heading(level) => "h{level}"
+        Tag.Heading(level, id) => "h{level}" + heading_id_suffix(id)
         Tag.BlockQuote => "quote"
         Tag.CodeBlock(info) => "code[" + info + "]"
         Tag.List(start, tight) => "list[{start} {tight}]"
@@ -3768,6 +3968,12 @@ fn describe_tag(tag: Tag) -> String:
         Tag.TableCell(alignment) => "td" + alignment_attribute(alignment)
         Tag.Strikethrough => "del"
         Tag.FootnoteDefinition(label) => "footnote[" + label + "]"
+
+# how describe spells a heading's id: nothing when it has none.
+fn heading_id_suffix(id: String) -> String:
+    if id.len() == 0:
+        return ""
+    return "#" + id
 
 fn describe_all(source: String, opts: Options) -> String:
     mut parts: List[String] := []
@@ -3890,6 +4096,85 @@ test "tight list items carry no paragraph events":
     assert_eq(describe_all("- a\n\n- b", options()), "+list[none false] +item +p text(a) -p -item +item +p text(b) -p -item -list[none false]")
     assert_eq(describe_all("7) a", options()), "+list[7 true] +item text(a) -item -list[7 true]")
 
+fn heading_id(source: String) -> String:
+    page := render(source, options().heading_ids(true))
+    start := find_text(page, 0, page.len(), "id=\"") + 4
+    return page.substring(start, find_text(page, start, page.len(), "\""))
+
+test "heading ids are github's slugs":
+    assert_eq(render("# Hello, World!", options().heading_ids(true)), "<h1 id=\"hello-world\">Hello, World!</h1>\n")
+    assert_eq(heading_id("## C++ & Rust"), "c--rust")
+    assert_eq(heading_id("# Café *au* `lait`"), "café-au-lait")
+    assert_eq(heading_id("# ÀÉÎ Straße ΑΓΩ"), "àéî-straße-αγω")
+    assert_eq(heading_id("# 100% done_well-ish"), "100-done_well-ish")
+    assert_eq(heading_id("# 🎉 Party"), "-party")
+    assert_eq(heading_id("# 日本語の見出し"), "日本語の見出し")
+    assert_eq(heading_id("# a" + encode_utf8(160) + "b" + encode_utf8(8203) + "c"), "abc")
+    assert_eq(heading_id("Setext\nline two\n==="), "setext-line-two")
+    assert_eq(heading_id("# !!!"), "section")
+    assert_eq(heading_id("#"), "section")
+
+test "repeated heading ids are numbered and never collide":
+    page := render("# a\n# a\n# a-1\n# a\n# A", options().heading_ids(true))
+    assert_eq(page, "<h1 id=\"a\">a</h1>\n<h1 id=\"a-1\">a</h1>\n<h1 id=\"a-1-1\">a-1</h1>\n<h1 id=\"a-2\">a</h1>\n<h1 id=\"a-3\">A</h1>\n")
+
+test "a heading id cannot break out of its attribute":
+    assert_eq(render("# a\" onmouseover=\"b", options().heading_ids(true)), "<h1 id=\"a-onmouseoverb\">a&quot; onmouseover=&quot;b</h1>\n")
+    assert_eq(heading_id("# \"><script>alert(1)</script>"), "scriptalert1script")
+    assert_eq(heading_id("# <b>&amp;</b>"), "bb")
+
+test "heading anchors link each heading to itself":
+    anchored := options().heading_anchors(true)
+    assert_eq(render("## Usage", anchored), "<h2 id=\"usage\"><a class=\"anchor\" href=\"#usage\" aria-hidden=\"true\" tabindex=\"-1\">#</a>Usage</h2>\n")
+    assert_eq(render("# Café", anchored), "<h1 id=\"café\"><a class=\"anchor\" href=\"#caf%C3%A9\" aria-hidden=\"true\" tabindex=\"-1\">#</a>Café</h1>\n")
+    assert_eq(render("## Usage", options()), "<h2>Usage</h2>\n")
+
+test "the event stream carries heading ids":
+    assert_eq(describe_all("# A b\n\nx\n\n## A b", options().heading_ids(true)), "+h1#a-b text(A b) -h1#a-b +p text(x) -p +h2#a-b-1 text(A b) -h2#a-b-1")
+    assert_eq(describe_all("# A b", options()), "+h1 text(A b) -h1")
+
+test "toc lists the headings with the ids render gives them":
+    source := "# Intro\n\nText.\n\n## Set *up* `now`\n\nSetext\n---\n\n> ## Quoted\n\n## Intro"
+    headings := toc(source, options())
+    assert_eq(headings.len(), 5)
+    assert_eq("{headings[0].level} {headings[0].text} {headings[0].id}", "1 Intro intro")
+    assert_eq("{headings[1].level} {headings[1].text} {headings[1].id}", "2 Set up now set-up-now")
+    assert_eq("{headings[2].level} {headings[2].text} {headings[2].id}", "2 Setext setext")
+    assert_eq("{headings[3].level} {headings[3].text} {headings[3].id}", "2 Quoted quoted")
+    assert_eq("{headings[4].level} {headings[4].text} {headings[4].id}", "2 Intro intro-1")
+    page := render(source, options().heading_ids(true))
+    for heading in headings:
+        assert(page.contains("id=\"" + heading.id + "\""))
+    assert_eq(toc("no headings", options()).len(), 0)
+
+fn front(source: String) -> String:
+    split := split_front_matter(source) catch:
+        return "error"
+    return "[" + split.format + "|" + split.data + "|" + split.body + "]"
+
+test "front matter is split off the start":
+    assert_eq(front("---\ntitle: x\n---\n# body\n"), "[yaml|title: x\n|# body\n]")
+    assert_eq(front("+++\ntitle = \"x\"\n+++\nbody"), "[toml|title = \"x\"\n|body]")
+    assert_eq(front("---\r\na: 1\r\n---\r\nbody"), "[yaml|a: 1\r\n|body]")
+    assert_eq(front("--- \na: 1\n---\t\nb"), "[yaml|a: 1\n|b]")
+    assert_eq(front("---\n---\nbody"), "[yaml||body]")
+    assert_eq(front("---\na: 1\n---"), "[yaml|a: 1\n|]")
+    assert_eq(front(encode_utf8(65279) + "---\na: 1\n---\nb"), "[yaml|a: 1\n|b]")
+
+test "anything else is not front matter":
+    assert_eq(front("# hi"), "[||# hi]")
+    assert_eq(front(""), "[||]")
+    assert_eq(front("---\nnot closed\n"), "[||---\nnot closed\n]")
+    assert_eq(front("----\na\n----\n"), "[||----\na\n----\n]")
+    assert_eq(front("+++\na\n---\nb"), "[||+++\na\n---\nb]")
+    assert_eq(front("text\n---\na\n---\n"), "[||text\n---\na\n---\n]")
+    assert_eq(front(" ---\na\n---\n"), "[|| ---\na\n---\n]")
+
+test "front matter is bounded":
+    at_limit := "a".repeat(MAX_FRONT_MATTER_BYTES - 1) + "\n"
+    assert_eq(split_front_matter("---\n" + at_limit + "---\nb")!.data.len(), MAX_FRONT_MATTER_BYTES)
+    assert_eq(front("---\n" + at_limit + "x\n---\nb"), "error")
+
 test "render_with drives any renderer":
     counter := CountingRenderer(counted: 0, texts: [])
     assert_eq(render_with("# a\n\nb *c*", options(), counter), "9 events: a|b |c")
@@ -3899,7 +4184,8 @@ test "options builders return copies":
     allowed := base.allow_html(true)
     assert_eq(render("a <b>", base), "<p>a &lt;b&gt;</p>\n")
     assert_eq(render("a <b>", allowed), "<p>a <b></p>\n")
-    assert_eq(render("# h", base.heading_ids(true).gfm(false)), "<h1>h</h1>\n")
+    assert_eq(render("# h", base.heading_ids(true).gfm(false)), "<h1 id=\"h\">h</h1>\n")
+    assert_eq(render("# h", base), "<h1>h</h1>\n")
 
 test "entities use the full html5 table":
     assert_eq(to_html("&CounterClockwiseContourIntegral; &ngE; &copy; &amp;"), "<p>∳ ≧̸ © &amp;</p>\n")

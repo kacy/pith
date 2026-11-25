@@ -260,13 +260,13 @@ everything rebuilds from source.
 
 ## the standard library
 
-130 modules, all pith. the areas, with the doc that goes deepest:
+131 modules, all pith. the areas, with the doc that goes deepest:
 
 | area | modules | read |
 |---|---|---|
 | networking | tcp, unix, dns, url, http, http2, websocket, tls, sse, grpc, socks5 | [tls](docs/tls.md), [grpc](docs/grpc.md), [web](docs/web.md) |
 | databases | sql, postgres, mysql, redis, and `db` on top | [db](docs/db.md) |
-| web apps | web: routing, middleware, sessions, csrf, cors | [http apps](docs/http_apps.md) |
+| web apps | web: routing, middleware, sessions, csrf, cors, markdown pages | [http apps](docs/http_apps.md) |
 | data | json, toml, yaml, csv, config, table | [yaml](docs/yaml.md) |
 | exact numbers | bigint, decimal | [numbers](docs/numbers.md) |
 | bytes and crypto | hash, checksum, encoding, crypto, bits, binary | [auth](docs/auth.md) |

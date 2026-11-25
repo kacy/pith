@@ -144,7 +144,8 @@ html := markdown.render(readme_text, trusted)
 | `allow_html(Bool)` | `false` | pass raw html through. only for text you would put in a template yourself |
 | `allow_unsafe_urls(Bool)` | `false` | skip the url check. the spec tests need it for schemes such as `irc:`; a page that shows untrusted text should never set it |
 | `gfm(Bool)` | `true` | the github extensions: tables, strikethrough, task lists, extended autolinks, footnotes, and the tag filter on raw html |
-| `heading_ids(Bool)` | `false` | reserved for `id` attributes on headings. no effect yet |
+| `heading_ids(Bool)` | `false` | give each heading an `id` made from its text, as github does (see [heading ids](#heading-ids-and-tables-of-contents)) |
+| `heading_anchors(Bool)` | `false` | also start each heading with a link to itself. turns heading ids on |
 
 both escape hatches are spelled out as method names, so
 `grep -rn 'allow_html(true)\|allow_unsafe_urls(true)'` lists every place a
@@ -163,10 +164,10 @@ from std.markdown import Event, Tag
 mut heading := 0
 for event in markdown.events(source, markdown.options()):
     if let Event.Start(opened) = event:
-        if let Tag.Heading(level) = opened:
+        if let Tag.Heading(level, id) = opened:
             heading = level
     if let Event.End(closed) = event:
-        if let Tag.Heading(level) = closed:
+        if let Tag.Heading(level, id) = closed:
             heading = 0
     if let Event.Text(content) = event:
         if heading > 0:
@@ -175,7 +176,7 @@ for event in markdown.events(source, markdown.options()):
 
 import the enum names with `from std.markdown import ...`: a pattern cannot
 name a module (`markdown.Event.Text(x)` does not parse), and a variant
-pattern nested in another (`Event.Start(Tag.Heading(level))`) passes the
+pattern nested in another (`Event.Start(Tag.Heading(level, id))`) passes the
 checker but does not compile yet, so match one level at a time.
 
 ```pith
@@ -194,7 +195,7 @@ pub enum Event:
 
 pub enum Tag:
     Paragraph
-    Heading(Int)              # the level, 1 to 6
+    Heading(Int, String)      # the level, 1 to 6, and the id ("" without heading ids)
     BlockQuote
     CodeBlock(String)         # the info string, "" for none
     List(Int?, Bool)          # the start number (none for a bullet list), tight
@@ -276,6 +277,194 @@ impl Renderer for TextLength:
 
 length := markdown.render_with(post, markdown.options(), TextLength(total: 0))
 ```
+
+## heading ids and tables of contents
+
+`options().heading_ids(true)` gives each heading an `id` made from its text,
+by the rule github uses for a readme:
+
+```pith
+markdown.render("# Hello, World!\n\n## Usage", markdown.options().heading_ids(true))
+# "<h1 id=\"hello-world\">Hello, World!</h1>\n<h2 id=\"usage\">Usage</h2>\n"
+```
+
+- the text is the heading's text and code spans with the markup dropped, so
+  ``## Set *up* `now` `` reads `Set up now`.
+- letters are lowercased (unicode simple case folding), each space becomes
+  `-`, and everything that is not a letter, a mark, a number, `-` or `_` is
+  dropped. `## C++ & Rust` becomes `c--rust` and `# Café au lait` becomes
+  `café-au-lait`.
+- a heading with nothing left becomes `section`.
+- an id is unique within its document. the second `## Usage` is `usage-1` and
+  the third `usage-2`, and a heading whose own text is `Usage 1` after them
+  becomes `usage-1-1`, never a second `usage-1`.
+
+an id holds only letters, marks, numbers, `-` and `_`, so no quote, `<`, `&`
+or space can end the attribute, and it is escaped when written all the same.
+the id is part of the event stream: `Tag.Heading(level, id)` carries it, and
+it is `""` when ids are off, so a renderer of your own gets the same ids.
+
+`heading_anchors(true)` also starts each heading with a link to itself, which
+turns ids on:
+
+```html
+<h2 id="usage"><a class="anchor" href="#usage" aria-hidden="true" tabindex="-1">#</a>Usage</h2>
+```
+
+the link is kept out of the tab order and away from screen readers, since the
+heading already says what it is. style `.anchor` to show it on hover.
+
+ids come from what the author wrote. on a page that shows text from several
+people, an id can repeat one the page already uses, or name a global that a
+script reads, since an element with an id is reachable as `window.<id>`. leave
+heading ids off for that kind of text, which is the default.
+
+`markdown.toc(source, opts)` lists the headings for a table of contents:
+
+```pith
+for heading in markdown.toc(source, markdown.options()):
+    print("{heading.level} {heading.text} #{heading.id}")
+```
+
+each `Heading` has `level`, `text` (the plain text, trimmed) and `id`. the ids
+are the ones `render` gives the same headings with the same options, so a link
+to `#id` reaches its heading. `toc` makes ids whether or not the options ask
+for them.
+
+## front matter
+
+`markdown.split_front_matter(source)` splits a block of metadata off the start
+of a document, yaml between `---` lines or toml between `+++` lines:
+
+```pith
+split := markdown.split_front_matter("---\ntitle: Hello\n---\n# Hello\n")!
+# split.format is "yaml", split.data is "title: Hello\n", split.body is "# Hello\n"
+```
+
+`format` is `"yaml"`, `"toml"` or `""` when there is no front matter, `data`
+is the text between the fences, and `body` is the rest. parsing `data` is left
+to `std.yaml` or `std.toml`.
+
+- the opening fence is the first line, after an optional byte order mark. the
+  closing fence is the next line that holds the same fence. either may have
+  trailing spaces, and lines may end in `\n` or `\r\n`.
+- a first line that opens a block no later line closes is not front matter.
+  `format` is `""` and the whole source is the body, where commonmark reads
+  the `---` as a thematic break.
+- the data may be at most `MAX_FRONT_MATTER_BYTES`, 64 KiB, and a split with
+  more fails. a document whose stray `---` lines happen to pair up therefore
+  never reaches a yaml parser whole.
+
+## in templates
+
+`std.template` writes a value as markdown with `<%md path %>`:
+
+```pith
+page := template.compile("<article><%md post.body %></article>")!
+```
+
+the html is what `markdown.to_html` writes, so raw html in the value is shown
+as text and every url is checked. a template has no way to let raw html
+through, so a `grep -rn '<%raw'` audit can skip `<%md`. text that should keep
+its raw html is rendered in pith with `markdown.options().allow_html(true)` and
+written with `<%raw %>`, where the audit finds it.
+
+the html is block content, so compile refuses `<%md %>` anywhere but element
+text. in an attribute value, a tag, a comment, `<script>`, `<style>`,
+`<title>` or `<textarea>` the template fails to compile, the way a misplaced
+`<%= %>` does. `page.heading_ids(true)` and `page.heading_anchors(true)` on a
+compiled template turn on heading ids and anchors for its `<%md %>` tags.
+[docs/html.md](html.md) covers the rest of the template language.
+
+## pages in std.web
+
+`std.web.pages` serves a directory of markdown files as html through a layout
+template. `pages.handler(dir, layout)` answers a route whose last segment is
+`*name`:
+
+```pith
+app := web.new().get("/docs/*path", pages.handler("docs", layout))
+```
+
+`GET /docs/guide/setup` renders `docs/guide/setup.md`, and a path that names a
+directory renders its `index.md`. a directory's page lives at its path with a
+trailing slash and any other page without one, as with net/http's
+`FileServer`: `/docs` gets a 301 to `/docs/`, and `/docs/guide/setup/` one to
+`/docs/guide/setup`. a relative link in a page then resolves against the
+directory its file is in, the same as when the markdown is read on disk.
+
+the layout is rendered with this context:
+
+| key | value |
+| --- | --- |
+| each front matter key | its value from the yaml or toml, nested maps and lists included |
+| `title` | the front matter's title, or else the text of the first heading |
+| `content` | the markdown body, for `<%md content %>` |
+| `toc` | the headings, each with `level`, `text` and `id` |
+
+`content` and `toc` are set after the front matter, so the front matter cannot
+replace them. the body reaches the page through `<%md %>`, which renders it
+with the safe defaults and with heading ids, so a layout needs no `<%raw %>`
+and nothing in a markdown file can write raw html or a `javascript:` url. pass
+`layout.heading_anchors(true)` for heading anchors.
+
+what it serves:
+
+- only markdown. a page is found by adding `.md` or `/index.md` to the path,
+  so a request cannot name any other file.
+- nothing outside the directory. a `..` segment is redirected to the clean
+  path before the route runs, as it is for static files. a segment that still
+  starts with `.`, such as a `..` behind an encoded slash or a hidden file,
+  gets 404, and a NUL byte gets 400. symbolic links are followed, as they are
+  for static files.
+- at most `pages.MAX_PAGE_BYTES`, 1 MiB, of markdown. a larger file, front
+  matter that does not parse, or a layout that fails to render gets 500, and
+  the reason goes to the log.
+- `Last-Modified`, a strong `ETag`, and 304 and 412 for conditional requests,
+  from `http.serve_content`. the time is the later of the file's modification
+  time and the time the handler was made, because a new layout changes every
+  page without touching its file.
+- `Content-Type: text/html; charset=utf-8`.
+
+each request reads and renders its page, so there is no cache to go stale.
+served this way on the development machine, this file (10 KB) takes about
+0.27 ms a request and `docs/web.md` (55 KB) about 1.4 ms.
+
+`std.toml` does not parse dates yet, so toml front matter with a bare date
+fails to parse. quote the date or use yaml.
+
+## a docs site in fifteen lines
+
+`layout.html`:
+
+```html
+<!doctype html>
+<meta charset="utf-8">
+<title><%= title %></title>
+<nav><% for h in toc %><a class="h<%= h.level %>" href="#<%= h.id %>"><%= h.text %></a>
+<% end %></nav>
+<main><%md content %></main>
+```
+
+`site.pith`:
+
+```pith
+import std.template as template
+import std.web as web
+import std.web.pages as pages
+
+fn main() -> Int!:
+    layout := template.load("layout.html") catch:
+        print("layout.html does not compile")
+        return 1
+    app := web.new().get("/*path", pages.handler("docs", layout.heading_anchors(true)))
+    app.listen("0.0.0.0", 8080)!
+    return 0
+```
+
+with `docs/index.md` and `docs/guide/setup.md` in place, `/` serves the first
+and `/guide/setup` the second, each with its own table of contents. the routes
+`web.new()` adds, `/healthz` and `/metrics`, come first and keep working.
 
 ## limits
 
@@ -361,7 +550,5 @@ parsed on its own.
 
 later work builds on the event stream and the options above:
 
-- `heading_ids(true)`, and use from `std.template` and `std.web`, with
-  `tools/sitegen` moving to this module.
 - a terminal renderer that writes ansi styles, and code highlighting hooks for
   the html and terminal renderers.

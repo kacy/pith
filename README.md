@@ -85,7 +85,7 @@ do integer conversions, `abs`, `Float.to_int` and shift counts outside
 
 ## why you might want it
 
-**the whole stack is readable.** 128 standard library modules, 44,000
+**the whole stack is readable.** 134 standard library modules, 51,000
 lines of pith: the tls implementation, http/1.1 and http/2,
 websockets, grpc, the database wire protocols, json, toml, yaml,
 compression, hashing, a linear-time regex engine. when the language
@@ -260,7 +260,7 @@ everything rebuilds from source.
 
 ## the standard library
 
-131 modules, all pith. the areas, with the doc that goes deepest:
+134 modules, all pith. the areas, with the doc that goes deepest:
 
 | area | modules | read |
 |---|---|---|

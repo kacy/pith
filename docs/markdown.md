@@ -164,21 +164,18 @@ from std.markdown import Event, Tag
 
 mut heading := 0
 for event in markdown.events(source, markdown.options()):
-    if let Event.Start(opened) = event:
-        if let Tag.Heading(level, id) = opened:
-            heading = level
-    if let Event.End(closed) = event:
-        if let Tag.Heading(level, id) = closed:
-            heading = 0
+    if let Event.Start(Tag.Heading(level, _)) = event:
+        heading = level
+    if let Event.End(Tag.Heading(_, _)) = event:
+        heading = 0
     if let Event.Text(content) = event:
         if heading > 0:
             print("h{heading}: {content}")
 ```
 
-import the enum names with `from std.markdown import ...`: a pattern cannot
-name a module (`markdown.Event.Text(x)` does not parse), and a variant
-pattern nested in another (`Event.Start(Tag.Heading(level, id))`) passes the
-checker but does not compile yet, so match one level at a time.
+a pattern can nest, as `Event.Start(Tag.Heading(level, _))` does, and it can
+name the module instead of importing the enums: `markdown.Event.Text(x)`
+matches the same events as `Event.Text(x)`.
 
 ```pith
 pub enum Event:

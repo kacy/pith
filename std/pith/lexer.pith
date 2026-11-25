@@ -1,0 +1,1275 @@
+# std.pith.lexer - the lexer of the pith compiler
+#
+# turns pith source text into a token stream. this is the lexer the compiler
+# itself runs: its parser reads this stream, and std.pith.highlight colors code
+# from the same stream, so a highlighter can never disagree with the compiler
+# about where a string ends or which words are keywords.
+#
+#   import std.pith.lexer as lexer
+#
+#   for tok in lexer.lex("total := add(1, 2)"):
+#       print(tok.kind + " " + tok.value)
+#
+# lexing never fails. a stray character, an unterminated string or an
+# indentation level that matches no open block becomes an "err" token and
+# scanning carries on, so any text, including half-typed code, lexes. a
+# multi-byte character outside a string or a comment is not valid pith and
+# comes back as one "err" token per byte.
+#
+# every piece of scan state lives in a value made for one call, so any number
+# of tasks can lex at once.
+
+# ---------------------------------------------------------------
+# tokens
+# ---------------------------------------------------------------
+
+# one lexed token. `kind` is a string tag the parser matches on and `value` is
+# the source text it covered, empty for the kinds that carry none: newline,
+# indent, dedent, eof.
+#
+# the kinds are "identifier", "underscore", "int_lit", "float_lit",
+# "string_lit", "comment", "err", the layout kinds "newline", "indent",
+# "dedent" and "eof", "kw_<word>" for each keyword, an operator or punctuation
+# name such as "plus_eq" or "lparen", and the pieces of an interpolated string:
+# "string_start", then "interpolation_expr", "string_mid" and "string_end".
+#
+# `line` and `column` are 1-based and name the token's first character, and
+# `offset` and `len` give the same span as a byte offset and a byte length.
+# columns count bytes. a token the scanner makes up (indent, dedent, eof) has
+# a zero length.
+#
+# an interpolated string is one "string_start" token whose span covers the
+# whole literal and whose value is the text from the opening quote up to the
+# first `{`. the pieces follow it, each with the span of its own text: an
+# "interpolation_expr" holds the raw source between a `{` and its `}`, and a
+# "string_mid" or "string_end" the text after a `}`, without the closing
+# quote. the braces and the closing quote belong to no piece.
+pub struct Token:
+    pub kind: String
+    pub value: String
+    pub line: Int
+    pub column: Int
+    pub offset: Int
+    pub len: Int
+
+# the words the lexer turns into "kw_<word>" tokens, matched with the commas
+# around them
+KEYWORDS := ",fn,if,elif,else,for,in,while,match,select,default,timeout,return,fail,break,continue,spawn,await,struct,enum,interface,impl,type,pub,mut,ref,weak,import,from,as,self,true,false,none,and,or,not,catch,test,let,threadlocal,defer,errdefer,"
+
+# a brace inside a string literal starts an interpolation, so the brace
+# tokens' values are built with chr() instead of written as literals
+LBRACE := chr(123)
+RBRACE := chr(125)
+
+## the tokens of `src`, up to and including the trailing eof token. this is
+## the stream the compiler parses. a comment that shares its line with code
+## comes back as a "comment" token, and a line holding only a comment is
+## skipped like a blank line.
+pub fn lex(src: String) -> List[Token]:
+    return lex_source(src, false)
+
+## the tokens of `src` with every comment in them: like `lex`, except that a
+## comment alone on its line also comes back, as a "comment" token. the line
+## still counts as blank, so the layout tokens are the ones `lex` produces.
+## this is the stream for tools that show source rather than run it.
+pub fn lex_with_comments(src: String) -> List[Token]:
+    return lex_source(src, true)
+
+fn lex_source(src: String, keep_comments: Bool) -> List[Token]:
+    mut lx := Scanner(src, keep_comments, 0, 1, 0, true, false, [0], 0, 0, [], [], [], [], 0, "", "", 0, 0, 0, 0, 1, 1, 0)
+    mut tokens: List[Token] := []
+    mut keep_going := true
+    while keep_going:
+        lx.next_token()
+        tokens.push(Token(lx.current_token_kind, lx.current_token_value, lx.current_token_line, lx.current_token_column, lx.current_token_offset, lx.current_token_len))
+        if lx.current_token_kind == "eof":
+            keep_going = false
+    return tokens
+
+# ---------------------------------------------------------------
+# character classes
+# ---------------------------------------------------------------
+
+fn is_alpha(character: String) -> Bool:
+    if character.len() == 0:
+        return false
+    code := ord(character)
+    if code >= 97:
+        if code <= 122:
+            return true
+    if code >= 65:
+        if code <= 90:
+            return true
+    if character == "_":
+        return true
+    return false
+
+fn is_digit(character: String) -> Bool:
+    if character.len() == 0:
+        return false
+    code := ord(character)
+    if code >= 48:
+        if code <= 57:
+            return true
+    return false
+
+fn is_alnum(character: String) -> Bool:
+    return is_alpha(character) or is_digit(character)
+
+fn is_hex_digit(character: String) -> Bool:
+    if is_digit(character):
+        return true
+    if character.len() == 0:
+        return false
+    code := ord(character)
+    if code >= 97:
+        if code <= 102:
+            return true
+    if code >= 65:
+        if code <= 70:
+            return true
+    return false
+
+fn is_octal_char(c: String) -> Bool:
+    if c == "_":
+        return true
+    if c.len() == 0:
+        return false
+    code := ord(c)
+    if code >= 48:
+        if code <= 55:
+            return true
+    return false
+
+fn is_lbrace(character: String) -> Bool:
+    if character.len() == 0:
+        return false
+    return ord(character) == 123
+
+fn is_rbrace(character: String) -> Bool:
+    if character.len() == 0:
+        return false
+    return ord(character) == 125
+
+fn is_quote(character: String) -> Bool:
+    if character.len() == 0:
+        return false
+    return ord(character) == 34
+
+fn is_backslash(character: String) -> Bool:
+    if character.len() == 0:
+        return false
+    return ord(character) == 92
+
+fn is_newline_char(character: String) -> Bool:
+    if character.len() == 0:
+        return false
+    return ord(character) == 10
+
+fn keyword_token_kind(word: String) -> String:
+    if KEYWORDS.contains("," + word + ","):
+        return "kw_" + word
+    return "identifier"
+
+# drop `_` digit separators from a numeric literal's text. the scanner consumes
+# them so `1_000_000` reads as one token, but the token value must be the clean
+# number, or downstream int and float parsing chokes on the underscores.
+fn strip_digit_separators(text: String) -> String:
+    if not text.contains("_"):
+        return text
+    return text.replace("_", "")
+
+# ---------------------------------------------------------------
+# scanner state
+# ---------------------------------------------------------------
+
+# the state of one scan. lex_source() makes one per call and nothing else
+# holds it, so concurrent scans never share state.
+struct Scanner:
+    source: String
+    # whether a comment alone on its line comes back as a token
+    keep_comments: Bool
+    mut current_position: Int
+    mut current_line: Int
+    mut current_column: Int
+    mut at_line_start: Bool
+    mut done: Bool
+    # indentation levels of the open blocks, outermost first
+    mut indent_stack: List[Int]
+    # depth of open (, [, { groups: newlines and indentation inside a group
+    # don't produce layout tokens, so call arguments and literals can span
+    # lines
+    mut group_depth: Int
+    mut pending_dedents: Int
+    # a block lambda written inside a group, as in `xs.map(fn(x: Int):` with
+    # the body on the lines below. lambda_header_depths holds the group depth
+    # of each `fn` seen inside a group whose header has not ended yet,
+    # innermost last. when such a header ends in a colon at the end of its
+    # line, the scanner leaves group mode for the body: the block's depth and
+    # the indent stack height are saved, and layout tokens come back until a
+    # line dedents past the body, which closes the block and resumes the
+    # group.
+    mut lambda_header_depths: List[Int]
+    mut lambda_block_depths: List[Int]
+    mut lambda_block_heights: List[Int]
+    # the pieces of an interpolated string, queued while the whole literal is
+    # scanned and handed out one per next_token() call from pending_head on.
+    # each piece carries the span it was cut from, so it reports where it sits
+    # in the source rather than where the scanner ended up.
+    mut pending: List[Token]
+    mut pending_head: Int
+    # the token next_token() produced last. next_token() returns nothing and
+    # sets these instead, so a caller reads them straight after each call.
+    mut current_token_kind: String
+    mut current_token_value: String
+    mut current_token_line: Int
+    mut current_token_column: Int
+    mut current_token_offset: Int
+    mut current_token_len: Int
+    # where the token being scanned starts. captured before the scan consumes
+    # anything, so emit() reports the token's first character instead of
+    # wherever the scan finished.
+    mut token_start_line: Int
+    mut token_start_column: Int
+    mut token_start_offset: Int
+
+impl Scanner:
+    fn peek() -> String:
+        if self.current_position >= self.source.len():
+            return ""
+        return self.source_char(self.current_position)
+
+    fn source_char(pos: Int) -> String:
+        if pos < 0:
+            return ""
+        if pos >= self.source.len():
+            return ""
+        return self.source[pos]
+
+    fn advance() -> String:
+        character := self.source_char(self.current_position)
+        self.current_position = self.current_position + 1
+        if is_newline_char(character):
+            self.current_line = self.current_line + 1
+            self.current_column = 0
+        else:
+            self.current_column = self.current_column + 1
+        return character
+
+    fn is_blank_line() -> Bool:
+        mut i := self.current_position
+        while i < self.source.len():
+            character := self.source_char(i)
+            if is_newline_char(character):
+                return true
+            if character == "#":
+                return true
+            if character != " ":
+                if character != chr(9):
+                    return false
+            i = i + 1
+        return true
+
+    fn skip_to_next_line():
+        while self.current_position < self.source.len():
+            character := self.source_char(self.current_position)
+            self.current_position = self.current_position + 1
+            if is_newline_char(character):
+                self.current_line = self.current_line + 1
+                self.current_column = 0
+                return
+            else:
+                self.current_column = self.current_column + 1
+
+    fn measure_indent() -> Int:
+        mut level := 0
+        mut i := self.current_position
+        while i < self.source.len():
+            character := self.source_char(i)
+            if character == " ":
+                level = level + 1
+                i = i + 1
+            elif character == chr(9):
+                level = level + 1
+                i = i + 1
+            else:
+                return level
+        return level
+
+    fn skip_spaces():
+        while self.current_position < self.source.len():
+            if self.source_char(self.current_position) == " ":
+                self.current_position = self.current_position + 1
+                self.current_column = self.current_column + 1
+            else:
+                return
+
+    fn mark_token_start():
+        self.token_start_line = self.current_line
+        # current_column counts consumed characters, so the next character,
+        # the token's first, sits at the 1-based column one past it
+        self.token_start_column = self.current_column + 1
+        self.token_start_offset = self.current_position
+
+    fn emit(kind: String, value: String):
+        self.current_token_kind = kind
+        self.current_token_value = value
+        self.current_token_line = self.token_start_line
+        self.current_token_column = self.token_start_column
+        self.current_token_offset = self.token_start_offset
+        mut length := self.current_position - self.token_start_offset
+        if length < 0:
+            length = 0
+        self.current_token_len = length
+        self.track_group_lambda(kind)
+
+    # follow block lambda headers inside a group; see lambda_header_depths
+    fn track_group_lambda(kind: String):
+        if kind == "kw_fn":
+            if self.group_depth > 0:
+                self.lambda_header_depths.push(self.group_depth)
+            return
+        if self.lambda_header_depths.len() == 0:
+            return
+        if kind == "rparen" or kind == "rbracket" or kind == "rbrace":
+            while self.lambda_header_depths.len() > 0 and self.lambda_header_depths[self.lambda_header_depths.len() - 1] > self.group_depth:
+                self.lambda_header_depths.remove(self.lambda_header_depths.len() - 1)
+            return
+        if self.lambda_header_depths[self.lambda_header_depths.len() - 1] != self.group_depth:
+            return
+        if kind == "comma" or kind == "fat_arrow":
+            self.lambda_header_depths.remove(self.lambda_header_depths.len() - 1)
+            return
+        if kind == "colon" and self.is_blank_line():
+            self.lambda_header_depths.remove(self.lambda_header_depths.len() - 1)
+            self.lambda_block_depths.push(self.group_depth)
+            self.lambda_block_heights.push(self.indent_stack.len())
+            self.group_depth = 0
+
+    # a line that dedents past the body of a block lambda opened inside a
+    # group closes the body and goes back to the group. returns true when it
+    # emitted the closing dedent.
+    fn close_group_lambda(level: Int) -> Bool:
+        if self.lambda_block_heights.len() == 0:
+            return false
+        height := self.lambda_block_heights[self.lambda_block_heights.len() - 1]
+        if self.indent_stack.len() == height:
+            # the body's first line, unless it is not indented at all
+            if level > self.indent_stack[height - 1]:
+                return false
+        elif level >= self.indent_stack[height]:
+            return false
+        dedents := self.indent_stack.len() - height
+        while self.indent_stack.len() > height:
+            self.indent_stack.remove(self.indent_stack.len() - 1)
+        self.group_depth = self.lambda_block_depths[self.lambda_block_depths.len() - 1]
+        self.lambda_block_depths.remove(self.lambda_block_depths.len() - 1)
+        self.lambda_block_heights.remove(self.lambda_block_heights.len() - 1)
+        if dedents == 0:
+            return false
+        self.pending_dedents = dedents - 1
+        self.emit("dedent", "")
+        return true
+
+    # produce the next token. scan_token() returns false when it consumed
+    # input without producing a token, such as a blank or comment-only line or
+    # a line break inside a group, and this loop then calls it again.
+    # scan_token() must not call itself for those cases: a file of a million
+    # comment lines would need a million stack frames.
+    fn next_token():
+        mut produced := self.scan_token()
+        while not produced:
+            produced = self.scan_token()
+
+    fn scan_token() -> Bool:
+        # synthetic tokens (dedents, queued interpolation pieces, indent,
+        # newline, eof) take the position the scanner is sitting at when they
+        # are produced
+        self.mark_token_start()
+
+        # step 1: drain pending dedents
+        if self.pending_dedents > 0:
+            self.pending_dedents = self.pending_dedents - 1
+            self.emit("dedent", "")
+            return true
+
+        # step 2: drain pending interpolation pieces. each carries the span it
+        # was cut from, so it reports where it sits in the source rather than
+        # where the scanner ended up after the whole string.
+        if self.pending_head < self.pending.len():
+            piece := self.pending[self.pending_head]
+            self.pending_head = self.pending_head + 1
+            if self.pending_head == self.pending.len():
+                self.pending = []
+                self.pending_head = 0
+            self.token_start_line = piece.line
+            self.token_start_column = piece.column
+            self.token_start_offset = piece.offset
+            self.emit(piece.kind, piece.value)
+            # emit() measures a lexeme from where the scanner is now, which
+            # for a queued piece is past the whole string
+            self.current_token_len = piece.len
+            return true
+
+        # step 3: handle eof
+        if self.current_position >= self.source.len():
+            if not self.done:
+                if self.indent_stack.len() > 1:
+                    remaining := self.indent_stack.len() - 1
+                    # pop all but the first level
+                    while self.indent_stack.len() > 1:
+                        self.indent_stack.remove(self.indent_stack.len() - 1)
+                    if remaining > 1:
+                        self.pending_dedents = remaining - 1
+                    self.emit("dedent", "")
+                    return true
+                self.done = true
+            self.emit("eof", "")
+            return true
+
+        # step 4: handle indentation at the start of a line
+        if self.at_line_start:
+            self.at_line_start = false
+
+            # inside a bracketed group the line break is cosmetic: no indent
+            # or dedent bookkeeping applies
+            if self.group_depth > 0:
+                self.skip_spaces()
+                return false
+
+            if self.is_blank_line():
+                if self.keep_comments and self.scan_line_comment():
+                    return true
+                self.skip_to_next_line()
+                self.at_line_start = true
+                return false
+
+            level := self.measure_indent()
+            if self.close_group_lambda(level):
+                return true
+            if self.group_depth > 0:
+                # a block lambda with no indented body; back in the group
+                self.skip_spaces()
+                return false
+            current_indent := self.indent_stack[self.indent_stack.len() - 1]
+
+            if level > current_indent:
+                self.indent_stack.push(level)
+                self.emit("indent", "")
+                return true
+            elif level < current_indent:
+                mut dedents := 0
+                while self.indent_stack.len() > 1:
+                    if self.indent_stack[self.indent_stack.len() - 1] > level:
+                        self.indent_stack.remove(self.indent_stack.len() - 1)
+                        dedents = dedents + 1
+                    else:
+                        break
+                # verify the target indentation level exists in the stack
+                if self.indent_stack[self.indent_stack.len() - 1] != level:
+                    self.emit("err", "invalid dedent: indentation level does not match any outer block")
+                    return true
+                if dedents > 0:
+                    self.pending_dedents = dedents - 1
+                    self.emit("dedent", "")
+                    return true
+
+        # step 5: skip spaces
+        self.skip_spaces()
+
+        # step 6: re-check eof after skipping spaces
+        if self.current_position >= self.source.len():
+            return false
+
+        # the real token starts here, after any leading spaces
+        self.mark_token_start()
+        character := self.peek()
+
+        # step 7: dispatch on the character
+
+        # newline
+        if is_newline_char(character):
+            self.current_position = self.current_position + 1
+            self.current_line = self.current_line + 1
+            self.current_column = 0
+            self.at_line_start = true
+            if self.group_depth > 0:
+                return false
+            self.emit("newline", "")
+            return true
+
+        # comment
+        if character == "#":
+            self.scan_comment()
+            return true
+
+        # string
+        if is_quote(character):
+            self.scan_string()
+            return true
+
+        # number
+        if is_digit(character):
+            self.scan_number()
+            return true
+
+        # identifier or keyword
+        if is_alpha(character):
+            self.scan_identifier()
+            return true
+
+        # operators and punctuation
+        self.scan_operator()
+        return true
+
+    # a comment from the `#` under the scanner to the end of its line
+    fn scan_comment():
+        start := self.current_position
+        while self.current_position < self.source.len():
+            if is_newline_char(self.source_char(self.current_position)):
+                break
+            self.current_position = self.current_position + 1
+            self.current_column = self.current_column + 1
+        self.emit("comment", self.source.substring(start, self.current_position))
+
+    # on a blank line, with keep_comments set: the comment the line holds, if
+    # any, as a "comment" token, and then the rest of the line skipped like
+    # any blank line, so the indent stack and the layout tokens stay as they
+    # are without comments. false when the line holds no comment.
+    fn scan_line_comment() -> Bool:
+        mut i := self.current_position
+        while i < self.source.len() and (self.source_char(i) == " " or self.source_char(i) == chr(9)):
+            i = i + 1
+        if self.source_char(i) != "#":
+            return false
+        self.current_column = self.current_column + i - self.current_position
+        self.current_position = i
+        self.mark_token_start()
+        self.scan_comment()
+        self.skip_to_next_line()
+        self.at_line_start = true
+        return true
+
+    fn scan_identifier():
+        start := self.current_position
+        while self.current_position < self.source.len():
+            if not is_alnum(self.source_char(self.current_position)):
+                break
+            self.current_position = self.current_position + 1
+            self.current_column = self.current_column + 1
+        word := self.source.substring(start, self.current_position)
+
+        # check for a lone underscore
+        if word == "_":
+            self.emit("underscore", "_")
+            return
+
+        # check if it's a keyword
+        if KEYWORDS.contains("," + word + ","):
+            self.emit(keyword_token_kind(word), word)
+        else:
+            self.emit("identifier", word)
+
+    # a `0x`, `0b` or `0o` literal's token. a prefix with no digits after it
+    # is an error here, since it names no value and the backend would refuse
+    # it later.
+    fn emit_radix_literal(start: Int):
+        text := strip_digit_separators(self.source.substring(start, self.current_position))
+        if text.len() == 2:
+            self.emit("err", "the integer literal '" + text + "' has no digits after its prefix")
+            return
+        self.emit("int_lit", text)
+
+    # consume the digits of a `0x` literal after its prefix
+    fn skip_hex_digits():
+        while self.current_position < self.source.len():
+            scan_char := self.source_char(self.current_position)
+            if is_hex_digit(scan_char) or scan_char == "_":
+                self.current_position = self.current_position + 1
+                self.current_column = self.current_column + 1
+            else:
+                return
+
+    # consume the digits of a `0b` literal after its prefix
+    fn skip_binary_digits():
+        while self.current_position < self.source.len():
+            scan_char := self.source_char(self.current_position)
+            if scan_char == "0" or scan_char == "1" or scan_char == "_":
+                self.current_position = self.current_position + 1
+                self.current_column = self.current_column + 1
+            else:
+                return
+
+    # consume the digits of a `0o` literal after its prefix
+    fn skip_octal_digits():
+        while self.current_position < self.source.len():
+            if not is_octal_char(self.source_char(self.current_position)):
+                return
+            self.current_position = self.current_position + 1
+            self.current_column = self.current_column + 1
+
+    # consume decimal digits and `_` separators
+    fn skip_decimal_digits():
+        while self.current_position < self.source.len():
+            scan_char := self.source_char(self.current_position)
+            if is_digit(scan_char) or scan_char == "_":
+                self.current_position = self.current_position + 1
+                self.current_column = self.current_column + 1
+            else:
+                return
+
+    fn scan_number():
+        start := self.current_position
+
+        # a number right after a dot is a tuple index, so `pair.0.1` reads as
+        # two indexes rather than an index followed by the float `0.1`
+        if self.current_token_kind == "dot":
+            while self.current_position < self.source.len() and is_digit(self.source_char(self.current_position)):
+                self.current_position = self.current_position + 1
+                self.current_column = self.current_column + 1
+            self.emit("int_lit", self.source.substring(start, self.current_position))
+            return
+
+        # check for hex, binary and octal prefixes
+        if self.source_char(self.current_position) == "0" and self.current_position + 1 < self.source.len():
+            next_char := self.source_char(self.current_position + 1)
+            if next_char == "x" or next_char == "X":
+                self.current_position = self.current_position + 2
+                self.current_column = self.current_column + 2
+                self.skip_hex_digits()
+                self.emit_radix_literal(start)
+                return
+            if next_char == "b" or next_char == "B":
+                self.current_position = self.current_position + 2
+                self.current_column = self.current_column + 2
+                self.skip_binary_digits()
+                self.emit_radix_literal(start)
+                return
+            if next_char == "o" or next_char == "O":
+                self.current_position = self.current_position + 2
+                self.current_column = self.current_column + 2
+                self.skip_octal_digits()
+                self.emit_radix_literal(start)
+                return
+
+        # decimal digits
+        self.skip_decimal_digits()
+
+        # check for a decimal point, which must be followed by a digit
+        mut is_float := false
+        if self.current_position + 1 < self.source.len() and self.source_char(self.current_position) == "." and is_digit(self.source_char(self.current_position + 1)):
+            is_float = true
+            self.current_position = self.current_position + 1
+            self.current_column = self.current_column + 1
+            self.skip_decimal_digits()
+
+        # check for an exponent
+        if self.current_position < self.source.len():
+            exp_char := self.source_char(self.current_position)
+            if exp_char == "e" or exp_char == "E":
+                is_float = true
+                self.current_position = self.current_position + 1
+                self.current_column = self.current_column + 1
+                if self.current_position < self.source.len():
+                    sign := self.source_char(self.current_position)
+                    if sign == "+" or sign == "-":
+                        self.current_position = self.current_position + 1
+                        self.current_column = self.current_column + 1
+                self.skip_decimal_digits()
+
+        if is_float:
+            self.emit("float_lit", strip_digit_separators(self.source.substring(start, self.current_position)))
+        else:
+            self.emit("int_lit", strip_digit_separators(self.source.substring(start, self.current_position)))
+
+    fn scan_string():
+        start := self.current_position
+        self.current_position = self.current_position + 1
+        self.current_column = self.current_column + 1
+
+        # check for interpolation by peeking ahead
+        mut has_interpolation := false
+        mut i := self.current_position
+        mut found_string_boundary := false
+        while i < self.source.len():
+            if found_string_boundary:
+                break
+            scan_char := self.source_char(i)
+            if is_backslash(scan_char):
+                if i + 1 >= self.source.len():
+                    found_string_boundary = true
+                else:
+                    i = i + 2
+            elif is_lbrace(scan_char):
+                if i + 1 < self.source.len() and is_lbrace(self.source_char(i + 1)):
+                    # `{{` is an escaped literal brace, not interpolation
+                    i = i + 2
+                else:
+                    has_interpolation = true
+                    found_string_boundary = true
+            elif is_quote(scan_char):
+                found_string_boundary = true
+            elif is_newline_char(scan_char):
+                found_string_boundary = true
+            else:
+                i = i + 1
+
+        if not has_interpolation:
+            # simple string
+            while self.current_position < self.source.len():
+                scan_char := self.source_char(self.current_position)
+                if is_backslash(scan_char):
+                    if self.current_position + 1 >= self.source.len():
+                        self.emit("err", "unterminated escape sequence")
+                        return
+                    self.current_position = self.current_position + 2
+                    self.current_column = self.current_column + 2
+                elif is_quote(scan_char):
+                    self.current_position = self.current_position + 1
+                    self.current_column = self.current_column + 1
+                    self.emit("string_lit", self.source.substring(start, self.current_position))
+                    return
+                elif is_newline_char(scan_char):
+                    self.emit("err", "newline in string literal")
+                    return
+                else:
+                    self.current_position = self.current_position + 1
+                    self.current_column = self.current_column + 1
+            self.emit("err", "unterminated string literal")
+            return
+
+        # interpolated string: scan to the first {
+        mut found_interp_start := false
+        while self.current_position < self.source.len():
+            if found_interp_start:
+                break
+            scan_char := self.source_char(self.current_position)
+            if is_backslash(scan_char):
+                if self.current_position + 1 >= self.source.len():
+                    self.emit("err", "unterminated escape sequence in string interpolation")
+                    return
+                self.current_position = self.current_position + 2
+                self.current_column = self.current_column + 2
+            elif is_lbrace(scan_char):
+                if self.current_position + 1 < self.source.len() and is_lbrace(self.source_char(self.current_position + 1)):
+                    # `{{` is an escaped literal brace; keep scanning for a real `{`
+                    self.current_position = self.current_position + 2
+                    self.current_column = self.current_column + 2
+                else:
+                    found_interp_start = true
+            elif is_quote(scan_char):
+                found_interp_start = true
+            elif is_newline_char(scan_char):
+                found_interp_start = true
+            else:
+                self.current_position = self.current_position + 1
+                self.current_column = self.current_column + 1
+
+        # the string_start value runs from the opening quote to the {
+        string_start_value := self.source.substring(start, self.current_position)
+
+        # now scan the interpolation parts into pending pieces
+        self.scan_interpolation_parts()
+
+        self.emit("string_start", string_start_value)
+
+    # queue one piece of an interpolated string with the source span it was
+    # cut from: `line` and `column` are 1-based and name its first character.
+    fn queue_interpolation_token(kind: String, value: String, line: Int, column: Int, offset: Int, length: Int):
+        self.pending.push(Token(kind, value, line, column, offset, length))
+
+    fn scan_interpolation_parts():
+        while self.current_position < self.source.len():
+            if not is_lbrace(self.source_char(self.current_position)):
+                return
+
+            # skip the {
+            self.current_position = self.current_position + 1
+            self.current_column = self.current_column + 1
+
+            # scan the expression inside {}
+            mut brace_depth := 1
+            expression_start := self.current_position
+            # current_column counts the characters consumed on this line, so
+            # the character after the brace sits one past it
+            expression_line := self.current_line
+            expression_column := self.current_column + 1
+            mut found_expr_end := false
+            while self.current_position < self.source.len():
+                if found_expr_end:
+                    break
+                input_char := self.source_char(self.current_position)
+                if is_backslash(input_char) and self.current_position + 1 < self.source.len():
+                    # skip an escaped char so a `\"` or `\}` inside the
+                    # expression (e.g. a string argument's quotes) doesn't
+                    # throw off the brace matching
+                    self.current_position = self.current_position + 2
+                    self.current_column = self.current_column + 2
+                elif is_lbrace(input_char):
+                    brace_depth = brace_depth + 1
+                    self.current_position = self.current_position + 1
+                    self.current_column = self.current_column + 1
+                elif is_rbrace(input_char):
+                    brace_depth = brace_depth - 1
+                    if brace_depth == 0:
+                        found_expr_end = true
+                    else:
+                        self.current_position = self.current_position + 1
+                        self.current_column = self.current_column + 1
+                else:
+                    self.current_position = self.current_position + 1
+                    self.current_column = self.current_column + 1
+
+            # the raw text, escapes and all: the parser undoes them, because
+            # it is the only place that can walk a token's offset in the
+            # unescaped fragment back to the source character it came from
+            expr_text := self.source.substring(expression_start, self.current_position)
+            if expr_text.len() > 0:
+                self.queue_interpolation_token("interpolation_expr", expr_text, expression_line, expression_column, expression_start, expr_text.len())
+
+            if self.current_position >= self.source.len():
+                return
+
+            # skip the }
+            self.current_position = self.current_position + 1
+            self.current_column = self.current_column + 1
+
+            # scan the string content after the }
+            middle_start := self.current_position
+            middle_line := self.current_line
+            middle_column := self.current_column + 1
+            mut found_middle_end := false
+            while self.current_position < self.source.len():
+                if found_middle_end:
+                    break
+                scan_char := self.source_char(self.current_position)
+                if is_backslash(scan_char):
+                    if self.current_position + 1 >= self.source.len():
+                        return
+                    self.current_position = self.current_position + 2
+                    self.current_column = self.current_column + 2
+                elif is_lbrace(scan_char):
+                    if self.current_position + 1 < self.source.len() and is_lbrace(self.source_char(self.current_position + 1)):
+                        # `{{` is an escaped literal brace inside the trailing segment
+                        self.current_position = self.current_position + 2
+                        self.current_column = self.current_column + 2
+                    else:
+                        found_middle_end = true
+                elif is_quote(scan_char):
+                    found_middle_end = true
+                elif is_newline_char(scan_char):
+                    found_middle_end = true
+                else:
+                    self.current_position = self.current_position + 1
+                    self.current_column = self.current_column + 1
+
+            if self.current_position >= self.source.len():
+                return
+
+            if is_quote(self.source_char(self.current_position)):
+                end_text := self.source.substring(middle_start, self.current_position)
+                self.current_position = self.current_position + 1
+                self.current_column = self.current_column + 1
+                self.queue_interpolation_token("string_end", end_text, middle_line, middle_column, middle_start, end_text.len())
+                return
+
+            if is_newline_char(self.source_char(self.current_position)):
+                return
+
+            # another {: queue a string_mid and continue
+            mid_text := self.source.substring(middle_start, self.current_position)
+            self.queue_interpolation_token("string_mid", mid_text, middle_line, middle_column, middle_start, mid_text.len())
+
+    # take one more character when it is `next`, for the two-character
+    # operators. true when it was taken.
+    fn take_if(next: String) -> Bool:
+        if self.current_position < self.source.len() and self.source_char(self.current_position) == next:
+            self.current_position = self.current_position + 1
+            self.current_column = self.current_column + 1
+            return true
+        return false
+
+    fn scan_operator():
+        character := self.advance()
+
+        if character == "+":
+            if self.take_if("="):
+                self.emit("plus_eq", "+=")
+                return
+            self.emit("plus", "+")
+            return
+
+        if character == "-":
+            if self.take_if(">"):
+                self.emit("arrow", "->")
+                return
+            if self.take_if("="):
+                self.emit("minus_eq", "-=")
+                return
+            self.emit("minus", "-")
+            return
+
+        if character == "*":
+            if self.take_if("="):
+                self.emit("star_eq", "*=")
+                return
+            self.emit("star", "*")
+            return
+
+        if character == "/":
+            if self.take_if("="):
+                self.emit("slash_eq", "/=")
+                return
+            self.emit("slash", "/")
+            return
+
+        if character == "%":
+            self.emit("percent", "%")
+            return
+
+        if character == "=":
+            if self.take_if("="):
+                self.emit("eq_eq", "==")
+                return
+            if self.take_if(">"):
+                self.emit("fat_arrow", "=>")
+                return
+            self.emit("eq", "=")
+            return
+
+        if character == "!":
+            if self.take_if("="):
+                self.emit("bang_eq", "!=")
+                return
+            self.emit("bang", "!")
+            return
+
+        if character == "<":
+            if self.take_if("="):
+                self.emit("less_eq", "<=")
+                return
+            self.emit("less", "<")
+            return
+
+        if character == ">":
+            if self.take_if("="):
+                self.emit("greater_eq", ">=")
+                return
+            self.emit("greater", ">")
+            return
+
+        if character == ":":
+            if self.take_if("="):
+                self.emit("colon_eq", ":=")
+                return
+            self.emit("colon", ":")
+            return
+
+        if character == "?":
+            self.emit("question", "?")
+            return
+
+        if character == ".":
+            if self.take_if("."):
+                if self.take_if("="):
+                    self.emit("dotdoteq", "..=")
+                    return
+                self.emit("dotdot", "..")
+                return
+            self.emit("dot", ".")
+            return
+
+        if character == ",":
+            self.emit("comma", ",")
+            return
+
+        if character == "(":
+            self.group_depth = self.group_depth + 1
+            self.emit("lparen", "(")
+            return
+
+        if character == ")":
+            if self.group_depth > 0:
+                self.group_depth = self.group_depth - 1
+            self.emit("rparen", ")")
+            return
+
+        if character == "[":
+            self.group_depth = self.group_depth + 1
+            self.emit("lbracket", "[")
+            return
+
+        if character == "]":
+            if self.group_depth > 0:
+                self.group_depth = self.group_depth - 1
+            self.emit("rbracket", "]")
+            return
+
+        if is_lbrace(character):
+            self.group_depth = self.group_depth + 1
+            self.emit("lbrace", LBRACE)
+            return
+
+        if is_rbrace(character):
+            if self.group_depth > 0:
+                self.group_depth = self.group_depth - 1
+            self.emit("rbrace", RBRACE)
+            return
+
+        if character == "|":
+            self.emit("pipe", "|")
+            return
+
+        self.emit("err", character)
+
+# ---------------------------------------------------------------
+# string interpolation
+# ---------------------------------------------------------------
+
+# what interp_escape_kind says about one character of an interpolation
+pub INTERP_PLAIN := 0
+pub INTERP_ESCAPE_COLLAPSED := 1
+pub INTERP_ESCAPE_KEPT := 2
+
+## the raw text between {} keeps the backslash-escapes it needed to sit
+## inside the surrounding string literal: `\"` for a string argument's
+## quotes and `\\` for a literal backslash. undo those so the expression
+## re-lexes as real code. without this, `f(\"x\", 1)` re-lexes as a
+## single string argument and the call looks like it has one argument.
+##
+## a string argument may also be written with bare quotes, `{m["key"]}`.
+## inside one of those the escapes belong to the nested literal and stay as
+## written: `{s.index_of("\"")}` searches for a quote. collapsing them
+## there closed the literal early and left an empty string.
+##
+## interp_raw_offsets maps each character of the result back to `text`.
+pub fn unescape_interp_expr(text: String) -> String:
+    # copy the runs between collapsed escapes and join once at the end, so
+    # the work stays linear in the text
+    mut parts: List[String] := []
+    mut copied := 0
+    mut i := 0
+    mut in_literal := false
+    while i < text.len():
+        kind := interp_escape_kind(text, i, in_literal)
+        if kind == INTERP_ESCAPE_COLLAPSED:
+            # drop the backslash, keep the character it escapes
+            parts.push(text.substring(copied, i))
+            copied = i + 1
+            i = i + 2
+        elif kind == INTERP_ESCAPE_KEPT:
+            i = i + 2
+        else:
+            if ord(text[i]) == 34:
+                in_literal = not in_literal
+            i = i + 1
+    if parts.len() == 0:
+        return text
+    parts.push(text.substring(copied, text.len()))
+    return parts.join("")
+
+## what the character at `i` of an interpolation's raw text is to the
+## unescaper: a plain character, a `\"` or `\\` that collapses to its second
+## character, or an escape inside a bare-quoted literal that is kept whole.
+## `in_literal` is true between a bare quote and the one that closes it; the
+## caller flips it on every plain quote.
+pub fn interp_escape_kind(text: String, i: Int, in_literal: Bool) -> Int:
+    if ord(text[i]) != 92 or i + 1 >= text.len():
+        return INTERP_PLAIN
+    if in_literal:
+        return INTERP_ESCAPE_KEPT
+    nxt := ord(text[i + 1])
+    if nxt == 34 or nxt == 92:
+        return INTERP_ESCAPE_COLLAPSED
+    return INTERP_PLAIN
+
+## where each character of `unescape_interp_expr(raw)` came from in `raw`:
+## element `k` is the byte offset in `raw` of the result's byte `k`, and one
+## more element at the end holds `raw.len()`. unescaping collapses `\"` and
+## `\\` to one character each outside a bare-quoted literal, so every offset
+## past one of those is short by one in the result; this walks the raw text
+## the way the unescaper does and gives the source offset back. the walk is
+## one pass, so mapping every token of a fragment stays linear.
+pub fn interp_raw_offsets(raw: String) -> List[Int]:
+    mut offsets: List[Int] := []
+    mut i := 0
+    mut in_literal := false
+    while i < raw.len():
+        kind := interp_escape_kind(raw, i, in_literal)
+        if kind == INTERP_ESCAPE_COLLAPSED:
+            offsets.push(i)
+            i = i + 2
+        elif kind == INTERP_ESCAPE_KEPT:
+            offsets.push(i)
+            offsets.push(i + 1)
+            i = i + 2
+        else:
+            if ord(raw[i]) == 34:
+                in_literal = not in_literal
+            offsets.push(i)
+            i = i + 1
+    offsets.push(raw.len())
+    return offsets
+
+## split an interpolation's text "expr:spec" at a top-level colon when the
+## suffix reads as a format spec: optional alignment (< > ^), optional zero
+## flag, width digits, optional .precision. colons inside strings or brackets
+## never split, and a suffix that isn't a spec leaves the text untouched: the
+## result is then the whole text and "". the spec comes back without its
+## colon.
+pub fn split_format_spec(text: String) -> (String, String):
+    mut depth := 0
+    mut in_str := false
+    mut i := 0
+    mut colon := 0 - 1
+    while i < text.len():
+        c := text[i]
+        if in_str:
+            if c == chr(34):
+                in_str = false
+        elif c == chr(34):
+            in_str = true
+        elif c == "(" or c == "[":
+            depth = depth + 1
+        elif c == ")" or c == "]":
+            depth = depth - 1
+        elif c == ":" and depth == 0:
+            colon = i
+            i = text.len()
+        i = i + 1
+    if colon <= 0:
+        return (text, "")
+    spec := text.substring(colon + 1, text.len())
+    if is_format_spec(spec):
+        return (text.substring(0, colon), spec)
+    return (text, "")
+
+fn is_format_spec(spec: String) -> Bool:
+    if spec.len() == 0:
+        return false
+    mut i := 0
+    c0 := spec[0]
+    if c0 == "<" or c0 == ">" or c0 == "^":
+        i = 1
+    mut digits := 0
+    mut dot := false
+    mut frac_digits := 0
+    while i < spec.len():
+        c := spec[i]
+        if c == ".":
+            if dot:
+                return false
+            dot = true
+        elif c >= "0" and c <= "9":
+            if dot:
+                frac_digits = frac_digits + 1
+            else:
+                digits = digits + 1
+        else:
+            return false
+        i = i + 1
+    if dot and frac_digits == 0:
+        return false
+    return digits > 0 or frac_digits > 0
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+# "kind value" for each token, joined with commas
+fn kinds_and_values(tokens: List[Token]) -> String:
+    mut parts: List[String] := []
+    for tok in tokens:
+        parts.push(tok.kind + " " + tok.value)
+    return parts.join(",")
+
+fn joined(values: List[Int]) -> String:
+    mut parts: List[String] := []
+    for v in values:
+        parts.push(v.to_string())
+    return parts.join(",")
+
+# the tokens of `src` as kind_and_values() renders them, lexed `rounds` times
+fn lex_rounds(src: String, rounds: Int) -> String:
+    mut last := ""
+    mut r := 0
+    while r < rounds:
+        last = kinds_and_values(lex(src))
+        r = r + 1
+    return last
+
+test "lex gives each token its kind, value and span":
+    toks := lex("x := 1\n")
+    assert_eq(kinds_and_values(toks), "identifier x,colon_eq :=,int_lit 1,newline ,eof ")
+    assert_eq(toks[1].line, 1)
+    assert_eq(toks[1].column, 3)
+    assert_eq(toks[1].offset, 2)
+    assert_eq(toks[1].len, 2)
+    assert_eq(toks[4].line, 2)
+    assert_eq(toks[4].len, 0)
+
+test "indentation becomes indent and dedent tokens":
+    assert_eq(kinds_and_values(lex("if a:\n    b\nc\n")), "kw_if if,identifier a,colon :,newline ,indent ,identifier b,newline ,dedent ,identifier c,newline ,eof ")
+    # inside brackets a line break is not layout
+    assert_eq(kinds_and_values(lex("f(a,\n    b)\n")), "identifier f,lparen (,identifier a,comma ,,identifier b,rparen ),newline ,eof ")
+
+test "lex_with_comments keeps a comment that is alone on its line":
+    src := "x := 1\n    # alone\ny := 2 # after\n"
+    assert_eq(kinds_and_values(lex(src)), "identifier x,colon_eq :=,int_lit 1,newline ,identifier y,colon_eq :=,int_lit 2,comment # after,newline ,eof ")
+    with := lex_with_comments(src)
+    assert_eq(kinds_and_values(with), "identifier x,colon_eq :=,int_lit 1,newline ,comment # alone,identifier y,colon_eq :=,int_lit 2,comment # after,newline ,eof ")
+    assert_eq(with[4].offset, 11)
+    assert_eq(with[4].len, 7)
+    assert_eq(with[4].line, 2)
+    assert_eq(with[4].column, 5)
+
+test "an interpolated string comes back as a start and its pieces":
+    toks := lex("\"a {{b}} c\"")
+    assert_eq(kinds_and_values(toks), "string_start \"a ,interpolation_expr b,string_end  c,eof ")
+    assert_eq(toks[0].len, 9)
+    assert_eq(toks[1].offset, 4)
+    assert_eq(toks[2].offset, 6)
+    assert_eq(kinds_and_values(lex("\"{{{{x}}}}\"")), "string_lit \"{{{{x}}}}\",eof ")
+
+test "numbers drop their separators and a tuple index stays whole":
+    assert_eq(kinds_and_values(lex("1_000 0x_ff 2.5e-3 t.0.1")), "int_lit 1000,int_lit 0xff,float_lit 2.5e-3,identifier t,dot .,int_lit 0,dot .,int_lit 1,eof ")
+
+test "bad input becomes err tokens and lexing carries on":
+    assert_eq(kinds_and_values(lex("a $ b")), "identifier a,err $,identifier b,eof ")
+    assert_eq(kinds_and_values(lex("\"open\nx")), "err newline in string literal,newline ,identifier x,eof ")
+    assert_eq(kinds_and_values(lex("0x")), "err the integer literal '0x' has no digits after its prefix,eof ")
+    toks := lex("é")
+    assert_eq(toks.len(), 3)
+    assert_eq(toks[0].kind, "err")
+    assert_eq(toks[1].kind, "err")
+    assert_eq(toks[1].offset, 1)
+
+test "unescaping an interpolation and mapping it back":
+    # the expression text f(\"x\") unescapes to f("x")
+    raw := "f(\\\"x\\\")"
+    assert_eq(unescape_interp_expr(raw), "f(\"x\")")
+    assert_eq(joined(interp_raw_offsets(raw)), "0,1,2,4,5,7,8")
+    # inside a bare-quoted literal the escapes stay
+    bare := "s.find(\"\\\"\")"
+    assert_eq(unescape_interp_expr(bare), bare)
+    assert_eq(interp_raw_offsets(bare).len(), bare.len() + 1)
+    assert_eq(unescape_interp_expr("plain"), "plain")
+
+test "split_format_spec splits only at a format spec":
+    assert_eq(split_format_spec("x:>8").0, "x")
+    assert_eq(split_format_spec("x:>8").1, ">8")
+    assert_eq(split_format_spec("v:.2").1, ".2")
+    assert_eq(split_format_spec("x:y").0, "x:y")
+    assert_eq(split_format_spec("x:y").1, "")
+    assert_eq(split_format_spec("f(a:1)").1, "")
+    assert_eq(split_format_spec("m[\"a:1\"]").1, "")
+
+test "tasks lex at the same time without sharing state":
+    a := "fn f(x: Int) -> Int:\n    return x + 1\n"
+    b := "s := \"n = {{n}}\" # note\n"
+    want_a := lex_rounds(a, 1)
+    want_b := lex_rounds(b, 1)
+    ta := spawn lex_rounds(a, 200)
+    tb := spawn lex_rounds(b, 200)
+    assert_eq(await ta, want_a)
+    assert_eq(await tb, want_b)

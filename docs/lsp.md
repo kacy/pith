@@ -44,10 +44,13 @@ what `pith check` reports.
   is re-lexed alone, so highlighting keeps working mid-edit when the
   text does not parse. the legend is `keyword`, `string`, `number`,
   `comment`, `function`, `type`, `variable`, `operator`, with no
-  modifiers. identifiers classify by shape: an uppercase first letter
-  is a type, a directly following `(` makes a function, anything else
-  is a variable. an interpolated string highlights as one string
-  token spanning the whole literal.
+  modifiers. the classification is `std.pith.highlight`'s, the same one
+  html highlighting uses: an uppercase first letter is a type, a name
+  that is declared after `fn` or directly followed by `(` is a
+  function, anything else is a variable, and `locked`, `guard`,
+  `holding`, `where` and `frozen` are keywords where a name follows
+  them. inside an interpolated string the literal pieces are strings
+  and the expressions highlight as code.
 - **signature help** — triggered on `(` and `,`. the innermost
   unclosed `(` on the cursor's line names the callee, top-level
   commas before the cursor pick the active parameter, and the label

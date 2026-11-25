@@ -5,7 +5,7 @@
 # a small command-line wrapper around them.
 
 from lexer import int_literal_magnitude, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot
-from std.pith.lexer import Token, unescape_interp_expr, interp_raw_offsets, split_format_spec
+from std.pith.lexer import Token, lex_interpolation, unescape_interp_expr, interp_raw_offsets, split_format_spec
 from ast import add_node, add_node_with_type_args, add_leaf, get_node, node_count, set_node_value, set_node_name_position, node_kind, from_import_alias_receiver
 from errors import Diagnostic
 
@@ -187,6 +187,19 @@ fn report_lexer_error_tokens():
         else:
             prev_was_err = false
         i = i + 1
+
+# the stream without its "bad_escape" tokens, each reported as E243 on the
+# way. the lexer adds one after a string whose literal text holds an escape the
+# language does not define; the string itself lexed whole, so the token holds
+# nothing to parse and would only derail the expression around it.
+fn report_bad_escapes(token_list: List[Token]) -> List[Token]:
+    mut kept: List[Token] := []
+    for tok in token_list:
+        if tok.kind == "bad_escape":
+            parser_report_error_at(tok.line, tok.column, "E243", tok.value, "")
+        else:
+            kept.push(tok)
+    return kept
 
 # everything the most recent parse complained about, in the order it was
 # found: lexer error tokens first (reported up front as E243), then the
@@ -1437,7 +1450,7 @@ fn parse_interp_expr(text: String, base_line: Int, base_col: Int) -> Int:
     saved_depth := recursion_depth
 
     # sub-lex and sub-parse the interpolation expression
-    raw_tokens := lex_all(unescape_interp_expr(text))
+    raw_tokens := lex_interpolation(unescape_interp_expr(text), false)
     raw_offsets := interp_raw_offsets(text)
     mut sub_tokens: List[Token] := []
     for tok in raw_tokens:
@@ -1449,12 +1462,28 @@ fn parse_interp_expr(text: String, base_line: Int, base_col: Int) -> Int:
         else:
             tok_col_out = base_col + raw_offsets[tok.offset]
         sub_tokens.push(Token(tok.kind, tok.value, tok_line_out, tok_col_out, tok.offset, tok.len))
-    load_tokens(sub_tokens)
+    # the fragment's own lexer errors, such as an unknown escape in a string
+    # written inside it: report_lexer_error_tokens only sees the outer stream
+    mut prev_was_err := false
+    for tok in sub_tokens:
+        if tok.kind == "err":
+            if not prev_was_err:
+                parser_report_error_at(tok.line, tok.column, "E243", lexer_error_message(tok.value), "")
+            prev_was_err = true
+        else:
+            prev_was_err = false
+    load_tokens(report_bad_escapes(sub_tokens))
     current_token_position = 0
     # recursion_depth carries on from the enclosing expression, so a string
     # nested in an interpolation nested in a string counts toward max_depth
 
     result := parse_expression()
+    # the braces hold one expression. anything after it used to be dropped
+    # without a word, so `{a b}` printed a.
+    while check("err"):
+        advance_token()
+    if not check("eof"):
+        parser_report_error_at(tok_line(current_token_position), tok_col(current_token_position), "E242", "unexpected token in interpolation: " + _cur_tok_kind(), "")
 
     # restore parser state
     load_token_snapshot(saved_kinds, saved_values, saved_lines, saved_cols, saved_offsets, saved_lens)
@@ -1975,7 +2004,6 @@ pub fn parse(token_list: List[Token]) -> Int:
 # are recovered from, not raised: check parser_has_errors() before
 # trusting the tree.
 pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
-    load_tokens(token_list)
     current_token_position = 0
     recursion_depth = 0
     nesting_overflow = false
@@ -1986,6 +2014,7 @@ pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
     parser_diag_list = []
     import_aliases = {}
     from_import_renames = {}
+    load_tokens(report_bad_escapes(token_list))
 
     # a lexer error token is a hard lexical error. surface every one up
     # front: statement recovery skips stray tokens to the next newline,

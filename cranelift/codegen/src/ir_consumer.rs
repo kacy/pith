@@ -2082,8 +2082,9 @@ fn emit_checked_int_div_or_mod(
 
 /// The text of a `string ID "..."` line: what lies between its first quote
 /// and the closing one, with the IR's escapes decoded. `{{` and `}}` stand
-/// for a literal brace; `\n`, `\t`, `\r`, `\0`, `\\` and `\"` for their
-/// characters; any other backslash is kept as written.
+/// for a literal brace, and so do `\{` and `\}`; `\n`, `\t`, `\r`, `\0`, `\\`
+/// and `\"` for their characters. the lexer reports any other escape, so a
+/// backslash left over here is kept as written.
 fn decode_string_literal(line: &str) -> String {
     let rest = &line[line.find('"').unwrap_or(0)..];
     // strip exactly one quote at each end; trim_matches would also eat the
@@ -2111,6 +2112,8 @@ fn decode_string_literal(line: &str) -> String {
             (b'\\', Some(b'"')) => Some(b'"'),
             (b'\\', Some(b'r')) => Some(b'\r'),
             (b'\\', Some(b'0')) => Some(b'\0'),
+            (b'\\', Some(b'{')) => Some(b'{'),
+            (b'\\', Some(b'}')) => Some(b'}'),
             _ => None,
         };
         match decoded {
@@ -5340,7 +5343,9 @@ mod tests {
         );
         // a trailing escaped quote keeps its quote
         assert_eq!(decode_string_literal(r#"string 1 "say \"""#), "say \"");
-        // an unknown escape and a lone brace stay as written
+        // an escaped brace is the brace; an unknown escape (which the lexer
+        // reports before any ir exists) and a lone brace stay as written
+        assert_eq!(decode_string_literal(r#"string 1 "\{x\}""#), "{x}");
         assert_eq!(decode_string_literal(r#"string 1 "\q { }""#), "\\q { }");
         assert_eq!(decode_string_literal("string 1 \"café\""), "café");
     }

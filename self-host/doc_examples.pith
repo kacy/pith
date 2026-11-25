@@ -1,0 +1,565 @@
+# doc_examples.pith - type checks the pith code blocks of markdown files
+#
+# `pith doc --check file.md` runs every fenced code block whose info string
+# starts with `pith` through the checker, so the examples in the docs keep
+# compiling as the language and std change. the blocks are found with
+# std.markdown's event stream, so a fence counts exactly when commonmark says
+# it is one: a ```pith shown inside another code block is text, and a fence
+# inside a list item or a block quote is found like any other.
+#
+# most examples are fragments, so a block is read the way a person reads it:
+#
+#   - a block with a top-level `fn main` is a program, checked as it stands.
+#     in any other block the top-level declarations (`import`, `from`, `fn`,
+#     `struct`, `enum`, `interface`, `impl`, `type`, `test`, `guard`, `pub`,
+#     and constants named in capitals) stay at the top level, and the other
+#     lines become the body of a function that may fail, so `x := f()!` and
+#     a `for` loop check as statements.
+#   - a name the block never defines is taken to come from the code around
+#     it: `source`, `req`, a helper such as `handle(x)`, a type such as
+#     `User`, or an assignment to a variable bound elsewhere. the error the
+#     checker gives for it is not reported, and neither is the error type of
+#     a `!` or the type of a `return` in a fragment's statements.
+#   - a name the block never defines that is the last part of a std module's
+#     name, and that the block uses with a member the module has, is
+#     imported as that module, so `markdown.to_html(s)` is checked against
+#     std.markdown with no import line in the block.
+#   - an import of a module that is not in std and cannot be found, such as a
+#     generated one, is left out, and the names it would bind are free.
+#   - a line whose code starts with `...` stands for code left out, and a
+#     function signature with no body under it, as in a list of an api, gets
+#     an empty one.
+#
+# everything else the checker reports is an error at the markdown file's
+# line and column. a block whose info string holds the word `no-check`, as
+# in ```pith no-check, is skipped: that is for code that shows an error on
+# purpose or a syntax that does not exist yet. the first word still names
+# the language, so the block is highlighted as pith wherever it is rendered.
+
+import std.markdown as markdown
+import std.strings as strings
+from std.markdown import Event, Tag
+from check_pipeline import run_check_pipeline
+from driver import set_source_overlay, clear_source_overlay, dr_find_stdlib_root, get_directory
+from errors import Diagnostic
+
+# the words that start a top-level declaration, which a fragment keeps at
+# the top level.
+DECLARATION_WORDS := ",import,from,fn,pub,struct,enum,interface,impl,type,test,extern,guard,"
+
+# how the checker starts the report of a name nothing defines.
+UNDEFINED := "undefined variable: "
+
+# the function a fragment's statements are checked inside.
+WRAPPER := "fn checked_doc_example() -> Int!:"
+
+## one pith code block of a markdown file: the line its code starts on,
+## its info string and its code.
+pub struct Example:
+    pub line: Int
+    pub info: String
+    pub code: String
+
+## the fenced code blocks of `source` whose language is pith, in order.
+pub fn pith_examples(source: String) -> List[Example]:
+    mut out: List[Example] := []
+    stream := markdown.events(source, markdown.options())
+    mut inside := false
+    mut start := 0
+    mut code := ""
+    for event in stream:
+        match event:
+            Event.Start(tag) =>
+                if let Tag.CodeBlock(info) = tag:
+                    inside = true
+                    # a fenced block starts on its opening fence; the code
+                    # is on the lines after it.
+                    start = stream.line() + 1
+                    code = ""
+            Event.Text(content) =>
+                if inside:
+                    code = content
+            Event.End(tag) =>
+                if let Tag.CodeBlock(info) = tag:
+                    inside = false
+                    if info_word(info, 0) == "pith":
+                        out.push(Example(line: start, info: info, code: code))
+            _ =>
+                continue
+    return out
+
+# word `n` of an info string, counted from 0, or "" past the last.
+fn info_word(info: String, n: Int) -> String:
+    # split drops the empty strings between repeated spaces
+    words := info.replace(chr(9), " ").split(" ")
+    if n < words.len():
+        return words[n]
+    return ""
+
+# whether the info string asks for the block to be skipped.
+fn skipped(info: String) -> Bool:
+    mut n := 1
+    while info_word(info, n) != "":
+        if info_word(info, n) == "no-check":
+            return true
+        n += 1
+    return false
+
+# the source the checker sees for one block, and for each of its lines the
+# block line it came from (-1 for a line added here) and how many columns
+# to add to a checker column to get the block's column. `body` is the index
+# of the first line inside the wrapper function, or -1 without one.
+struct Prepared:
+    lines: List[String]
+    origins: List[Int]
+    shifts: List[Int]
+    body: Int
+
+impl Prepared:
+    fn add(line: String, origin: Int, shift: Int):
+        self.lines.push(line)
+        self.origins.push(origin)
+        self.shifts.push(shift)
+
+    # put `lines` before the rest, as lines added here.
+    fn prepend(lines: List[String]):
+        for k in 0..lines.len():
+            self.lines.insert(0, lines[lines.len() - 1 - k])
+            self.origins.insert(0, -1)
+            self.shifts.insert(0, 0)
+        if self.body >= 0:
+            self.body += lines.len()
+
+    fn source() -> String:
+        return self.lines.join("\n") + "\n"
+
+    # blank out the imports of modules the checker cannot find and that are
+    # not in std, which are a module of the example's own, such as a
+    # generated one. the names they bound are then free. true when it
+    # dropped one.
+    fn drop_missing_modules(diags: List[Diagnostic]) -> Bool:
+        mut dropped := false
+        for d in diags:
+            if d.code != "E247" or not d.message.starts_with("cannot find module '"):
+                continue
+            module_name := d.message.substring(20, d.message.len() - 1)
+            if module_name.starts_with("std."):
+                continue
+            for line, i in self.lines:
+                if line.starts_with("import " + module_name + " ") or line == "import " + module_name or line.starts_with("from " + module_name + " "):
+                    self.lines[i] = ""
+                    dropped = true
+        return dropped
+
+    # the name at the checker's line and column, both counted from 1.
+    fn name_at(line: Int, col: Int) -> String:
+        if line < 1 or line > self.lines.len() or col < 1 or col > self.lines[line - 1].len():
+            return ""
+        text := self.lines[line - 1]
+        return text.substring(col - 1, name_end(text, col - 1))
+
+    # whether the checker's line `line`, counted from 1, is a statement the
+    # wrapper holds.
+    fn in_body(line: Int) -> Bool:
+        return self.body >= 0 and line - 1 >= self.body
+
+    # whether an import line binds `alias`.
+    fn imports(alias: String) -> Bool:
+        for line in self.lines:
+            if line.starts_with("import ") and (line.ends_with(" as " + alias) or line.ends_with("." + alias) or line == "import " + alias):
+                return true
+        return false
+
+fn indentation(line: String) -> Int:
+    mut i := 0
+    while i < line.len() and line[i] == " ":
+        i += 1
+    return i
+
+fn is_blank(line: String) -> Bool:
+    return line.trim() == ""
+
+# whether a line at the left margin goes on with the statement above it.
+fn continues(line: String) -> Bool:
+    return line.starts_with("else") or line.starts_with("elif") or line.starts_with(")") or line.starts_with("]") or line.starts_with("}")
+
+# whether a line at the left margin starts a declaration.
+fn declares(line: String) -> Bool:
+    word := line.substring(0, name_end(line, 0))
+    if DECLARATION_WORDS.contains("," + word + ","):
+        return true
+    # a constant: a name in capitals bound at the top level
+    return word.len() > 0 and word == word.to_upper() and ord(word[0]) >= 65 and ord(word[0]) <= 90 and line.substring(word.len(), line.len()).trim().starts_with(":")
+
+fn is_name_byte(c: Int) -> Bool:
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 95
+
+# where the name starting at `at` ends.
+fn name_end(code: String, at: Int) -> Int:
+    mut end := at
+    while end < code.len() and is_name_byte(ord(code[end])):
+        end += 1
+    return end
+
+# a line's code without a trailing comment.
+fn code_of(line: String) -> String:
+    comment := line.index_of("#")
+    if comment < 0:
+        return line
+    return line.substring(0, comment)
+
+# a line whose code starts with `...`, such as `...` or `... work ...`,
+# stands for code left out. it becomes a call to `exit`, which the checker
+# knows does not return, so a function whose body is `...` needs no return
+# value.
+fn fill_placeholder(line: String) -> String:
+    if not code_of(line).trim().starts_with("..."):
+        return line
+    return " ".repeat(indentation(line)) + "exit(0)"
+
+# whether line `i` at the margin is a function's signature with no body
+# under it, as in a list of an api's functions.
+fn bare_signature(lines: List[String], i: Int) -> Bool:
+    line := lines[i]
+    if not line.starts_with("fn ") and not line.starts_with("pub fn "):
+        return false
+    mut j := i + 1
+    while j < lines.len() and is_blank(lines[j]):
+        j += 1
+    return j == lines.len() or indentation(lines[j]) == 0
+
+# a block as the checker sees it: a program as it stands, a fragment with
+# its statements moved into a function. either way the block is moved to
+# the left margin, `...` lines are filled in, and a signature without a
+# body gets one.
+fn prepare(code: String) -> Prepared:
+    mut lines := strings.split_keep_empty(code, "\n")
+    if lines.len() > 0 and lines[lines.len() - 1] == "":
+        lines.remove(lines.len() - 1)
+    mut margin := 1000000
+    for line in lines:
+        if not is_blank(line):
+            margin = min(margin, indentation(line))
+    mut moved: List[String] := []
+    for line in lines:
+        if is_blank(line):
+            moved.push("")
+        else:
+            moved.push(fill_placeholder(line.substring(margin, line.len())))
+    mut program := false
+    out := Prepared(lines: [], origins: [], shifts: [], body: -1)
+    for line in moved:
+        if line.starts_with("fn main(") or line.starts_with("pub fn main("):
+            program = true
+    # each line at the margin starts a chunk, a declaration or a run of
+    # statements, and the lines below it belong to it. a program's lines
+    # all stay where they are.
+    mut body: List[String] := []
+    mut body_origins: List[Int] := []
+    mut in_declaration := program
+    for line, i in moved:
+        if not program and not is_blank(line) and indentation(line) == 0 and not line.starts_with("#") and not continues(line):
+            in_declaration = declares(line)
+        if not in_declaration:
+            body.push(line)
+            body_origins.push(i)
+        elif bare_signature(moved, i):
+            signature := code_of(line).trim()
+            if signature.ends_with(":"):
+                out.add(signature, i, margin)
+            else:
+                out.add(signature + ":", i, margin)
+            out.add("    exit(0)", -1, 0)
+        else:
+            out.add(line, i, margin)
+    if body.len() > 0:
+        out.add(WRAPPER, -1, 0)
+        out.body = out.lines.len()
+        for line, k in body:
+            out.add("    " + line, body_origins[k], margin - 4)
+        out.add("    return 0", -1, 0)
+    return out
+## what checking one markdown file found: how many pith blocks it checked,
+## skipped and found errors in, and the errors, each rendered as
+## `file:line:col: error[code]: message`.
+pub struct DocReport:
+    pub checked: Int
+    pub skipped: Int
+    pub failed: Int
+    pub errors: List[String]
+
+# what a file's blocks are checked against: the file name the checker sees
+# them under, the toolchain root whose std they import, and its modules by
+# the last part of their names.
+struct Context:
+    path: String
+    entry: String
+    root: String
+    modules: Map[String, String]
+
+## type check every pith block of the markdown file at `path`, whose text is
+## `source`.
+pub fn check_examples(path: String, source: String) -> DocReport:
+    report := DocReport(checked: 0, skipped: 0, failed: 0, errors: [])
+    entry := get_directory(path) + "/checked_doc_example.pith"
+    root := dr_find_stdlib_root(entry)
+    context := Context(path: path, entry: entry, root: root, modules: std_modules(root))
+    for example in pith_examples(source):
+        if skipped(example.info):
+            report.skipped += 1
+            continue
+        report.checked += 1
+        errors := check_one(context, example)
+        if errors.len() > 0:
+            report.failed += 1
+            for line in errors:
+                report.errors.push(line)
+    clear_source_overlay(entry)
+    return report
+
+# the errors in one block, rendered against the markdown file.
+fn check_one(context: Context, example: Example) -> List[String]:
+    prepared := prepare(example.code)
+    mut diags := diagnostics_of(context.entry, prepared.source())
+    if prepared.drop_missing_modules(diags):
+        diags = diagnostics_of(context.entry, prepared.source())
+    # an import can bring errors into view that hid behind a value of
+    # unknown type, and those can call for another import
+    mut rounds := 0
+    while rounds < 3:
+        imports := missing_imports(context, prepared, example.code, diags)
+        if imports.len() == 0:
+            break
+        prepared.prepend(imports)
+        diags = diagnostics_of(context.entry, prepared.source())
+        rounds += 1
+    mut free := false
+    for d in diags:
+        if d.message.starts_with(UNDEFINED):
+            free = true
+    mut out: List[String] := []
+    for d in diags:
+        if d.severity == "error" and not assumed(d, prepared, example.code, free):
+            out.push(render(context, example, prepared, d))
+    return out
+
+# whether an error only says that the block is missing the code around it:
+# a name it never defines, a type it never declares or the error type of
+# the function a fragment's statements stand in. `free` is whether the
+# block uses a name it never defines.
+fn assumed(d: Diagnostic, prepared: Prepared, code: String, free: Bool) -> Bool:
+    message := d.message
+    if message.starts_with(UNDEFINED) or message.ends_with(" belongs to another module and is not imported here"):
+        return true
+    if message.starts_with("unknown type: "):
+        name := message.substring(14, message.len())
+        dot := name.index_of(".")
+        # a type of a module the block names but never imports
+        return dot < 0 or not prepared.imports(name.substring(0, dot))
+    # an assignment to a variable the block never binds, which the checker
+    # reports this way rather than as undefined
+    if message.starts_with("cannot assign to immutable variable '"):
+        return not binds(code, message.substring(37, message.len() - 1))
+    # a generic call on a value of unknown type
+    if d.code == "E222" and free:
+        return true
+    if prepared.in_body(d.line):
+        return message.starts_with("try (!) error type mismatch") or message.starts_with("return type mismatch")
+    return false
+
+# whether `code` binds `name` with `:=`, with or without a type.
+fn binds(code: String, name: String) -> Bool:
+    for line in code.split("\n"):
+        at := name_at_start(line.trim(), name)
+        if at >= 0:
+            rest := line.trim().substring(at, line.trim().len()).trim()
+            if rest.starts_with(":=") or (rest.starts_with(":") and rest.contains(":=")):
+                return true
+    return false
+
+# where `line` goes on after a leading `name` or `mut name`, or -1 when it
+# does not start with one.
+fn name_at_start(line: String, name: String) -> Int:
+    mut start := 0
+    if line.starts_with("mut "):
+        start = 4
+    end := name_end(line, start)
+    if line.substring(start, end) == name:
+        return end
+    return -1
+# the diagnostics of `source` checked as the file `entry`.
+fn diagnostics_of(entry: String, source: String) -> List[Diagnostic]:
+    set_source_overlay(entry, source)
+    outcome := run_check_pipeline(entry) catch:
+        return [Diagnostic(severity: "error", code: "E000", message: "the checker could not run", file: entry, line: 0, col: 0, fix: "")]
+    return outcome.diags
+
+# one diagnostic as `file:line:col: error[code]: message`, at the place in
+# the markdown file the block's line came from.
+fn render(context: Context, example: Example, prepared: Prepared, d: Diagnostic) -> String:
+    path := context.path
+    mut line := example.line
+    mut col := d.col
+    if d.file != context.entry and d.file != "":
+        return "{path}:{line}: error[{d.code}]: {d.message} (in {d.file}:{d.line})"
+    index := d.line - 1
+    if index >= 0 and index < prepared.origins.len() and prepared.origins[index] >= 0:
+        line = example.line + prepared.origins[index]
+        col = d.col + prepared.shifts[index]
+    else:
+        col = 0
+    if col < 1:
+        return "{path}:{line}: error[{d.code}]: {d.message}"
+    return "{path}:{line}:{col}: error[{d.code}]: {d.message}"
+
+# the imports a block needs: one for each name it never defines that names
+# a std module and is used as `name.member` with a member the module has.
+# requiring a real member keeps a variable such as `app` or `path` from
+# being taken for std.term.app or std.os.path.
+fn missing_imports(context: Context, prepared: Prepared, code: String, diags: List[Diagnostic]) -> List[String]:
+    mut out: List[String] := []
+    mut seen: Map[String, Bool] := {}
+    for d in diags:
+        mut name := ""
+        if d.message.starts_with(UNDEFINED):
+            name = d.message.substring(UNDEFINED.len(), d.message.len())
+        elif d.message.starts_with("unknown type: ") and d.message.contains("."):
+            name = d.message.substring(14, d.message.index_of("."))
+        elif d.message.starts_with("fn has no method "):
+            # a builtin function such as `time` stands where a module was
+            # meant: the name is the one the diagnostic points at
+            name = prepared.name_at(d.line, d.col)
+        if name == "" or seen.contains_key(name) or not context.modules.contains_key(name) or prepared.imports(name):
+            continue
+        seen[name] = true
+        module_file := context.modules[name]
+        exported := pub_names(context.root + "/" + module_file + ".pith")
+        for member in members_used(code, name):
+            if exported.contains_key(member):
+                out.push("import " + module_file.replace("/", ".") + " as " + name)
+                break
+    return out
+
+# the members `code` uses on `name`: each `x` in `name.x`, where no name
+# byte comes just before `name`.
+fn members_used(code: String, name: String) -> List[String]:
+    mut out: List[String] := []
+    needle := name + "."
+    mut start := 0
+    while start < code.len():
+        found := code.substring(start, code.len()).index_of(needle)
+        if found < 0:
+            break
+        at := start + found
+        after := at + needle.len()
+        if at == 0 or not is_name_byte(ord(code[at - 1])):
+            out.push(code.substring(after, name_end(code, after)))
+        start = after
+    return out
+
+# the names a std module makes public, read off its `pub` lines.
+fn pub_names(file: String) -> Map[String, Bool]:
+    mut names: Map[String, Bool] := {}
+    source := read_file(file) catch:
+        return names
+    for line in source.split("\n"):
+        if not line.starts_with("pub "):
+            continue
+        mut at := 4
+        word := line.substring(at, name_end(line, at))
+        if ",fn,struct,enum,interface,type,mut,".contains("," + word + ","):
+            at = at + word.len() + 1
+        names[line.substring(at, name_end(line, at))] = true
+    return names
+
+# the std modules under `root`, by the last part of their names, as paths
+# under the root without the extension: "std/markdown" for "markdown",
+# "std/web/pages" for "pages". a last part two modules share, such as
+# "tables", names neither.
+fn std_modules(root: String) -> Map[String, String]:
+    mut found: Map[String, String] := {}
+    mut shared: Map[String, Bool] := {}
+    if root == "":
+        return found
+    mut pending := ["std"]
+    while pending.len() > 0:
+        module_dir := pending[pending.len() - 1]
+        pending.remove(pending.len() - 1)
+        for name in list_dir(root + "/" + module_dir):
+            full := root + "/" + module_dir + "/" + name
+            if dir_exists(full):
+                pending.push(module_dir + "/" + name)
+            elif name.ends_with(".pith"):
+                short := name.substring(0, name.len() - 5)
+                if found.contains_key(short):
+                    shared[short] = true
+                found[short] = module_dir + "/" + short
+    for name in shared.keys():
+        found.remove(name)
+    return found
+
+test "pith blocks are found where commonmark finds them":
+    source := "# t\n\n```pith\nx := 1\n```\n\n- item\n\n  ```pith no-check\n  y\n  ```\n\n````md\n```pith\nnot a block\n```\n````\n\n```go\nz\n```\n"
+    found := pith_examples(source)
+    assert_eq(found.len(), 2)
+    assert_eq(found[0].line, 4)
+    assert_eq(found[0].code, "x := 1\n")
+    assert_eq(found[1].line, 10)
+    assert_eq(found[1].code, "y\n")
+    assert(skipped(found[1].info))
+    assert(not skipped(found[0].info))
+
+test "a fragment keeps its declarations and wraps its statements":
+    prepared := prepare("import std.json as json\n\nMAX := 3\n\nx := f()\nif x:\n    g()\nelse:\n    h()\nfn f() -> Bool:\n    return true\n")
+    assert_eq(prepared.body, 7)
+    assert_eq(prepared.source(), "import std.json as json\n\nMAX := 3\n\nfn f() -> Bool:\n    return true\n" + WRAPPER + "\n    x := f()\n    if x:\n        g()\n    else:\n        h()\n    return 0\n")
+    assert_eq(prepared.origins[6], -1)
+    assert_eq(prepared.origins[7], 4)
+    assert_eq(prepared.shifts[7], -4)
+    prepared.prepend(["import std.web as web"])
+    assert_eq(prepared.body, 8)
+    assert(prepared.imports("web"))
+    assert(prepared.imports("json"))
+    assert(not prepared.imports("http"))
+
+test "a program is checked as it stands":
+    prepared := prepare("fn main():\n    print(1)\n    ...\n")
+    assert_eq(prepared.body, -1)
+    assert_eq(prepared.source(), "fn main():\n    print(1)\n    exit(0)\n")
+
+test "an indented fragment is moved to the margin first":
+    prepared := prepare("    a := 1\n    b := a\n")
+    assert_eq(prepared.source(), WRAPPER + "\n    a := 1\n    b := a\n    return 0\n")
+    assert_eq(prepared.shifts[1], 0)
+
+test "a member use is told apart from a longer name":
+    assert_eq(members_used("x := markdown.to_html(s) + markdown.X", "markdown").join(","), "to_html,X")
+    assert_eq(members_used("x := my_markdown.to_html(s)", "markdown").len(), 0)
+    assert_eq(members_used("my_markdown.a + markdown.b", "markdown").join(","), "b")
+    assert_eq(members_used("markdown := 1", "markdown").len(), 0)
+
+test "a line of dots stands for code left out":
+    assert_eq(fill_placeholder("    ...  # the rest"), "    exit(0)")
+    assert_eq(fill_placeholder("x := f(...)"), "x := f(...)")
+
+test "a fragment may assign to a variable it never binds":
+    assert(binds("x := 1\nx = 2", "x"))
+    assert(binds("    mut total: Int := 0", "total"))
+    assert(not binds("total = total + 1", "total"))
+    assert(not binds("totals := 1", "total"))
+
+test "a signature with no body gets one":
+    prepared := prepare("fn next() -> T?\npub fn a(x: Int) -> Int:\nfn b():\n    return\n")
+    assert_eq(prepared.source(), "fn next() -> T?:\n    exit(0)\npub fn a(x: Int) -> Int:\n    exit(0)\nfn b():\n    return\n")
+    assert_eq(prepared.origins[1], -1)
+    assert_eq(prepared.origins[4], 2)
+
+test "an import of a module of the example's own is dropped":
+    prepared := prepare("import catalog_gen as cat\nfrom greeter import greet\nimport std.nope as nope\nx := cat.f()\n")
+    missing := [Diagnostic(severity: "error", code: "E247", message: "cannot find module 'catalog_gen'", file: "", line: 1, col: 1, fix: ""), Diagnostic(severity: "error", code: "E247", message: "cannot find module 'greeter'", file: "", line: 2, col: 1, fix: ""), Diagnostic(severity: "error", code: "E247", message: "cannot find module 'std.nope'", file: "", line: 3, col: 1, fix: "")]
+    assert(prepared.drop_missing_modules(missing))
+    assert_eq(prepared.lines[0], "")
+    assert_eq(prepared.lines[1], "")
+    assert_eq(prepared.lines[2], "import std.nope as nope")
+    assert_eq(prepared.name_at(5, 10), "cat")
+    assert_eq(prepared.name_at(5, 100), "")

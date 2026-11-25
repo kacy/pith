@@ -101,12 +101,12 @@ commit. if any step fails, you want a rollback — but not after a
 successful commit:
 
 ```pith
-fn transfer(db: Db, from: Int, to: Int, cents: Int) -> Int!:
+fn transfer(db: Db, payer: Int, payee: Int, cents: Int) -> Int!:
     tx := db.begin()!
     errdefer tx.rollback()       # only if we leave through an error
 
-    tx.debit(from, cents)!       # any of these can fail and propagate
-    tx.credit(to, cents)!
+    tx.debit(payer, cents)!      # any of these can fail and propagate
+    tx.credit(payee, cents)!
     tx.commit()!
     return cents
 ```

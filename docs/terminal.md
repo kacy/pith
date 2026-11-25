@@ -5,6 +5,13 @@ module (`std.term`) colors and styles text; this page covers the raw layer
 underneath, `std.term.tty`, and the escape parsing and session handling built
 on it. the widget layer above these lives in [docs/tui.md](tui.md).
 
+## colors and NO_COLOR
+
+`term.no_color()` is true when the NO_COLOR environment variable is set to
+anything but the empty string. a program that colors its output by default
+checks it first, as `std.markdown.terminal` does before it writes styles (see
+[docs/markdown.md](markdown.md#in-the-terminal)).
+
 ## what the tty layer is
 
 six runtime calls and nothing else: detect a terminal, enter and leave raw
@@ -98,13 +105,14 @@ sequence until more bytes arrive.
 
 ```pith
 import std.term.input as input
+from std.term.input import Event
 
 p := input.parser()
 for ev in input.feed(p, chunk):
     match ev:
-        input.Event.KeyPress(k) =>
+        Event.KeyPress(k) =>
             handle(input.key_name(k))   # "a", "ctrl+c", "shift+tab", "f5"
-        input.Event.Paste(s) =>
+        Event.Paste(s) =>
             insert(s)
         _ =>
             pass_on(ev)
@@ -138,7 +146,9 @@ mouse and focus reporting opt-in), the hardware cursor hidden, the resize
 signal armed, and two tasks feeding one ordered event stream.
 
 ```pith
+import std.term.input as input
 import std.term.session as session
+from std.term.input import Event
 
 fn main() -> Int!:
     t := session.open()!

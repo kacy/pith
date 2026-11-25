@@ -6,6 +6,7 @@
 #   lib/pith_main, lib/ir_driver  the self-hosted compiler and ir driver
 #   lib/libpith_runtime.a         the runtime every program links against
 #   std/                          the standard library
+#   docs/                         the guides, which `pith doc <topic>` shows
 #
 # the asset name carries no version, so the latest release always serves the
 # same url for a platform; the version is in the top-level directory name.
@@ -34,6 +35,8 @@ mkdir -p "$stage/bin" "$stage/lib"
 cp target/release/pith "$stage/bin/"
 cp target/release/libpith_runtime.a self-host/pith_main self-host/ir_driver "$stage/lib/"
 cp -R std "$stage/std"
+mkdir -p "$stage/docs"
+cp docs/*.md "$stage/docs/"
 cp LICENSE README.md "$stage/"
 
 tar -C dist -czf "dist/$asset.tar.gz" "$(basename "$stage")"

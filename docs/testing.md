@@ -124,10 +124,10 @@ a row carries whatever the body needs, so the input-and-expected table is a
 table of pairs:
 
 ```pith
-    each([
-        case("empty", ("", 0)),
-        case("one character", ("a", 1)),
-        case("several", ("abcd", 4)),
+each([
+    case("empty", ("", 0)),
+    case("one character", ("a", 1)),
+    case("several", ("abcd", 4)),
 ], fn(c: (String, Int)) => c.0.len() == c.1)
 ```
 

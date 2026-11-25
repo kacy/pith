@@ -60,6 +60,35 @@ make bootstrap
 - prefer typed results like `T!E` when callers need to inspect the error payload; keep bare `T!` for simpler string-error paths
 - use `catch`, `unwrap_or(...)`, and `or_else(...)` in examples when they make recovery intent clearer than manual `is_err` branching
 
+## code in the docs
+
+every ```` ```pith ```` block in README.md and docs/*.md is type checked by
+`make doc-examples-check`, which ci runs. `pith doc --check file.md` checks one
+file and reports each error at the markdown file's line and column.
+
+the check reads a block the way a person reads it, so most blocks need no
+markup:
+
+- a block with a top-level `fn main` is a program and is checked as it stands.
+  in any other block the imports, functions, types and constants named in
+  capitals stay at the top level, and the other lines are checked as the body
+  of a function that may fail.
+- a name the block never defines, such as `source`, `req` or `User`, is taken
+  to come from the code around it. so are the error type of a `!` and the type
+  of a `return` in a fragment's statements.
+- a name used as `name.member`, where `name` is the last part of a std module
+  that has that member, is imported for the check, so `markdown.to_html(s)`
+  needs no import line. a block that uses only members a module no longer has
+  is not caught this way; import the module in the block to check it strictly.
+- an import of a module that is not in std and cannot be found, such as
+  generated code, is left out, and the names it would bind are free.
+- a line that starts with `...` stands for code left out, and a function
+  signature with no body under it, as in a list of an api, gets an empty one.
+
+mark a block ```` ```pith no-check ```` when it shows an error on purpose or a
+syntax that does not exist yet. renderers take the first word of the info
+string as the language, so the block is still highlighted as pith.
+
 ## where to work
 
 - native backend CLI: `cranelift/cli/src/main.rs`

@@ -289,6 +289,20 @@ pub fn highlight_html(code: String) -> String:
             parts.push("<span class=\"" + css + "\">" + text + "</span>")
     return parts.join("")
 
+## the html for a markdown code block, for std.markdown's
+## `options().code_highlighter`: a block whose language is "pith" becomes
+## `<pre><code class="language-pith">`, the highlighted code from
+## highlight_html and `</code></pre>`. every other language gives none, so
+## std.markdown writes the block the usual way. all of the code is escaped,
+## so nothing in a block can end the `<pre>` or start a tag:
+##
+##   opts := markdown.options().code_highlighter(highlight.code_block)
+##   page := markdown.render(text, opts)
+pub fn code_block(language: String, code: String) -> String?:
+    if language != "pith":
+        return none
+    return "<pre><code class=\"language-pith\">" + highlight_html(code) + "</code></pre>\n"
+
 ## a default theme for the classes highlight_html writes: one set of colors
 ## for a light page and one under `prefers-color-scheme: dark`. variables
 ## and plain text keep the page's own color. a site with its own theme can
@@ -475,6 +489,16 @@ test "highlight_html escapes the text and wraps every kind but plain":
     assert_eq(highlight_html("T"), "<span class=\"pith-ty\">T</span>")
     assert_eq(highlight_html("<"), "<span class=\"pith-op\">&lt;</span>")
     assert_eq(highlight_html("é&"), "é&amp;")
+
+test "code_block highlights pith and leaves other languages alone":
+    assert_eq(code_block("pith", "x := 1\n").value(), "<pre><code class=\"language-pith\"><span class=\"pith-var\">x</span> <span class=\"pith-op\">:=</span> <span class=\"pith-num\">1</span>\n</code></pre>\n")
+    assert(code_block("go", "x := 1") == none)
+    assert(code_block("", "x") == none)
+    assert(code_block("Pith", "x") == none)
+    escaped := code_block("pith", "s := \"</code></pre><script>alert(1)</script>\"\n# <img src=x onerror=y>").value()
+    assert(not escaped.contains("<script"))
+    assert(not escaped.contains("<img"))
+    assert_eq(escaped.index_of("</code></pre>"), escaped.len() - 14)
 
 test "every kind has its class and the stylesheet covers them":
     assert_eq(class_name("keyword"), "pith-kw")

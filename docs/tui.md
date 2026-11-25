@@ -190,11 +190,12 @@ widget at `ring.active`. a form is a `FocusRing` plus widgets, with tab cycling
 in `update`:
 
 ```pith
-DemoMsg.Cycle =>
-    self.ring.next()
-    ...blur all, focus the one at self.ring.active...
-DemoMsg.Forward(k) =>
-    ...key(k) on the focused widget...
+match msg:
+    DemoMsg.Cycle =>
+        self.ring.next()
+        ...   # blur all, focus the one at self.ring.active
+    DemoMsg.Forward(k) =>
+        ...   # key(k) on the focused widget
 ```
 
 `examples/tui_demo.pith` is the full composition — tabs, list, input,

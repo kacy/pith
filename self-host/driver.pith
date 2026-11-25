@@ -591,8 +591,9 @@ fn dots_to_slashes(mod_path: String) -> String:
             result = result + ch
     return result
 
-# find the stdlib root by walking up from source file directory.
-fn dr_find_stdlib_root(source_path: String) -> String:
+## the toolchain root whose std/ a file at `source_path` imports from:
+## the nearest directory above it that holds std/, else the installed one.
+pub fn dr_find_stdlib_root(source_path: String) -> String:
     mut dir := get_directory(source_path)
     mut depth := 0
     while depth < 20:

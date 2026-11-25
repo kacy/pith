@@ -370,7 +370,7 @@ fn verify_internal(state: tls.ConnectionState) -> String:
         return "unexpected protocol"
     return ""
 
-cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!
+mut cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!
 cfg = cfg.with_alpn(["pith.rpc"]).with_verify_connection(verify_internal)
 ```
 

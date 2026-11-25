@@ -1,4 +1,4 @@
-.PHONY: sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-fresh-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only build-corpus-bins-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only input-limits-check input-limits-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean fuzz-surfaces-check fuzz-surfaces loom-check pithgen-leak count-marks-check-only purl-check
+.PHONY: doc-examples-check sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-fresh-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only build-corpus-bins-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only input-limits-check input-limits-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean fuzz-surfaces-check fuzz-surfaces loom-check pithgen-leak count-marks-check-only purl-check
 
 
 # prints a bounded account of a failed regression case: exit status, the
@@ -724,6 +724,16 @@ docsite-check:
 	./tools/docsite/docsite tools/docsite/sample "$$tmpdir" tools/docsite/sample/assets > /dev/null; \
 	diff -u tools/docsite/expected/index.html "$$tmpdir/index.html" && \
 	echo "docsite output matches golden files"
+
+# --- doc examples check ---
+# type checks every ```pith block in README.md and docs/*.md with the
+# self-hosted compiler, so a renamed function or a changed signature fails
+# here rather than in a reader's editor. self-host/doc_examples.pith says how
+# a fragment is read; a block marked ```pith no-check is skipped.
+
+doc-examples-check:
+	@echo "--- doc examples check ---"
+	@./self-host/pith_main doc --check README.md docs/*.md
 
 # --- sitegen golden check ---
 # builds the dogfood site generator, runs it over the sample site, and
@@ -2171,6 +2181,34 @@ cli-regressions-self-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -eq 1 ] && echo "$$out" | grep -q "PITH_NATIVE is set to $$tmpdir/no_backend, which does not exist"; then pass=$$((pass+1)); echo "ok   a missing PITH_NATIVE is named"; else echo "FAIL a missing PITH_NATIVE is named"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf '# doc\n\n```pith\nx := 1\n```\n\ntext\n\n```pith\nimport std.markdown as markdown\n\npage := markdown.to_htm("a")\n```\n\n```pith no-check\nnot pith at all\n```\n' > "$$tmpdir/stale.md"; \
+	set +e; \
+	out=$$(./self-host/pith_main doc --check "$$tmpdir/stale.md" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 1 ] && echo "$$out" | grep -q "stale.md:12:9: error\[E201\]: undefined function: markdown.to_htm" && echo "$$out" | grep -q "1 of 2 pith blocks do not check"; then pass=$$((pass+1)); echo "ok   doc --check reports a stale markdown example at its line"; else echo "FAIL doc --check reports a stale markdown example at its line"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf '```pith\nimport std.markdown as markdown\n\npage := markdown.to_html("a")\n```\n' > "$$tmpdir/fresh.md"; \
+	set +e; \
+	out=$$(./self-host/pith_main doc --check "$$tmpdir/fresh.md" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && echo "$$out" | grep -q "fresh.md: ok (1 pith blocks checked, 0 skipped)"; then pass=$$((pass+1)); echo "ok   doc --check passes a markdown file that checks"; else echo "FAIL doc --check passes a markdown file that checks"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(NO_COLOR= ./self-host/pith_main doc markdown 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$(echo "$$out" | head -1)" = "# markdown" ] && ! echo "$$out" | grep -q "$$(printf '\033')"; then pass=$$((pass+1)); echo "ok   doc shows a guide as plain text off a terminal"; else echo "FAIL doc shows a guide as plain text off a terminal"; echo "$$out" | head -5; fail=$$((fail+1)); fi; \
+	printf '# Title\n\n| a | b |\n| - | - |\n| 1 | 2 |\n' > "$$tmpdir/page.md"; \
+	set +e; \
+	out=$$(./self-host/pith_main doc "$$tmpdir/page.md" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$out" = "$$(printf '# Title\n\na │ b\n──┼──\n1 │ 2')" ]; then pass=$$((pass+1)); echo "ok   doc shows a markdown file"; else echo "FAIL doc shows a markdown file"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./self-host/pith_main doc no_such_guide 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 1 ] && echo "$$out" | grep -q "no guide named 'no_such_guide'; the guides are .*markdown"; then pass=$$((pass+1)); echo "ok   doc names the guides when one is missing"; else echo "FAIL doc names the guides when one is missing"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host cli regressions passed"
@@ -2292,6 +2330,7 @@ test: build
 	@echo "=== Step 14: tool golden checks ==="
 	@$(MAKE) --no-print-directory docsite-check
 	@$(MAKE) --no-print-directory sitegen-check
+	@$(MAKE) --no-print-directory doc-examples-check
 	@echo "=== Step 15: diagnostic position goldens ==="
 	@$(MAKE) --no-print-directory diag-check-only
 	@echo "=== all tests passed ==="

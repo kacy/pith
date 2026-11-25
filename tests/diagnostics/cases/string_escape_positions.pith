@@ -1,0 +1,16 @@
+# an unknown escape is reported at its backslash, in a plain string, in the
+# text of an interpolated string, after a multi-byte character, and in a
+# string written inside an interpolation, where the fragment's offsets map
+# back to the file. a token left over after an interpolation's expression is
+# reported where it sits, past spaces inside the braces.
+fn main():
+    n := 1
+    plain := "a\vb"
+    around := "x\q{n}y\e"
+    wide := "é{ n }\p"
+    inside := "{ f("\x41") }"
+    print("{ n n }")
+    print(plain + around + wide + inside)
+
+fn f(s: String) -> String:
+    return s

@@ -14,7 +14,8 @@
 # indentation level that matches no open block becomes an "err" token and
 # scanning carries on, so any text, including half-typed code, lexes. a
 # multi-byte character outside a string or a comment is not valid pith and
-# comes back as one "err" token per byte.
+# comes back as one "err" token per byte. an escape a string does not define,
+# such as `\v`, adds a "bad_escape" token after the string's own tokens.
 #
 # every piece of scan state lives in a value made for one call, so any number
 # of tasks can lex at once.
@@ -28,7 +29,7 @@
 # indent, dedent, eof.
 #
 # the kinds are "identifier", "underscore", "int_lit", "float_lit",
-# "string_lit", "comment", "err", the layout kinds "newline", "indent",
+# "string_lit", "comment", "err", "bad_escape", the layout kinds "newline", "indent",
 # "dedent" and "eof", "kw_<word>" for each keyword, an operator or punctuation
 # name such as "plus_eq" or "lparen", and the pieces of an interpolated string:
 # "string_start", then "interpolation_expr", "string_mid" and "string_end".
@@ -37,6 +38,12 @@
 # `offset` and `len` give the same span as a byte offset and a byte length.
 # columns count bytes. a token the scanner makes up (indent, dedent, eof) has
 # a zero length.
+#
+# a "bad_escape" token spans the backslash of an escape the language does not
+# define and the byte after it, and its value is a message. it follows the
+# token or the interpolation piece that holds the escape, so it can sit
+# among the pieces of an interpolated string, and the string itself still
+# lexes whole.
 #
 # an interpolated string is one "string_start" token whose span covers the
 # whole literal and whose value is the text from the opening quote up to the
@@ -66,17 +73,28 @@ RBRACE := chr(125)
 ## comes back as a "comment" token, and a line holding only a comment is
 ## skipped like a blank line.
 pub fn lex(src: String) -> List[Token]:
-    return lex_source(src, false)
+    return lex_source(src, false, false)
 
 ## the tokens of `src` with every comment in them: like `lex`, except that a
 ## comment alone on its line also comes back, as a "comment" token. the line
 ## still counts as blank, so the layout tokens are the ones `lex` produces.
 ## this is the stream for tools that show source rather than run it.
 pub fn lex_with_comments(src: String) -> List[Token]:
-    return lex_source(src, true)
+    return lex_source(src, true, false)
 
-fn lex_source(src: String, keep_comments: Bool) -> List[Token]:
-    mut lx := Scanner(src, keep_comments, 0, 1, 0, true, false, [0], 0, 0, [], [], [], [], 0, "", "", 0, 0, 0, 0, 1, 1, 0)
+## the tokens of an interpolation's expression, the raw text between a `{` and
+## its `}` once unescape_interp_expr has undone its escapes. the text is read
+## the way the inside of a bracket is, so the spaces around `{ a + b }` are not
+## indentation and no layout token comes back. `keep_comments` is as for
+## `lex_with_comments`.
+pub fn lex_interpolation(src: String, keep_comments: Bool) -> List[Token]:
+    return lex_source(src, keep_comments, true)
+
+fn lex_source(src: String, keep_comments: Bool, in_group: Bool) -> List[Token]:
+    mut group_depth := 0
+    if in_group:
+        group_depth = 1
+    mut lx := Scanner(src, keep_comments, 0, 1, 0, true, false, [0], group_depth, 0, [], [], [], [], 0, "", "", 0, 0, 0, 0, 1, 1, 0)
     mut tokens: List[Token] := []
     mut keep_going := true
     while keep_going:
@@ -160,6 +178,15 @@ fn is_backslash(character: String) -> Bool:
     if character.len() == 0:
         return false
     return ord(character) == 92
+
+# the escapes a string literal may hold, by the byte after the backslash:
+# \n, \r, \t and \0, a backslash, a quote, and a brace, which \{ and \}
+# write without opening or closing an interpolation
+fn is_known_escape(character: String) -> Bool:
+    if character.len() == 0:
+        return false
+    c := ord(character)
+    return c == 110 or c == 114 or c == 116 or c == 48 or c == 92 or c == 34 or c == 123 or c == 125
 
 fn is_newline_char(character: String) -> Bool:
     if character.len() == 0:
@@ -722,6 +749,7 @@ impl Scanner:
                     if self.current_position + 1 >= self.source.len():
                         self.emit("err", "unterminated escape sequence")
                         return
+                    self.check_escape()
                     self.current_position = self.current_position + 2
                     self.current_column = self.current_column + 2
                 elif is_quote(scan_char):
@@ -748,6 +776,7 @@ impl Scanner:
                 if self.current_position + 1 >= self.source.len():
                     self.emit("err", "unterminated escape sequence in string interpolation")
                     return
+                self.check_escape()
                 self.current_position = self.current_position + 2
                 self.current_column = self.current_column + 2
             elif is_lbrace(scan_char):
@@ -772,6 +801,19 @@ impl Scanner:
         self.scan_interpolation_parts()
 
         self.emit("string_start", string_start_value)
+
+    # the backslash under the scanner, in a string's literal text, starts an
+    # escape. one the language does not define queues a "bad_escape" token
+    # over the backslash and the byte after it; see Token.
+    fn check_escape():
+        next := self.source_char(self.current_position + 1)
+        if is_known_escape(next):
+            return
+        mut message := "unknown escape sequence in a string literal"
+        c := ord(next)
+        if c > 32 and c < 127:
+            message = "unknown escape sequence '" + chr(92) + next + "' in a string literal"
+        self.pending.push(Token("bad_escape", message, self.current_line, self.current_column + 1, self.current_position, 2))
 
     # queue one piece of an interpolated string with the source span it was
     # cut from: `line` and `column` are 1-based and name its first character.
@@ -846,6 +888,7 @@ impl Scanner:
                 if is_backslash(scan_char):
                     if self.current_position + 1 >= self.source.len():
                         return
+                    self.check_escape()
                     self.current_position = self.current_position + 2
                     self.current_column = self.current_column + 2
                 elif is_lbrace(scan_char):
@@ -1116,7 +1159,7 @@ pub fn interp_raw_offsets(raw: String) -> List[Int]:
 ## flag, width digits, optional .precision. colons inside strings or brackets
 ## never split, and a suffix that isn't a spec leaves the text untouched: the
 ## result is then the whole text and "". the spec comes back without its
-## colon.
+## colon or the spaces around it.
 pub fn split_format_spec(text: String) -> (String, String):
     mut depth := 0
     mut in_str := false
@@ -1139,7 +1182,8 @@ pub fn split_format_spec(text: String) -> (String, String):
         i = i + 1
     if colon <= 0:
         return (text, "")
-    spec := text.substring(colon + 1, text.len())
+    # `{ price:08.2 }` takes the spec 08.2
+    spec := text.substring(colon + 1, text.len()).trim()
     if is_format_spec(spec):
         return (text.substring(0, colon), spec)
     return (text, "")
@@ -1255,7 +1299,28 @@ test "unescaping an interpolation and mapping it back":
     assert_eq(interp_raw_offsets(bare).len(), bare.len() + 1)
     assert_eq(unescape_interp_expr("plain"), "plain")
 
+test "an unknown escape adds a bad_escape token after the string":
+    assert_eq(kinds_and_values(lex("\"a\\vb\" x")), "string_lit \"a\\vb\",bad_escape unknown escape sequence '\\v' in a string literal,identifier x,eof ")
+    toks := lex("s := \"ab\\q\"")
+    assert_eq(toks[3].kind, "bad_escape")
+    assert_eq(toks[3].offset, 8)
+    assert_eq(toks[3].column, 9)
+    assert_eq(toks[3].len, 2)
+    # in an interpolated string the token sits among the pieces, after the
+    # piece that holds the escape
+    assert_eq(kinds_and_values(lex("\"a\\v{{x}}b\\q\"")), "string_start \"a\\v,bad_escape unknown escape sequence '\\v' in a string literal,interpolation_expr x,bad_escape unknown escape sequence '\\q' in a string literal,string_end b\\q,eof ")
+    # the defined escapes, braces included, come back as a plain string
+    assert_eq(kinds_and_values(lex("\"\\n\\r\\t\\0\\\\\\\"\\{{\\}}\"")), "string_lit \"\\n\\r\\t\\0\\\\\\\"\\{{\\}}\",eof ")
+
+test "an interpolation's expression lexes with no layout around it":
+    assert_eq(kinds_and_values(lex_interpolation(" a + b ", false)), "identifier a,plus +,identifier b,eof ")
+    assert_eq(kinds_and_values(lex_interpolation("  m[\"k\"] ", false)), "identifier m,lbracket [,string_lit \"k\",rbracket ],eof ")
+    # read at the start of a line, the same text opens a block
+    assert_eq(kinds_and_values(lex(" a")), "indent ,identifier a,dedent ,eof ")
+
 test "split_format_spec splits only at a format spec":
+    assert_eq(split_format_spec(" x :>8 ").0, " x ")
+    assert_eq(split_format_spec(" x :>8 ").1, ">8")
     assert_eq(split_format_spec("x:>8").0, "x")
     assert_eq(split_format_spec("x:>8").1, ">8")
     assert_eq(split_format_spec("v:.2").1, ".2")

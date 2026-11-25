@@ -1,10 +1,11 @@
 # rendering markdown over and over. a round renders one document that uses
-# every block and inline construct std.markdown has, three ways: to html with
-# the safe defaults, to html with raw html allowed, and through the event
-# iterator into a renderer of its own. the parser builds a block tree, an
-# inline tree per paragraph, delimiter and bracket stacks and a queue of
-# events, all as lists of structs and enums, so a node or an event that is not
-# released moves the peak between the two round counts.
+# every block and inline construct std.markdown has, the gfm extensions
+# included, three ways: to html with the safe defaults, to html with raw html
+# allowed, and through the event iterator into a renderer of its own. the
+# parser builds a block tree, an inline tree per paragraph, delimiter and
+# bracket stacks and a queue of events, all as lists of structs and enums, so
+# a node or an event that is not released moves the peak between the two
+# round counts.
 import leakprobe as probe
 import std.markdown as markdown
 
@@ -28,6 +29,9 @@ fn document(i: Int) -> String:
         "> quoted *text*", "> - nested", "", "- tight", "- list", "", "1. loose", "", "2. list",
         "", "```go", "fenced := code", "```", "", "    indented code", "", "<div>", "html block",
         "</div>", "", "***", "", "[r]: /ref 'reference title'", "",
+        "| a | *b* |", "| :- | -: |", "| `c` | d |", "x", "",
+        "~~struck~~ www.example.com https://example.org/x me@example.com a note[^n] and[^n] again", "",
+        "- [ ] todo", "- [x] done", "", "<title>filtered</title>", "", "[^n]: the *note*", "",
     ]
     return parts.join(nl)
 

@@ -1,0 +1,20 @@
+# std.pith.highlight over a real program, examples/functions.pith: the html
+# it prints is the golden, so this pins the class a reader of the docs sees
+# for each construct in it: comments, declarations, argument labels, format
+# specs inside interpolations, compound assignment and an if expression.
+# editing that example means regenerating the expected output.
+import std.fs as fs
+import std.pith.highlight as highlight
+
+fn main():
+    path := "examples/functions.pith"
+    code := fs.read(path) catch ""
+    if code == "":
+        print("cannot read " + path)
+        return
+    print(highlight.highlight_html(code))
+    # the spans cover the file exactly, in order
+    mut parts: List[String] := []
+    for span in highlight.spans(code):
+        parts.push(code.substring(span.start, span.start + span.len))
+    print("round trip: {parts.join("") == code}")

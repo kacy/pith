@@ -1552,6 +1552,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ord_reads_a_byte_from_0_to_255() {
+        let high = b"\xc3\xa9\0";
+        let ascii = b"A\0";
+        unsafe {
+            assert_eq!(pith_ord_cstr(high.as_ptr() as *const i8), 195);
+            assert_eq!(pith_ord_cstr(ascii.as_ptr() as *const i8), 65);
+            assert_eq!(pith_ord_cstr(b"\0".as_ptr() as *const i8), 0);
+            assert_eq!(pith_ord_cstr(std::ptr::null()), 0);
+        }
+    }
+
     /// a compiled literal's header gives its length, and retain and release
     /// leave it alone.
     #[test]
@@ -2168,7 +2180,10 @@ pub unsafe extern "C" fn pith_ord_cstr(s: *const i8) -> i64 {
     if first == 0 {
         return 0;
     }
-    first as i64
+    // a byte, 0 to 255, as `ord(s[i])` reads it (pith_cstring_byte_at).
+    // widening the signed `i8` turned bytes from 128 up negative, so the same
+    // byte read through a variable and through an index compared unequal.
+    first as u8 as i64
 }
 
 #[no_mangle]

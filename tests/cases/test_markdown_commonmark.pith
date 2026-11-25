@@ -10,6 +10,11 @@
 # it bare in text and as `&#x27;` in urls. all three mean the same character,
 # so each side has them rewritten to `'` first. the spec's own test script
 # normalizes far more than this.
+#
+# a second pass runs the examples with gfm on and lists the ones whose html
+# changes. each change is one the gfm spec makes: the tag filter escapes
+# `<script>`, `<style>` and `<textarea>` in the html block examples, and the
+# extended autolinks link bare urls and email addresses.
 
 import std.fs as fs
 import std.json as json
@@ -18,25 +23,31 @@ import std.markdown as markdown
 fn normalize(page: String) -> String:
     return page.replace("&#39;", "'").replace("&#x27;", "'")
 
-fn main() -> Int!:
-    body := fs.read("tests/markdown/commonmark-0.31.2.json")!
-    root := json.parse(body)
-    opts := markdown.options().allow_html(true).allow_unsafe_urls(true).gfm(false)
-    total := json.array_len(root)
-    mut passed := 0
-    mut failures: List[String] := []
-    for i in 0..total:
+# the examples whose html differs from the spec's under `opts`.
+fn failures(root: Int, opts: markdown.Options) -> List[String]:
+    mut failed: List[String] := []
+    for i in 0..json.array_len(root):
         example := json.array_get(root, i)
         source := json.object_get_string(example, "markdown")
         expected := json.object_get_string(example, "html")
         actual := markdown.render(source, opts)
-        if normalize(actual) == normalize(expected):
-            passed += 1
-            continue
-        number := json.object_get_int(example, "example")
-        section := json.object_get_string(example, "section")
-        failures.push("example {number} ({section})")
-    print("commonmark: {passed}/{total} passed")
-    for failure in failures:
+        if normalize(actual) != normalize(expected):
+            number := json.object_get_int(example, "example")
+            section := json.object_get_string(example, "section")
+            failed.push("example {number} ({section})")
+    return failed
+
+fn main() -> Int!:
+    body := fs.read("tests/markdown/commonmark-0.31.2.json")!
+    root := json.parse(body)
+    total := json.array_len(root)
+    opts := markdown.options().allow_html(true).allow_unsafe_urls(true)
+    failed := failures(root, opts.gfm(false))
+    print("commonmark: {total - failed.len()}/{total} passed")
+    for failure in failed:
         print("failed: {failure}")
+    changed := failures(root, opts)
+    print("commonmark with gfm: {total - changed.len()}/{total} passed")
+    for change in changed:
+        print("changed by gfm: {change}")
     return 0

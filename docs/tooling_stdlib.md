@@ -1,8 +1,8 @@
 # tooling standard library
 
 pith now has a small set of stdlib modules aimed at tools: walking files,
-scanning source-like text, parsing command lines, rendering diagnostics, and
-writing tighter tests.
+scanning source-like text, parsing command lines, rendering diagnostics,
+lexing and highlighting pith source, and writing tighter tests.
 
 ## file discovery
 
@@ -125,6 +125,66 @@ malformed or declares a body over 64 MiB, so a corrupt length cannot
 balloon memory. `parse_message` classifies bodies as request,
 notification, response, or invalid with a reason, and the `*_body`
 builders produce the matching outgoing envelopes.
+
+## pith source: lexing and highlighting
+
+`std.pith.lexer` is the lexer the compiler runs, and `std.pith.highlight`
+colors pith code with it. the compiler's front end reads the same token
+stream, so a highlighted page and the compiler agree on where a string ends
+and which words are keywords.
+
+```pith
+import std.pith.highlight as highlight
+
+code := "fn add(a: Int, b: Int) -> Int:\n    return a + b\n"
+style := "<style>" + highlight.STYLESHEET + "</style>"
+block := "<pre><code class=\"language-pith\">" + highlight.highlight_html(code) + "</code></pre>"
+```
+
+`highlight_html(code)` returns the inside of a code block. it escapes all text
+with `std.html` and wraps each span that is not plain in
+`<span class="...">`. the class names are stable:
+
+| kind          | class        | covers                                                        |
+|---------------|--------------|---------------------------------------------------------------|
+| `keyword`     | `pith-kw`    | keywords, plus `locked`, `guard`, `holding`, `where` and `frozen` where a name follows them |
+| `type`        | `pith-ty`    | a name that starts with an uppercase letter                   |
+| `function`    | `pith-fn`    | a name called directly, `f(`, or declared, `fn f`             |
+| `variable`    | `pith-var`   | any other name                                                |
+| `string`      | `pith-str`   | string literals, the literal text of an interpolated string, a format spec |
+| `number`      | `pith-num`   | integer and float literals                                    |
+| `comment`     | `pith-com`   | `#` and `##` comments                                         |
+| `operator`    | `pith-op`    | `+`, `->`, `:=`, `==`, `..`, `?`, `|` and the rest            |
+| `punctuation` | `pith-punct` | `.`, `,`, `:`, brackets, and the braces of an interpolation   |
+| `plain`       | none         | whitespace, `_`, and bytes the lexer rejects                  |
+
+the expression inside an interpolation highlights as code, so
+`"total {format(n):>8}"` shows a function call between two pieces of string.
+`STYLESHEET` is a default theme for these classes, with a light scheme and a
+dark one under `prefers-color-scheme: dark`. variables and plain text keep the
+page's own color. a site with its own theme can skip it and style the classes
+directly.
+
+`spans(code)` is the form for other renderers, such as a terminal. it returns
+a `List[Span]`, where each span has a byte `start`, a byte `len` and a `kind`
+from the table above. the spans cover every byte of the input once, in order,
+and never split a utf-8 character. adjacent spans never share a kind, and only
+a plain span holds a line break, so a renderer can color line by line.
+
+neither function fails on any input: half-typed code, an unterminated string,
+control bytes and invalid utf-8 all highlight, and the work is linear in the
+input. the language server builds its semantic tokens from `spans` as well, so
+an editor and a rendered page color code the same way.
+
+`std.pith.lexer` also works on its own. `lex(src)` returns the token stream
+the compiler parses, ending in an `eof` token. `lex_with_comments(src)` adds a
+token for each comment that sits alone on its line, which `lex` skips like a
+blank line. each `Token` has a `kind`, the source text as its `value`, a
+1-based `line` and `column`, and a byte `offset` and `len`. a lexing error
+becomes an `err` token and scanning continues. all scan state belongs to one
+call, so tasks can lex at the same time. the compiler's `self-host/lexer.pith`
+adds what only the compiler needs: the 16 MiB source limit, the token table
+the parser reads by index, and integer literal values.
 
 ## testing helpers
 

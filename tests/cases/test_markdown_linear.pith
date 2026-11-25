@@ -122,3 +122,92 @@ fn main():
 
     entities := timed("entities", "&amp;&#x41;&copy;&bogus;".repeat(40000))
     print("  decoded {count(entities, "©")}, kept {count(entities, "&amp;bogus;")}")
+
+    # the gfm extensions, which the cases above run with as well.
+
+    wide := timed("wide table over one-cell rows", "|a".repeat(5000) + "|\n" + "|-".repeat(5000) + "|\n" + "a\n".repeat(50000))
+    print("  rows {count(wide, "<tr>")}, output under 4 MB {wide.len() < 4000000}")
+
+    rows := timed("table with many rows", "| a | b | c |\n| --- | :-: | --: |\n" + "| x | *y* | `z` |\n".repeat(50000))
+    print("  rows {count(rows, "<tr>")}, cells {count(rows, "<td")}")
+
+    columns := timed("table with many columns", "|a".repeat(50000) + "\n" + "|-".repeat(50000) + "\n" + "|b".repeat(50000))
+    print("  header cells {count(columns, "<th>")}, body cells {count(columns, "<td>")}")
+
+    cmark_table := timed("cmark-gfm table case", ("aaa\rbbb\n-" + chr(11) + "\n").repeat(30000))
+    print("  tables {count(cmark_table, "<table>")}, rows {count(cmark_table, "<tr>")}")
+
+    header_lines := timed("paragraph of rows before a delimiter row", "| a | b |\n".repeat(50000) + "| - | - |\n")
+    print("  tables {count(header_lines, "<table>")}, paragraphs {count(header_lines, "<p>")}")
+
+    mismatched_tables := timed("delimiter rows that do not match", "| a |\n| - | - |\n\n".repeat(25000))
+    print("  tables {count(mismatched_tables, "<table>")}, paragraphs {count(mismatched_tables, "<p>")}")
+
+    strike_openers := timed("strikethrough openers without closers", "~~a ".repeat(50000))
+    print("  del {count(strike_openers, "<del>")}")
+
+    strike_closers := timed("strikethrough closers without openers", "a~~ ".repeat(50000))
+    print("  del {count(strike_closers, "<del>")}")
+
+    tildes := timed("runs of tildes", "~".repeat(100000) + "a" + " ~~~b~~~".repeat(30000))
+    print("  del {count(tildes, "<del>")}")
+
+    nested_strike := timed("nested strikethrough", "~~a ~b ".repeat(30000) + "c" + " d~ e~~".repeat(30000))
+    print("  del {count(nested_strike, "<del>")}")
+
+    unbalanced_strike := timed("unbalanced strikethrough", "~a~~ ~~b~ ".repeat(30000))
+    print("  del {count(unbalanced_strike, "<del>")}")
+
+    strike_emphasis := timed("strikethrough mixed with emphasis", "~~*a_ ".repeat(50000))
+    print("  del {count(strike_emphasis, "<del>")}, em {count(strike_emphasis, "<em>")}")
+
+    footnotes := timed("many footnotes", numbered_lines("[^N]: note N\n", 50000) + "\n" + numbered_lines("x[^N] ", 50000))
+    print("  references {count(footnotes, "data-footnote-ref>")}, definitions {count(footnotes, "<li id=")}")
+
+    one_note := timed("many references to one footnote", "x[^a] ".repeat(50000) + "\n\n[^a]: note")
+    print("  references {count(one_note, "data-footnote-ref>")}, backlinks {count(one_note, "footnote-backref\" data")}")
+
+    nested_notes := timed("footnote labels that nest", "[^".repeat(50000) + "a" + "]".repeat(50000) + "\n\n[^a]: x")
+    print("  references {count(nested_notes, "data-footnote-ref>")}")
+
+    undefined_notes := timed("undefined footnote references", "[^a] [^b".repeat(50000) + "\n\n[^c]: x")
+    print("  references {count(undefined_notes, "data-footnote-ref>")}")
+
+    deep_notes := timed("footnote definitions nested on one line", "[^a]: ".repeat(50000) + "x\n\ny[^a]")
+    print("  definitions {count(deep_notes, "<li id=")}")
+
+    punctuation := timed("an autolink with long trailing punctuation", "www.example.com/" + ".,:;!?*_~'\"".repeat(10000))
+    print("  links {count(punctuation, "<a href")}")
+
+    parens := timed("an autolink with unbalanced parentheses", "http://example.com/" + "(".repeat(50000) + ")".repeat(60000))
+    print("  links {count(parens, "<a href")}")
+
+    trailing := timed("autolinks with trailing punctuation", "www.a.com/b?!.,:*_~ ".repeat(30000))
+    print("  links {count(trailing, "<a href")}")
+
+    www_run := timed("www. repeated", "www.".repeat(50000))
+    print("  links {count(www_run, "<a href")}")
+
+    underscores := timed("www. domains with underscores", "www._".repeat(50000) + " www.a_".repeat(50000))
+    print("  links {count(underscores, "<a href")}")
+
+    schemes := timed("url candidates without hosts", "http:// https://. ftp://_ ".repeat(30000))
+    print("  links {count(schemes, "<a href")}")
+
+    letters := timed("long scheme candidates", "a".repeat(100000) + "://x.com " + "http".repeat(30000) + "://y.com")
+    print("  links {count(letters, "<a href")}")
+
+    entity_tails := timed("autolinks with entity-like tails", "www.a.com/&b;&c;&d; ".repeat(30000))
+    print("  links {count(entity_tails, "<a href")}")
+
+    emails := timed("email candidates", "a@".repeat(50000) + " " + "a.b@c ".repeat(50000))
+    print("  links {count(emails, "<a href")}")
+
+    mailto := timed("mailto prefixes", "mailto:".repeat(30000) + "a@b.com " + "x@y.co".repeat(30000))
+    print("  links {count(mailto, "<a href")}")
+
+    tag_filter := timed("disallowed raw html", "<script>x</script>".repeat(30000) + "\n\na " + "<style>".repeat(30000))
+    print("  escaped {count(tag_filter, "&lt;script>")} {count(tag_filter, "&lt;style>")}")
+
+    tasks := timed("many task list items", "- [ ] a\n- [x] b\n".repeat(25000))
+    print("  checkboxes {count(tasks, "<input")}")

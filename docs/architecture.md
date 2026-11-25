@@ -57,7 +57,9 @@ if a change only affects object output or linking, it belongs in `cranelift/`.
 
 ### add a token or keyword
 
-- self-hosted compiler: `self-host/lexer.pith`
+- the lexer: `std/pith/lexer.pith`. the compiler reads it through
+  `self-host/lexer.pith`, and `std/pith/highlight.pith` colors code from it,
+  so a new token kind may need a class there too
 - if syntax changes: update `docs/grammar.ebnf`
 
 ### add syntax

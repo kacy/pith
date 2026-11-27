@@ -495,6 +495,7 @@ impl MapImpl {
     /// Extract `(val_tag, raw_handle)` for a displaced/removed value if this
     /// map owns heap values, so callers can drop `&mut MapImpl` before running
     /// any destructor.
+    #[must_use]
     #[inline(always)]
     fn displaced_value_handle(&self, val: MapVal) -> Option<(ListTypeTag, i64)> {
         if !self.val_is_heap() {
@@ -519,6 +520,7 @@ impl MapImpl {
     /// so callers drop `&mut MapImpl` (and, on final release, scrub magic and
     /// free the shell) BEFORE releasing any child values. Primitive maps clear
     /// with zero allocation.
+    #[must_use]
     fn take_values_for_release(&mut self) -> (ListTypeTag, Vec<i64>) {
         if !self.val_is_heap() {
             self.clear();
@@ -780,10 +782,14 @@ pub(crate) unsafe fn insert_bytes_key(
     let run = |impl_ref: &mut MapImpl| {
         require_key_flavor(impl_ref.key_type, KeyType::String, "map_insert");
         // SAFETY: Caller guarantees `value` matches the map's value kind.
-        unsafe { insert_keyed(impl_ref, &KeyRef::Str(key), value, takes_caller_count) };
+        unsafe { insert_keyed(impl_ref, &KeyRef::Str(key), value, takes_caller_count) }
     };
-    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
-    unsafe { with_map_mut_handle(map_handle, run) };
+    // SAFETY: `with_map_mut_handle` validates `map_handle`; release displaced value after borrow ends.
+    let displaced = unsafe { with_map_mut_handle(map_handle, run) }.flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `map_handle` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 /// Get map length
@@ -793,6 +799,7 @@ pub extern "C" fn pith_map_len(map: PithMap) -> i64 {
     unsafe { with_map_ref(map, |impl_ref| impl_ref.len() as i64) }.unwrap_or(0)
 }
 
+#[must_use]
 #[inline(always)]
 unsafe fn map_insert_int_impl(
     impl_ref: &mut MapImpl,
@@ -1220,6 +1227,7 @@ fn get_keyed(impl_ref: &MapImpl, map_key: &KeyRef<'_>) -> Option<i64> {
 
 /// Drop the entry under `map_key`, returning any displaced heap value handle
 /// for release after the `&mut MapImpl` borrow ends.
+#[must_use]
 #[inline(always)]
 fn remove_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) -> Option<(ListTypeTag, i64)> {
     impl_ref
@@ -1392,6 +1400,7 @@ unsafe fn insert_bkey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
 /// owns heap values, and returns whatever that displaces for release after the
 /// `&mut MapImpl` borrow ends. an owned value arrives with the caller's count,
 /// which the map keeps as its own.
+#[must_use]
 #[inline(always)]
 unsafe fn insert_keyed(
     impl_ref: &mut MapImpl,
@@ -2093,6 +2102,7 @@ pub unsafe extern "C" fn pith_map_insert_ikey_owned_kind(
     }
 }
 
+#[must_use]
 #[inline(always)]
 unsafe fn insert_ikey_impl(
     impl_ref: &mut MapImpl,
@@ -2213,6 +2223,7 @@ pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i6
         .unwrap_or(0)
 }
 
+#[must_use]
 #[inline(always)]
 fn map_remove_ikey_impl(impl_ref: &mut MapImpl, key: i64) -> Option<(ListTypeTag, i64)> {
     crate::perf_stats!(PERF_MAP_INT_REMOVES += 1);

@@ -371,6 +371,7 @@ fn displaced_element(impl_ref: &ListImpl, index: usize) -> Option<i64> {
 /// so the caller can drop its `&mut ListImpl` borrow (and, on final release,
 /// scrub magic and free the shell) BEFORE releasing any child handles.
 /// Primitive lists clear in place with zero allocation.
+#[must_use]
 fn take_elements_for_release(impl_ref: &mut ListImpl) -> (ListTypeTag, Vec<i64>) {
     let tag = impl_ref.type_tag;
     if matches!(tag, ListTypeTag::Primitive) {
@@ -924,6 +925,7 @@ pub unsafe extern "C" fn pith_list_insert_value_kind(
     };
 }
 
+#[must_use]
 #[inline(always)]
 unsafe fn set_value_kind_impl(
     impl_ref: &mut ListImpl,
@@ -1067,6 +1069,7 @@ pub unsafe extern "C" fn pith_list_set_value_owned(list: PithList, index: i64, v
     unsafe { set_value_inner(list, index, value, true) };
 }
 
+#[must_use]
 #[inline(always)]
 unsafe fn set_scalar_impl(
     impl_ref: &mut ListImpl,
@@ -1102,6 +1105,7 @@ pub unsafe extern "C" fn pith_list_set_scalar(list: PithList, index: i64, value:
     }
 }
 
+#[must_use]
 #[inline(always)]
 unsafe fn set_value_impl(
     impl_ref: &mut ListImpl,

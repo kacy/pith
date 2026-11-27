@@ -124,11 +124,15 @@ fn read_len(data: Bytes, pos: Int, available_end: Int) -> Int!:
         fail "der length is too large"
     if pos + count >= available_end:
         fail "truncated der long length"
+    if data[pos + 1] == 0:
+        fail "non-canonical der length"
     mut value := 0
     mut i := 0
     while i < count:
         value = bits.shl(value, 8) + data[pos + 1 + i]
         i = i + 1
+    if value < 128:
+        fail "non-canonical der length"
     return value
 
 fn len_width(data: Bytes, pos: Int) -> Int!:
@@ -140,27 +144,37 @@ fn len_width(data: Bytes, pos: Int) -> Int!:
         fail "indefinite der length is not supported"
     return 1 + count
 
-# read one der value at offset.
-pub fn read_value(data: Bytes, pos: Int) -> DerValue!:
-    if pos + 2 > data.len():
+# read one der value bounded by `end`.
+fn read_value_in(data: Bytes, pos: Int, end: Int) -> DerValue!:
+    if pos < 0 or end > data.len() or pos + 2 > end:
         fail "truncated der value"
-    length := read_len(data, pos + 1, data.len())!
+    length := read_len(data, pos + 1, end)!
     width := len_width(data, pos + 1)!
     value_start := pos + 1 + width
     value_end := value_start + length
-    if value_end > data.len():
-        fail "der value extends past input"
+    if value_end > end:
+        fail "der value extends past container"
     tag := data[pos]
     return DerValue(tag, pos, value_start, value_end, value_end, bits.band(tag, 32) != 0)
 
-fn expect_tag(data: Bytes, pos: Int, tag: Int) -> DerValue!:
-    value := read_value(data, pos)!
+# read one der value at offset.
+pub fn read_value(data: Bytes, pos: Int) -> DerValue!:
+    return read_value_in(data, pos, data.len())!
+
+fn expect_tag_in(data: Bytes, pos: Int, end: Int, tag: Int) -> DerValue!:
+    value := read_value_in(data, pos, end)!
     if value.tag != tag:
         fail "unexpected der tag"
     return value
 
+fn expect_tag(data: Bytes, pos: Int, tag: Int) -> DerValue!:
+    return expect_tag_in(data, pos, data.len(), tag)!
+
 fn value_bytes(data: Bytes, value: DerValue) -> Bytes:
     return data.slice(value.value_start, value.value_end)
+
+# largest value that can be shifted left 7 bits without overflowing signed 64-bit Int.
+OID_MAX_BEFORE_SHIFT := 72057594037927935
 
 fn read_oid_value(data: Bytes, value: DerValue) -> String!:
     if value.tag != TAG_OBJECT_ID:
@@ -180,15 +194,23 @@ fn read_oid_value(data: Bytes, value: DerValue) -> String!:
         parts.push("2")
         parts.push((first - 80).to_string())
     mut component := 0
+    mut in_arc := false
     mut i := 1
     while i < body.len():
         b := body[i]
+        # X.690 §8.19.2: the leading octet of a subidentifier must not be 0x80.
+        if not in_arc and b == 128:
+            fail "non-minimal object id"
+        if component > OID_MAX_BEFORE_SHIFT:
+            fail "object id component overflows"
+        in_arc = true
         component = bits.shl(component, 7) + bits.band(b, 127)
         if bits.band(b, 128) == 0:
             parts.push(component.to_string())
             component = 0
+            in_arc = false
         i = i + 1
-    if component != 0:
+    if in_arc:
         fail "truncated object id"
     return parts.join(".")
 
@@ -219,7 +241,7 @@ fn read_bit_string(data: Bytes, value: DerValue) -> Bytes!:
 fn read_algorithm_oid(data: Bytes, value: DerValue) -> String!:
     if value.tag != TAG_SEQUENCE:
         fail "expected algorithm sequence"
-    oid_value := expect_tag(data, value.value_start, TAG_OBJECT_ID)!
+    oid_value := expect_tag_in(data, value.value_start, value.value_end, TAG_OBJECT_ID)!
     return read_oid_value(data, oid_value)!
 
 fn parse_name_common_name(data: Bytes, value: DerValue) -> String!:
@@ -227,12 +249,13 @@ fn parse_name_common_name(data: Bytes, value: DerValue) -> String!:
         fail "expected name sequence"
     mut pos := value.value_start
     while pos < value.value_end:
-        rdn := expect_tag(data, pos, TAG_SET)!
+        rdn := expect_tag_in(data, pos, value.value_end, TAG_SET)!
         mut rdn_pos := rdn.value_start
         while rdn_pos < rdn.value_end:
-            attr := expect_tag(data, rdn_pos, TAG_SEQUENCE)!
-            oid := read_oid(data, attr.value_start)!
-            attr_value := read_value(data, read_value(data, attr.value_start)!.next)!
+            attr := expect_tag_in(data, rdn_pos, rdn.value_end, TAG_SEQUENCE)!
+            oid_val := expect_tag_in(data, attr.value_start, attr.value_end, TAG_OBJECT_ID)!
+            oid := read_oid_value(data, oid_val)!
+            attr_value := read_value_in(data, oid_val.next, attr.value_end)!
             if oid == OID_COMMON_NAME:
                 return read_der_string(data, attr_value)!
             rdn_pos = attr.next
@@ -242,8 +265,10 @@ fn parse_name_common_name(data: Bytes, value: DerValue) -> String!:
 fn parse_validity(data: Bytes, value: DerValue) -> List[String]!:
     if value.tag != TAG_SEQUENCE:
         fail "expected validity sequence"
-    first := read_value(data, value.value_start)!
-    second := read_value(data, first.next)!
+    first := read_value_in(data, value.value_start, value.value_end)!
+    second := read_value_in(data, first.next, value.value_end)!
+    if second.next != value.value_end:
+        fail "trailing bytes in validity sequence"
     mut out: List[String] := []
     out.push(read_der_string(data, first)!)
     out.push(read_der_string(data, second)!)
@@ -252,14 +277,16 @@ fn parse_validity(data: Bytes, value: DerValue) -> List[String]!:
 fn parse_spki_algorithm(data: Bytes, value: DerValue) -> String!:
     if value.tag != TAG_SEQUENCE:
         fail "expected public key info sequence"
-    alg := expect_tag(data, value.value_start, TAG_SEQUENCE)!
+    alg := expect_tag_in(data, value.value_start, value.value_end, TAG_SEQUENCE)!
     return read_algorithm_oid(data, alg)!
 
 fn parse_spki_public_key(data: Bytes, value: DerValue) -> Bytes!:
     if value.tag != TAG_SEQUENCE:
         fail "expected public key info sequence"
-    alg := expect_tag(data, value.value_start, TAG_SEQUENCE)!
-    key_bits := expect_tag(data, alg.next, TAG_BIT_STRING)!
+    alg := expect_tag_in(data, value.value_start, value.value_end, TAG_SEQUENCE)!
+    key_bits := expect_tag_in(data, alg.next, value.value_end, TAG_BIT_STRING)!
+    if key_bits.next != value.value_end:
+        fail "trailing bytes in public key info"
     return read_bit_string(data, key_bits)!
 
 fn read_ip_address(data: Bytes, value: DerValue) -> String!:
@@ -270,10 +297,12 @@ fn read_ip_address(data: Bytes, value: DerValue) -> String!:
 
 fn parse_san(data: Bytes, extn_value: DerValue, dns_names: List[String], ip_addresses: List[String]) -> Bool!:
     inner := value_bytes(data, extn_value)
-    names := expect_tag(inner, 0, TAG_SEQUENCE)!
+    names := expect_tag_in(inner, 0, inner.len(), TAG_SEQUENCE)!
+    if names.next != inner.len():
+        fail "trailing bytes in san extension"
     mut pos := names.value_start
     while pos < names.value_end:
-        name := read_value(inner, pos)!
+        name := read_value_in(inner, pos, names.value_end)!
         if name.tag == TAG_DNS_NAME:
             dns_names.push(value_bytes(inner, name).to_string_utf8()!)
         elif name.tag == TAG_IP_ADDRESS:
@@ -301,11 +330,13 @@ fn der_small_int(body: Bytes) -> Int:
 
 fn parse_basic_constraints(data: Bytes, extn_value: DerValue) -> BasicConstraints!:
     inner := value_bytes(data, extn_value)
-    seq := expect_tag(inner, 0, TAG_SEQUENCE)!
+    seq := expect_tag_in(inner, 0, inner.len(), TAG_SEQUENCE)!
+    if seq.next != inner.len():
+        fail "trailing bytes in basic constraints"
     if seq.value_start >= seq.value_end:
         return BasicConstraints(false, false, 0)
     mut pos := seq.value_start
-    first := read_value(inner, pos)!
+    first := read_value_in(inner, pos, seq.value_end)!
     mut is_ca := false
     if first.tag == TAG_BOOLEAN:
         body := value_bytes(inner, first)
@@ -313,17 +344,19 @@ fn parse_basic_constraints(data: Bytes, extn_value: DerValue) -> BasicConstraint
         pos = first.next
     # pathLenConstraint is only meaningful for a ca and follows the cA boolean.
     if is_ca and pos < seq.value_end:
-        next := read_value(inner, pos)!
+        next := read_value_in(inner, pos, seq.value_end)!
         if next.tag == TAG_INTEGER:
             return BasicConstraints(true, true, der_small_int(value_bytes(inner, next)))
     return BasicConstraints(is_ca, false, 0)
 
 fn parse_eku(data: Bytes, extn_value: DerValue, eku_oids: List[String]) -> Bool!:
     inner := value_bytes(data, extn_value)
-    seq := expect_tag(inner, 0, TAG_SEQUENCE)!
+    seq := expect_tag_in(inner, 0, inner.len(), TAG_SEQUENCE)!
+    if seq.next != inner.len():
+        fail "trailing bytes in extended key usage"
     mut pos := seq.value_start
     while pos < seq.value_end:
-        oid_value := expect_tag(inner, pos, TAG_OBJECT_ID)!
+        oid_value := expect_tag_in(inner, pos, seq.value_end, TAG_OBJECT_ID)!
         eku_oids.push(read_oid_value(inner, oid_value)!)
         pos = oid_value.next
     return true
@@ -333,8 +366,8 @@ fn parse_eku(data: Bytes, extn_value: DerValue, eku_oids: List[String]) -> Bool!
 fn collect_dns_subtrees(inner: Bytes, subtrees: DerValue, out: List[String]) -> Bool!:
     mut pos := subtrees.value_start
     while pos < subtrees.value_end:
-        subtree := expect_tag(inner, pos, TAG_SEQUENCE)!
-        base := read_value(inner, subtree.value_start)!
+        subtree := expect_tag_in(inner, pos, subtrees.value_end, TAG_SEQUENCE)!
+        base := read_value_in(inner, subtree.value_start, subtree.value_end)!
         if base.tag == TAG_DNS_NAME:
             out.push(value_bytes(inner, base).to_string_utf8()!)
         pos = subtree.next
@@ -346,8 +379,8 @@ fn collect_dns_subtrees(inner: Bytes, subtrees: DerValue, out: List[String]) -> 
 fn collect_ip_subtrees(inner: Bytes, subtrees: DerValue, out: List[Bytes]) -> Bool!:
     mut pos := subtrees.value_start
     while pos < subtrees.value_end:
-        subtree := expect_tag(inner, pos, TAG_SEQUENCE)!
-        base := read_value(inner, subtree.value_start)!
+        subtree := expect_tag_in(inner, pos, subtrees.value_end, TAG_SEQUENCE)!
+        base := read_value_in(inner, subtree.value_start, subtree.value_end)!
         if base.tag == TAG_IP_ADDRESS:
             body := value_bytes(inner, base)
             if body.len() == 8 or body.len() == 32:
@@ -357,10 +390,12 @@ fn collect_ip_subtrees(inner: Bytes, subtrees: DerValue, out: List[Bytes]) -> Bo
 
 fn parse_name_constraints(data: Bytes, extn_value: DerValue, permitted_dns: List[String], excluded_dns: List[String], permitted_ip: List[Bytes], excluded_ip: List[Bytes]) -> Bool!:
     inner := value_bytes(data, extn_value)
-    constraints := expect_tag(inner, 0, TAG_SEQUENCE)!
+    constraints := expect_tag_in(inner, 0, inner.len(), TAG_SEQUENCE)!
+    if constraints.next != inner.len():
+        fail "trailing bytes in name constraints"
     mut pos := constraints.value_start
     while pos < constraints.value_end:
-        field := read_value(inner, pos)!
+        field := read_value_in(inner, pos, constraints.value_end)!
         if field.tag == TAG_PERMITTED_SUBTREES:
             collect_dns_subtrees(inner, field, permitted_dns)!
             collect_ip_subtrees(inner, field, permitted_ip)!
@@ -375,7 +410,9 @@ fn parse_name_constraints(data: Bytes, extn_value: DerValue, permitted_dns: List
 # first content byte. an absent keyUsage extension permits every usage.
 fn parse_key_usage_cert_sign(data: Bytes, extn_value: DerValue) -> Bool!:
     inner := value_bytes(data, extn_value)
-    bit_str := expect_tag(inner, 0, TAG_BIT_STRING)!
+    bit_str := expect_tag_in(inner, 0, inner.len(), TAG_BIT_STRING)!
+    if bit_str.next != inner.len():
+        fail "trailing bytes in key usage"
     body := value_bytes(inner, bit_str)
     if body.len() < 2:
         return false
@@ -386,7 +423,9 @@ fn parse_key_usage_cert_sign(data: Bytes, extn_value: DerValue) -> Bool!:
 # the handshake with a signature from the leaf key.
 fn parse_key_usage_digital_signature(data: Bytes, extn_value: DerValue) -> Bool!:
     inner := value_bytes(data, extn_value)
-    bit_str := expect_tag(inner, 0, TAG_BIT_STRING)!
+    bit_str := expect_tag_in(inner, 0, inner.len(), TAG_BIT_STRING)!
+    if bit_str.next != inner.len():
+        fail "trailing bytes in key usage"
     body := value_bytes(inner, bit_str)
     if body.len() < 2:
         return false
@@ -403,7 +442,9 @@ struct ParsedExtensions:
     path_len: Int
 
 fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_addresses: List[String], eku_oids: List[String], permitted_dns: List[String], excluded_dns: List[String], permitted_ip: List[Bytes], excluded_ip: List[Bytes]) -> ParsedExtensions!:
-    extensions := expect_tag(data, value.value_start, TAG_SEQUENCE)!
+    extensions := expect_tag_in(data, value.value_start, value.value_end, TAG_SEQUENCE)!
+    if extensions.next != value.value_end:
+        fail "trailing bytes in extensions wrapper"
     mut is_ca := false
     mut has_eku := false
     mut has_key_usage := false
@@ -413,20 +454,20 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
     mut path_len := 0
     mut pos := extensions.value_start
     while pos < extensions.value_end:
-        ext := expect_tag(data, pos, TAG_SEQUENCE)!
-        oid_value := read_value(data, ext.value_start)!
+        ext := expect_tag_in(data, pos, extensions.value_end, TAG_SEQUENCE)!
+        oid_value := expect_tag_in(data, ext.value_start, ext.value_end, TAG_OBJECT_ID)!
         oid := read_oid_value(data, oid_value)!
         mut child_pos := oid_value.next
         mut is_critical := false
-        mut child := read_value(data, child_pos)!
+        mut child := read_value_in(data, child_pos, ext.value_end)!
         if child.tag == TAG_BOOLEAN:
             # DER criticality flag: any non-zero body byte is TRUE (canonical
             # DER uses 0xFF). absent means false, the default.
             crit_body := value_bytes(data, child)
             is_critical = crit_body.len() > 0 and crit_body[0] != 0
             child_pos = child.next
-            child = read_value(data, child_pos)!
-        if child.tag != TAG_OCTET_STRING:
+            child = read_value_in(data, child_pos, ext.value_end)!
+        if child.tag != TAG_OCTET_STRING or child.next != ext.value_end:
             fail "expected extension value"
         if oid == OID_SUBJECT_ALT_NAME:
             parse_san(data, child, dns_names, ip_addresses)!
@@ -458,28 +499,33 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
 fn skip_optional_tbs_field(tag: Int) -> Bool:
     return tag == 129 or tag == 161 or tag == 130 or tag == 162
 
-fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!:
+fn parse_tbs(data: Bytes, tbs: DerValue, outer_sig_alg_der: Bytes, signature_value: Bytes) -> Certificate!:
     mut pos := tbs.value_start
     mut version := 1
-    first := read_value(data, pos)!
+    first := read_value_in(data, pos, tbs.value_end)!
     if first.tag == 160:
-        version_value := expect_tag(data, first.value_start, TAG_INTEGER)!
+        version_value := expect_tag_in(data, first.value_start, first.value_end, TAG_INTEGER)!
+        if version_value.next != first.value_end:
+            fail "trailing bytes in certificate version"
         version_body := value_bytes(data, version_value)
         if version_body.len() > 0:
             version = version_body[version_body.len() - 1] + 1
         pos = first.next
 
-    serial := expect_tag(data, pos, TAG_INTEGER)!
+    serial := expect_tag_in(data, pos, tbs.value_end, TAG_INTEGER)!
     pos = serial.next
-    signature_alg := expect_tag(data, pos, TAG_SEQUENCE)!
+    signature_alg := expect_tag_in(data, pos, tbs.value_end, TAG_SEQUENCE)!
+    # RFC 5280 §4.1.1.2: Certificate.signatureAlgorithm MUST match TBSCertificate.signature.
+    if not bytes.eq(outer_sig_alg_der, data.slice(signature_alg.header_start, signature_alg.next)):
+        fail "certificate signature algorithm mismatch"
     pos = signature_alg.next
-    issuer := expect_tag(data, pos, TAG_SEQUENCE)!
+    issuer := expect_tag_in(data, pos, tbs.value_end, TAG_SEQUENCE)!
     pos = issuer.next
-    validity := expect_tag(data, pos, TAG_SEQUENCE)!
+    validity := expect_tag_in(data, pos, tbs.value_end, TAG_SEQUENCE)!
     pos = validity.next
-    subject := expect_tag(data, pos, TAG_SEQUENCE)!
+    subject := expect_tag_in(data, pos, tbs.value_end, TAG_SEQUENCE)!
     pos = subject.next
-    spki := expect_tag(data, pos, TAG_SEQUENCE)!
+    spki := expect_tag_in(data, pos, tbs.value_end, TAG_SEQUENCE)!
     pos = spki.next
 
     validity_parts := parse_validity(data, validity)!
@@ -498,7 +544,7 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
     mut has_path_len := false
     mut path_len := 0
     while pos < tbs.value_end:
-        child := read_value(data, pos)!
+        child := read_value_in(data, pos, tbs.value_end)!
         if child.tag == TAG_EXTENSIONS:
             parsed := parse_extensions(data, child, dns_names, ip_addresses, eku_oids, permitted_dns, excluded_dns, permitted_ip, excluded_ip)!
             is_ca = parsed.is_ca
@@ -518,11 +564,16 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
 
 # parse a der-encoded x.509 certificate.
 pub fn parse_der(data: Bytes) -> Certificate!:
-    cert := expect_tag(data, 0, TAG_SEQUENCE)!
-    tbs := expect_tag(data, cert.value_start, TAG_SEQUENCE)!
-    outer_sig_alg := expect_tag(data, tbs.next, TAG_SEQUENCE)!
-    sig_bits := expect_tag(data, outer_sig_alg.next, TAG_BIT_STRING)!
-    return parse_tbs(data, tbs, read_bit_string(data, sig_bits)!)!
+    cert := expect_tag_in(data, 0, data.len(), TAG_SEQUENCE)!
+    if cert.next != data.len():
+        fail "trailing bytes after der certificate"
+    tbs := expect_tag_in(data, cert.value_start, cert.value_end, TAG_SEQUENCE)!
+    outer_sig_alg := expect_tag_in(data, tbs.next, cert.value_end, TAG_SEQUENCE)!
+    sig_bits := expect_tag_in(data, outer_sig_alg.next, cert.value_end, TAG_BIT_STRING)!
+    if sig_bits.next != cert.value_end:
+        fail "trailing bytes in der certificate"
+    outer_sig_alg_der := data.slice(outer_sig_alg.header_start, outer_sig_alg.next)
+    return parse_tbs(data, tbs, outer_sig_alg_der, read_bit_string(data, sig_bits)!)!
 
 # parse the first certificate in a pem document.
 pub fn parse_pem(text: String) -> Certificate!:
@@ -545,18 +596,7 @@ pub fn parse_pem_chain(text: String) -> List[Certificate]!:
 fn host_is_ip(host: String) -> Bool:
     if host.contains(":"):
         return true
-    parts := host.split(".")
-    if parts.len() != 4:
-        return false
-    for part in parts:
-        if part.len() == 0:
-            return false
-        n := parse_int(part)
-        if n.is_err:
-            return false
-        if n.ok < 0 or n.ok > 255:
-            return false
-    return true
+    return parse_ipv4_bytes(host).len() == 4
 
 fn wildcard_matches(pattern: String, host: String) -> Bool:
     if not pattern.starts_with("*."):
@@ -618,29 +658,24 @@ fn issuer_matches(cert: Certificate, issuer: Certificate) -> Bool:
 
 # a tls server leaf may carry an extendedKeyUsage extension. when it does, it
 # must allow serverAuth (or the anyExtendedKeyUsage escape hatch); a cert that
-# lists only clientAuth, emailProtection, codeSigning, etc. is being misused as
-# a server certificate and is rejected. an absent eku extension permits any
-# purpose per rfc 5280, so those certs pass.
-fn leaf_permits_server_auth(cert: Certificate) -> Bool:
+# whether `cert` permits `required_eku` (or carries no EKU extension, or
+# carries anyExtendedKeyUsage). enforced on leaf, intermediate CAs, and roots
+# so a sub-CA restricted to emailProtection or clientAuth cannot issue TLS
+# server certificates, and a serverAuth-only sub-CA cannot issue mTLS client
+# certificates.
+fn cert_permits_eku(cert: Certificate, required_eku: String) -> Bool:
     if not cert.has_eku:
         return true
     for oid in cert.eku_oids:
-        if oid == OID_SERVER_AUTH or oid == OID_ANY_EKU:
+        if oid == required_eku or oid == OID_ANY_EKU:
             return true
     return false
 
-# a tls client leaf may carry an extendedKeyUsage extension. when it does, it
-# must allow clientAuth (or anyExtendedKeyUsage); a cert that lists only
-# serverAuth, emailProtection, codeSigning, etc. is being misused as a client
-# certificate and is rejected. an absent eku extension permits any purpose per
-# rfc 5280, so those certs pass.
+fn leaf_permits_server_auth(cert: Certificate) -> Bool:
+    return cert_permits_eku(cert, OID_SERVER_AUTH)
+
 fn leaf_permits_client_auth(cert: Certificate) -> Bool:
-    if not cert.has_eku:
-        return true
-    for oid in cert.eku_oids:
-        if oid == OID_CLIENT_AUTH or oid == OID_ANY_EKU:
-            return true
-    return false
+    return cert_permits_eku(cert, OID_CLIENT_AUTH)
 
 # rfc 5280 dnsname constraint match: a constraint of "example.com" matches
 # "example.com" and any subdomain; a leading-dot constraint (".example.com")
@@ -671,26 +706,40 @@ fn dns_excluded_matches(constraint: String, name: String) -> Bool:
                 return true
     return false
 
+# strict dotted-quad ipv4 parser: requires exactly four non-empty decimal
+# octets (0..255) separated by single dots, rejecting empty segments such as
+# "127..0.0.1" and ambiguous leading zeros like "0127.0.0.1".
 fn parse_ipv4_bytes(text: String) -> Bytes:
-    parts := text.split(".")
-    if parts.len() != 4:
+    if text.len() < 7 or text.len() > 15:
         return bytes.empty()
     out := bytes.buffer_with_capacity(4)
     defer out.free()
-    for part in parts:
-        if part.len() == 0 or part.len() > 3:
-            return bytes.empty()
-        mut value := 0
-        mut i := 0
-        while i < part.len():
-            c := ord(part[i])
-            if c < 48 or c > 57:
+    mut octets := 0
+    mut digits := 0
+    mut value := 0
+    mut leading_zero := false
+    mut i := 0
+    while i <= text.len():
+        at_end := i == text.len()
+        if at_end or ord(text[i]) == 46:
+            if digits == 0 or (leading_zero and digits > 1) or value > 255 or octets >= 4:
                 return bytes.empty()
+            out.write_byte(value) catch 0
+            octets = octets + 1
+            digits = 0
+            value = 0
+            leading_zero = false
+        else:
+            c := ord(text[i])
+            if c < 48 or c > 57 or digits >= 3:
+                return bytes.empty()
+            if digits == 0 and c == 48:
+                leading_zero = true
             value = value * 10 + (c - 48)
-            i = i + 1
-        if value > 255:
-            return bytes.empty()
-        out.write_byte(value) catch 0
+            digits = digits + 1
+        i = i + 1
+    if octets != 4:
+        return bytes.empty()
     return out.bytes()
 
 fn parse_ipv6_group(text: String) -> Int:
@@ -717,6 +766,8 @@ fn parse_ipv6_side(text: String, allow_ipv4_tail: Bool) -> List[Int]:
     mut groups: List[Int] := []
     if text == "":
         return groups
+    if text.starts_with(":") or text.ends_with(":") or text.contains("::"):
+        return [-1]
     parts := text.split(":")
     mut i := 0
     while i < parts.len():
@@ -967,94 +1018,96 @@ fn verification_reason(hostname_ok: Bool, issuer_ok: Bool, root_ca_ok: Bool, sig
         return "certificate signature verification failed"
     return "ok"
 
-fn find_issuer_in_chain(cert: Certificate, chain: List[Certificate], start: Int) -> Certificate!:
-    mut i := start
-    while i < chain.len():
-        candidate := chain[i]
-        if issuer_matches(cert, candidate):
-            return candidate
-        i = i + 1
-    fail "issuer not found in chain"
+fn eku_reason_for(required_eku: String) -> String:
+    if required_eku == OID_CLIENT_AUTH:
+        return CLIENT_EKU_REASON
+    return EKU_REASON
 
-fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificate], hostname_ok: Bool) -> VerificationResult:
+# check whether `issuer` is a valid CA issuer for `current` (carrying `leaf` at
+# depth `intermediates_used` below `issuer`) under `required_eku`. returns an
+# ok VerificationResult when every check passes, or the specific failure.
+fn check_issuer_hop(leaf: Certificate, current: Certificate, issuer: Certificate, now_ms: Int, intermediates_used: Int, hostname_ok: Bool, required_eku: String) -> VerificationResult:
+    if not validity_contains(issuer, now_ms):
+        return VerificationResult(false, hostname_ok, true, false, false, EXPIRED_REASON)
+    root_ca_ok := issuer.is_ca
+    signature_verified := verify_signature(current, issuer)
+    if not root_ca_ok or not signature_verified:
+        return VerificationResult(false, hostname_ok, true, root_ca_ok, signature_verified, verification_reason(hostname_ok, true, root_ca_ok, signature_verified))
+    if issuer.has_key_usage and not issuer.key_cert_sign:
+        return VerificationResult(false, hostname_ok, true, false, signature_verified, KEY_USAGE_REASON)
+    if issuer.has_path_len and intermediates_used > issuer.path_len:
+        return VerificationResult(false, hostname_ok, true, root_ca_ok, signature_verified, PATH_LEN_REASON)
+    if not cert_permits_eku(issuer, required_eku):
+        return VerificationResult(false, hostname_ok, true, root_ca_ok, signature_verified, eku_reason_for(required_eku))
+    if not name_constraints_permit_leaf(leaf, issuer):
+        return VerificationResult(false, hostname_ok, true, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
+    return VerificationResult(true, hostname_ok, true, true, true, "ok")
+
+fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificate], hostname_ok: Bool, required_eku: String) -> VerificationResult:
     # one clock read for the whole walk so every certificate is judged against
     # the same instant.
     now_ms := time.now()
+    leaf := chain[0]
     # the leaf must be within its validity window before we trust it, even on
     # the pinned-certificate fast path below.
-    if not validity_contains(chain[0], now_ms):
+    if not validity_contains(leaf, now_ms):
         return VerificationResult(false, hostname_ok, false, false, false, EXPIRED_REASON)
     # a trust anchor byte-identical to the leaf is a pinned certificate:
     # trusting the exact certificate needs no ca bit and no chain walk. this
     # is how self-signed servers (a dev postgres or a database with an
     # auto-generated cert) verify — pass the server's own pem as the ca file.
     for root in trusted_roots:
-        if bytes.eq(root.der, chain[0].der):
+        if bytes.eq(root.der, leaf.der):
             return VerificationResult(hostname_ok, hostname_ok, true, true, true, verification_reason(hostname_ok, true, true, true))
-    mut current := chain[0]
-    mut next_chain_index := 1
-    mut issuer_ok := false
-    mut root_ca_ok := false
-    mut signature_verified := false
-    mut depth := 0
-    while depth < chain.len() + trusted_roots.len() + 1:
-        issuer_from_chain := find_issuer_in_chain(current, chain, next_chain_index)
-        if issuer_from_chain.is_ok:
-            issuer := issuer_from_chain.ok
-            # an expired intermediate breaks trust just as a bad signature does.
-            if not validity_contains(issuer, now_ms):
-                return VerificationResult(false, hostname_ok, true, false, false, EXPIRED_REASON)
-            issuer_ok = true
-            root_ca_ok = issuer.is_ca
-            signature_verified = verify_signature(current, issuer)
-            if not root_ca_ok or not signature_verified:
-                return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
-            # a ca with a keyUsage that omits keyCertSign may not sign a
-            # certificate, and a pathLenConstraint bounds how many intermediates
-            # may sit below it (next_chain_index-1 of them do here).
-            if issuer.has_key_usage and not issuer.key_cert_sign:
-                return VerificationResult(false, hostname_ok, issuer_ok, false, signature_verified, KEY_USAGE_REASON)
-            if issuer.has_path_len and next_chain_index - 1 > issuer.path_len:
-                return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, PATH_LEN_REASON)
-            # a name-constrained intermediate may not sign outside its namespace.
-            if not name_constraints_permit_leaf(chain[0], issuer):
-                return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
-            current = issuer
-            next_chain_index = next_chain_index + 1
-        else:
-            # try every trusted root whose subject DN matches `current.issuer_dn`:
-            # CA bundles commonly carry two roots with the same DN during root
-            # rotation (an expiring root and its renewed successor with a new key).
-            mut matched_any_root := false
-            mut last_failure := VerificationResult(false, hostname_ok, false, false, false, UNTRUSTED_ISSUER_REASON)
-            for root in trusted_roots:
-                if not issuer_matches(current, root):
-                    continue
-                matched_any_root = true
-                if not validity_contains(root, now_ms):
-                    last_failure = VerificationResult(false, hostname_ok, true, false, false, EXPIRED_REASON)
-                    continue
-                issuer_ok = true
-                root_ca_ok = root.is_ca
-                signature_verified = verify_signature(current, root)
-                if not root_ca_ok or not signature_verified:
-                    last_failure = VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
-                    continue
-                if root.has_key_usage and not root.key_cert_sign:
-                    last_failure = VerificationResult(false, hostname_ok, issuer_ok, false, signature_verified, KEY_USAGE_REASON)
-                    continue
-                if root.has_path_len and next_chain_index - 1 > root.path_len:
-                    last_failure = VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, PATH_LEN_REASON)
-                    continue
-                if not name_constraints_permit_leaf(chain[0], root):
-                    last_failure = VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
-                    continue
+    # track visited chain entries so out-of-order intermediates are discovered
+    # regardless of wire order and no certificate is ever matched twice.
+    mut used: List[Bool] := []
+    mut k := 0
+    while k < chain.len():
+        used.push(k == 0)
+        k = k + 1
+    mut current := leaf
+    mut intermediates_used := 0
+    while intermediates_used <= chain.len():
+        # try every trusted root whose subject DN matches `current.issuer_dn`
+        # first: reaching a trust anchor finishes the walk immediately even if
+        # the peer appended an old/untrusted root or out-of-order certs.
+        mut matched_any_root := false
+        mut root_failure := VerificationResult(false, hostname_ok, false, false, false, UNTRUSTED_ISSUER_REASON)
+        for root in trusted_roots:
+            if not issuer_matches(current, root):
+                continue
+            matched_any_root = true
+            res := check_issuer_hop(leaf, current, root, now_ms, intermediates_used, hostname_ok, required_eku)
+            if res.ok:
                 return VerificationResult(hostname_ok, hostname_ok, true, true, true, verification_reason(hostname_ok, true, true, true))
-            if not matched_any_root:
-                return VerificationResult(false, hostname_ok, false, false, false, UNTRUSTED_ISSUER_REASON)
-            return last_failure
-        depth = depth + 1
-    return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, "certificate chain is too deep")
+            root_failure = res
+        # otherwise walk through any unused intermediate in `chain` (in any
+        # position, handling out-of-order and cross-signed chains).
+        mut matched_any_chain := false
+        mut chain_failure := VerificationResult(false, hostname_ok, false, false, false, UNTRUSTED_ISSUER_REASON)
+        mut advanced := false
+        mut i := 1
+        while i < chain.len():
+            if not used[i] and issuer_matches(current, chain[i]):
+                matched_any_chain = true
+                res := check_issuer_hop(leaf, current, chain[i], now_ms, intermediates_used, hostname_ok, required_eku)
+                if res.ok:
+                    used[i] = true
+                    current = chain[i]
+                    intermediates_used = intermediates_used + 1
+                    advanced = true
+                    break
+                chain_failure = res
+            i = i + 1
+        if advanced:
+            continue
+        if matched_any_chain:
+            return chain_failure
+        if matched_any_root:
+            return root_failure
+        return VerificationResult(false, hostname_ok, false, false, false, UNTRUSTED_ISSUER_REASON)
+    return VerificationResult(false, hostname_ok, false, false, false, "certificate chain is too deep")
 
 # check the server name against the certificate san list.
 pub fn verify_hostname(cert: Certificate, host: String) -> VerificationResult:
@@ -1063,7 +1116,8 @@ pub fn verify_hostname(cert: Certificate, host: String) -> VerificationResult:
 
 # run the native trust preflight for a server certificate and root.
 #
-# this checks hostname, issuer metadata, ca constraints, and certificate signature.
+# this checks hostname, issuer metadata, ca constraints (basicConstraints,
+# keyCertSign, EKU, name constraints), and certificate signature.
 pub fn preflight_server_certificate(cert: Certificate, trusted_root: Certificate, host: String) -> VerificationResult:
     hostname_ok := matches_hostname(cert, host)
     # both the leaf and the trust anchor must be inside their validity windows.
@@ -1079,8 +1133,15 @@ pub fn preflight_server_certificate(cert: Certificate, trusted_root: Certificate
     issuer_ok := issuer_matches(cert, trusted_root)
     root_ca_ok := trusted_root.is_ca
     signature_verified := verify_signature(cert, trusted_root)
-    ok := hostname_ok and issuer_ok and root_ca_ok and signature_verified
-    return VerificationResult(ok, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
+    if not issuer_ok or not root_ca_ok or not signature_verified:
+        return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
+    if trusted_root.has_key_usage and not trusted_root.key_cert_sign:
+        return VerificationResult(false, hostname_ok, issuer_ok, false, signature_verified, KEY_USAGE_REASON)
+    if not cert_permits_eku(trusted_root, OID_SERVER_AUTH):
+        return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, EKU_REASON)
+    if not name_constraints_permit_leaf(cert, trusted_root):
+        return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
+    return VerificationResult(hostname_ok, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
 
 # whether a peer's leaf certificate may sign the handshake. every suite this
 # stack speaks (ecdhe on 1.2, certificateverify on 1.3) authenticates with a
@@ -1109,7 +1170,7 @@ pub fn verify_server_chain(chain: List[Certificate], trusted_roots: List[Certifi
     if not leaf_permits_signing(leaf):
         return VerificationResult(false, hostname_ok, false, false, false, LEAF_KEY_USAGE_REASON)
 
-    return verify_chain_issuers(chain, trusted_roots, hostname_ok)
+    return verify_chain_issuers(chain, trusted_roots, hostname_ok, OID_SERVER_AUTH)
 
 # verify a client certificate chain against trusted roots.
 pub fn verify_client_chain(chain: List[Certificate], trusted_roots: List[Certificate]) -> VerificationResult:
@@ -1121,7 +1182,7 @@ pub fn verify_client_chain(chain: List[Certificate], trusted_roots: List[Certifi
         return VerificationResult(false, true, false, false, false, CLIENT_EKU_REASON)
     if not leaf_permits_signing(chain[0]):
         return VerificationResult(false, true, false, false, false, LEAF_KEY_USAGE_REASON)
-    return verify_chain_issuers(chain, trusted_roots, true)
+    return verify_chain_issuers(chain, trusted_roots, true, OID_CLIENT_AUTH)
 
 test "x509 does not match a hostname against a certificate's common name":
     # a leaf with NO subjectAltName and CN=www.bank.com must not match the
@@ -1441,3 +1502,76 @@ test "x509 wildcard excluded constraints and ipv6 san matching work":
     assert(bytes.eq(ip_string_to_bytes("2001:db8::1"), ip_string_to_bytes("2001:0db8:0000:0000:0000:0000:0000:0001")))
     assert(bytes.eq(ip_string_to_bytes("::ffff:127.0.0.1"), ip_string_to_bytes("00000000000000000000ffff7f000001")))
     assert_eq(ip_string_to_bytes("not::an::ip").len(), 0)
+    assert_eq(ip_string_to_bytes("127..0.0.1").len(), 0)
+    assert_eq(ip_string_to_bytes(".127.0.0.1").len(), 0)
+    assert_eq(ip_string_to_bytes("127.0.0.1.").len(), 0)
+    assert_eq(ip_string_to_bytes("0127.0.0.1").len(), 0)
+    assert_eq(ip_string_to_bytes("1:::2").len(), 0)
+    assert(not host_is_ip("127..0.0.1"))
+
+test "x509 oid decoder rejects non-minimal 0x80, truncated 0x80, and 64-bit overflow":
+    # non-minimal leading 0x80 subidentifier (06 03 2a 80 01)
+    assert(read_oid(encoding.from_hex("06032a8001")!, 0).is_err)
+    # truncated trailing 0x80 subidentifier (06 02 2a 80)
+    assert(read_oid(encoding.from_hex("06022a80")!, 0).is_err)
+    # 10-byte base-128 arc overflows 64-bit Int
+    assert(read_oid(encoding.from_hex("060b2a81818181818181818101")!, 0).is_err)
+
+test "x509 enforces preflight name constraints, keyCertSign, intermediate EKU, out-of-order chains, and outer sig alg":
+    # preflight enforces name constraints (nc-ca constrains to example.com)
+    bad_nc := parse_pem(read_file("tests/live/fixtures/nc-bad-leaf.crt")!)!
+    nc_ca := parse_pem(read_file("tests/live/fixtures/nc-ca.crt")!)!
+    pre_nc := preflight_server_certificate(bad_nc, nc_ca, "evil.com")
+    assert(not pre_nc.ok)
+    assert_eq(pre_nc.reason, NAME_CONSTRAINT_REASON)
+
+    # preflight enforces keyCertSign on trusted root
+    fx := "tests/live/fixtures/"
+    no_kcs_leaf := parse_pem(read_file(fx + "constraint-leaf-no-keycertsign.crt")!)!
+    no_kcs_ca := parse_pem(read_file(fx + "constraint-int-no-keycertsign.crt")!)!
+    pre_kcs := preflight_server_certificate(no_kcs_leaf, no_kcs_ca, "leaf.test")
+    assert(not pre_kcs.ok)
+    assert_eq(pre_kcs.reason, KEY_USAGE_REASON)
+
+    # intermediate CA carrying clientAuth-only EKU cannot anchor a TLS server cert
+    good_leaf := parse_pem(read_file(fx + "constraint-leaf-good.crt")!)!
+    good_int := parse_pem(read_file(fx + "constraint-int-good.crt")!)!
+    root := parse_pem(read_file(fx + "constraint-root.crt")!)!
+    client_only_int := Certificate(good_int.der, good_int.tbs_der, good_int.subject_public_key_info, good_int.subject_public_key, good_int.signature, good_int.version, good_int.serial_hex, good_int.signature_algorithm, good_int.public_key_algorithm, good_int.issuer_common_name, good_int.subject_common_name, good_int.not_before, good_int.not_after, good_int.dns_names, good_int.ip_addresses, good_int.is_ca, good_int.issuer_dn, good_int.subject_dn, true, [OID_CLIENT_AUTH], good_int.permitted_dns, good_int.excluded_dns, good_int.has_key_usage, good_int.key_cert_sign, good_int.digital_signature, good_int.has_path_len, good_int.path_len, good_int.permitted_ip, good_int.excluded_ip)
+    bad_eku_srv := verify_server_chain([good_leaf, client_only_int], [root], "leaf.test")
+    assert(not bad_eku_srv.ok)
+    assert_eq(bad_eku_srv.reason, EKU_REASON)
+
+    # intermediate CA carrying serverAuth-only EKU cannot anchor an mTLS client cert
+    server_only_int := Certificate(good_int.der, good_int.tbs_der, good_int.subject_public_key_info, good_int.subject_public_key, good_int.signature, good_int.version, good_int.serial_hex, good_int.signature_algorithm, good_int.public_key_algorithm, good_int.issuer_common_name, good_int.subject_common_name, good_int.not_before, good_int.not_after, good_int.dns_names, good_int.ip_addresses, good_int.is_ca, good_int.issuer_dn, good_int.subject_dn, true, [OID_SERVER_AUTH], good_int.permitted_dns, good_int.excluded_dns, good_int.has_key_usage, good_int.key_cert_sign, good_int.digital_signature, good_int.has_path_len, good_int.path_len, good_int.permitted_ip, good_int.excluded_ip)
+    bad_eku_cli := verify_client_chain([good_leaf, server_only_int], [root])
+    assert(not bad_eku_cli.ok)
+    assert_eq(bad_eku_cli.reason, CLIENT_EKU_REASON)
+
+    # out-of-order intermediates still verify and still enforce pathLenConstraint
+    pl_leaf := parse_pem(read_file(fx + "constraint-leaf-pathlen.crt")!)!
+    pl_below := parse_pem(read_file(fx + "constraint-int-below-pathlen0.crt")!)!
+    pl_top := parse_pem(read_file(fx + "constraint-int-pathlen0.crt")!)!
+    reordered := verify_server_chain([pl_leaf, pl_top, pl_below], [root], "leaf.test")
+    assert(not reordered.ok)
+    assert_eq(reordered.reason, PATH_LEN_REASON)
+    # extra unrelated cert before the real intermediate still finds the real intermediate
+    with_decoy := verify_server_chain([good_leaf, nc_ca, good_int], [root], "leaf.test")
+    assert(with_decoy.ok)
+
+    # mismatched outer signatureAlgorithm vs TBSCertificate.signature is rejected
+    cert_der := good_leaf.der
+    outer_seq := expect_tag_in(cert_der, 0, cert_der.len(), TAG_SEQUENCE)!
+    tbs_tlv := expect_tag_in(cert_der, outer_seq.value_start, outer_seq.value_end, TAG_SEQUENCE)!
+    outer_alg := expect_tag_in(cert_der, tbs_tlv.next, outer_seq.value_end, TAG_SEQUENCE)!
+    # flip the last OID byte inside outer signatureAlgorithm (sha256WithRSA -> sha384WithRSA)
+    mut tampered := bytes.buffer_with_capacity(cert_der.len())
+    defer tampered.free()
+    mut pos := 0
+    while pos < cert_der.len():
+        if pos == outer_alg.value_start + 10:
+            tampered.write_byte(cert_der[pos] + 1)!
+        else:
+            tampered.write_byte(cert_der[pos])!
+        pos = pos + 1
+    assert(parse_der(tampered.bytes()).is_err)

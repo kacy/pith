@@ -78,6 +78,12 @@ MAX_FLOW_CONTROL_WINDOW := 2147483647
 MAX_LOCAL_ENCODER_TABLE_SIZE := 65536
 FLOW_CONTROL_OVERFLOW := "http2: flow-control window overflow"
 
+# CVE-2023-44487 (HTTP/2 Rapid Reset) guard: maximum net client-initiated
+# RST_STREAM frames without offsetting completed streams before the server
+# terminates the connection with GOAWAY(ENHANCE_YOUR_CALM).
+MAX_RAPID_RESETS := 256
+RAPID_RESET_ERROR := "http2: too many rapid stream resets"
+
 # the most streams the server will serve at once on one connection. advertised in
 # the server's SETTINGS and enforced by the reader: a new stream past the cap is
 # refused with RST_STREAM rather than spawned.
@@ -446,10 +452,12 @@ struct Server:
     handlers: Handlers
     outbound: Channel[Outbound]
     closed: AtomicInt
+    peer_max_frame_atomic: AtomicInt
     guard mu:
         streams: Map[Int, Channel[StreamEvent]]
         mut active: List[Int]
         mut last_stream_id: Int
+        mut rapid_resets: Int
         # send-side flow control (RFC 9113 §6.9): we may not send more
         # response DATA than the client's windows allow. `conn_send_window` is
         # the connection-level credit (starts at the default, grows only on a
@@ -572,6 +580,11 @@ impl Server:
     # outbound queue, which would leave the handler nothing to send its trailers
     # through. here the stream stays registered and the writer stays running, so
     # a handler that reacts to the cancel still gets a clean status onto the wire.
+    fn note_completed_stream():
+        locked self.mu:
+            if self.rapid_resets > 0:
+                self.rapid_resets = self.rapid_resets - 1
+
     fn cancel_active_streams():
         mut ids: List[Int] := []
         locked self.mu:
@@ -579,7 +592,8 @@ impl Server:
                 ids.push(stream_id)
         for stream_id in ids:
             if let inbox = self.inbox_for(stream_id):
-                inbox.send(reset_event(frames.ERROR_CANCEL))
+                if not inbox.try_send(reset_event(frames.ERROR_CANCEL)):
+                    inbox.close()
 
     # close every open stream's inbox so handlers blocked on recv() unblock, then
     # clear the table. called when the connection winds down.
@@ -699,6 +713,12 @@ fn build_request(fields: List[hpack.HeaderField], body: Bytes) -> http.HttpReque
     method := pseudo(fields, ":method")
     path := pseudo(fields, ":path")
     authority := pseudo(fields, ":authority")
+    mut canonical_host := authority
+    if canonical_host == "":
+        for field in fields:
+            if field.name == "host":
+                canonical_host = field.value
+                break
     crlf := "\r\n"
     # the head is appended to a byte buffer rather than to a string. pith
     # strings are immutable, so `head = head + field` re-copies everything
@@ -711,10 +731,11 @@ fn build_request(fields: List[hpack.HeaderField], body: Bytes) -> http.HttpReque
     head := bytes.buffer()
     errdefer head.free()
     head.write_string_utf8(method + " " + path + " HTTP/1.1" + crlf)!
-    head.write_string_utf8("host: " + authority + crlf)!
+    head.write_string_utf8("host: " + canonical_host + crlf)!
     for field in fields:
-        # pseudo-headers are h2-only; they became the request line and Host above.
-        if field.name.starts_with(":"):
+        # pseudo-headers became the request line and Host above; skip any
+        # regular `host` field so the bridged HTTP/1.1 head carries Host once.
+        if field.name.starts_with(":") or field.name == "host":
             continue
         head.write_string_utf8(field.name)!
         head.write_string_utf8(": ")!
@@ -728,7 +749,7 @@ fn build_request(fields: List[hpack.HeaderField], body: Bytes) -> http.HttpReque
 # the hop-by-hop headers that are meaningless (and forbidden) in http/2: they
 # describe a single http/1.1 hop, not the end-to-end message (RFC 9113 §8.2.2).
 fn is_hop_by_hop(name: String) -> Bool:
-    return name == "connection" or name == "transfer-encoding" or name == "keep-alive" or name == "upgrade"
+    return name == "connection" or name == "transfer-encoding" or name == "keep-alive" or name == "upgrade" or name == "proxy-connection"
 
 # turn an HttpResponse into the http/2 response header fields: the ":status"
 # pseudo-header first, then the content type, the regular headers (lowercased,
@@ -773,16 +794,31 @@ fn response_trailer_fields(response: http.HttpResponse) -> List[hpack.HeaderFiel
             fields.push(hpack.header_field(name, val))
     return fields
 
-# encode and send a response's HEADERS on `stream_id`: one HEADERS frame carrying
-# the hpack block of `fields`, with END_HEADERS set. `end_stream` half-closes on
-# the HEADERS frame, which is what a bodiless response wants; a response with a
-# body passes false here and streams the body as flow-controlled DATA frames
-# afterward (see send_stream_data). runs only on the writer task, the sole owner
-# of the encoder and the socket.
-fn send_headers(conn: ServerConn, stream_id: Int, fields: List[hpack.HeaderField], end_stream: Bool) -> Int!:
+# encode and send a response's HEADERS on `stream_id`, splitting the hpack
+# block across HEADERS + CONTINUATION frames whenever it exceeds `max_frame_size`
+# (RFC 9113 §4.2, §6.10). runs only on the writer task, the sole owner of the
+# encoder and the socket, so no other frame can interleave between fragments.
+fn send_headers_bounded(conn: ServerConn, stream_id: Int, fields: List[hpack.HeaderField], end_stream: Bool, max_frame_size: Int) -> Int!:
     block := conn.encode_block(fields)
-    conn.send_frame(frames.headers_frame(stream_id, block, end_stream, true))!
+    mut limit := max_frame_size
+    if limit < MIN_MAX_FRAME_SIZE:
+        limit = MIN_MAX_FRAME_SIZE
+    if block.len() <= limit:
+        conn.send_frame(frames.headers_frame(stream_id, block, end_stream, true))!
+        return 0
+    conn.send_frame(frames.headers_frame(stream_id, block.slice(0, limit), end_stream, false))!
+    mut off := limit
+    while off < block.len():
+        mut stop := off + limit
+        if stop > block.len():
+            stop = block.len()
+        is_last := stop == block.len()
+        conn.send_frame(frames.continuation_frame(stream_id, block.slice(off, stop), is_last))!
+        off = stop
     return 0
+
+fn send_headers(conn: ServerConn, stream_id: Int, fields: List[hpack.HeaderField], end_stream: Bool) -> Int!:
+    return send_headers_bounded(conn, stream_id, fields, end_stream, frames.DEFAULT_MAX_FRAME_SIZE)!
 
 # --- send-side flow control (RFC 9113 §6.9) ---
 #
@@ -919,7 +955,7 @@ fn send_stream_data(server: Server, stream_id: Int, data: Bytes, end_stream: Boo
 # it receives: the reader and the handlers send into the bounded queue with a
 # blocking send, so a writer that stopped receiving would leave them parked on
 # a full queue for good.
-fn writer_loop(conn: ServerConn, outbound: Channel[Outbound], closed: AtomicInt) -> Int:
+fn writer_loop(conn: ServerConn, outbound: Channel[Outbound], closed: AtomicInt, peer_max_frame: AtomicInt) -> Int:
     mut failed := false
     while true:
         opt := outbound.recv()
@@ -937,7 +973,7 @@ fn writer_loop(conn: ServerConn, outbound: Channel[Outbound], closed: AtomicInt)
         else:
             # OUT_RESPONSE is headers only; the body follows as OUT_RAW DATA frames
             # the handler already gated against the client's send window.
-            sent := send_headers(conn, item.stream_id, item.fields, item.end_stream)
+            sent := send_headers_bounded(conn, item.stream_id, item.fields, item.end_stream, peer_max_frame.load())
             if sent.is_err:
                 closed.store(1)
                 failed = true
@@ -1064,6 +1100,7 @@ fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
         # a second HEADERS block after the body is the trailers; it always ends
         # the stream. queued after the DATA on the same FIFO, so ordering holds.
         server.outbound.send(Outbound(OUT_RESPONSE, bytes.empty(), stream_id, trailer_fields, true))
+    server.note_completed_stream()
     server.forget(stream_id)
 
 # run one stream on the streaming path: read the request HEADERS off the inbox,
@@ -1095,6 +1132,7 @@ fn handle_streaming_stream(server: Server, stream_id: Int, inbox: Channel[Stream
         http.report_handler_failure(stream.request, failure)
         server.reset(stream_id, frames.ERROR_INTERNAL_ERROR)
         return
+    server.note_completed_stream()
     server.forget(stream_id)
 
 # --- the reader task ---
@@ -1107,19 +1145,32 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
     t := frame.header.frame_type
     if t == frames.FRAME_HEADERS:
         hf := frames.parse_headers(frame)!
+        if hf.stream_id == 0:
+            fail "http2: HEADERS frame on stream 0"
         block := server.conn.read_header_block(hf)!
         # decode in receive order to keep the single hpack decoder in step, even
         # for a stream we are about to refuse.
         fields := server.conn.decode_block(block)!
-        open_stream(server, hf, fields)
+        open_stream(server, hf, fields)!
         return true
     if t == frames.FRAME_DATA:
         df := frames.parse_data(frame)!
+        if df.stream_id == 0:
+            fail "http2: DATA frame on stream 0"
+        mut delivered := false
         if let inbox = server.inbox_for(df.stream_id):
-            inbox.send(data_event(df.data, df.end_stream))
-        # flow control counts the whole frame payload; grant the credit back so a
-        # larger request body keeps flowing.
-        replenish(server, df.stream_id, frame.header.length, df.end_stream)
+            if inbox.try_send(data_event(df.data, df.end_stream)):
+                delivered = true
+            else:
+                # never block the single reader task on a stalled stream inbox
+                # (which would deadlock WINDOW_UPDATE reads for streaming handlers).
+                server.reset(df.stream_id, frames.ERROR_ENHANCE_YOUR_CALM)
+        # flow control counts the whole frame payload; replenish the connection
+        # window always, and the stream window only if the stream stayed live.
+        if delivered:
+            replenish(server, df.stream_id, frame.header.length, df.end_stream)
+        else:
+            replenish(server, df.stream_id, frame.header.length, true)
         return true
     if t == frames.FRAME_SETTINGS:
         sf := frames.parse_settings(frame)!
@@ -1143,8 +1194,18 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
         return true
     if t == frames.FRAME_RST_STREAM:
         rs := frames.parse_rst_stream(frame)!
+        if rs.stream_id == 0:
+            fail "http2: RST_STREAM frame on stream 0"
+        mut too_many_resets := false
+        locked server.mu:
+            server.rapid_resets = server.rapid_resets + 1
+            if server.rapid_resets > MAX_RAPID_RESETS:
+                too_many_resets = true
+        if too_many_resets:
+            fail RAPID_RESET_ERROR
         if let inbox = server.inbox_for(rs.stream_id):
-            inbox.send(reset_event(rs.error_code))
+            if not inbox.try_send(reset_event(rs.error_code)):
+                server.forget(rs.stream_id)
         return true
     if t == frames.FRAME_GOAWAY:
         # the client is winding the connection down; stop reading.
@@ -1176,6 +1237,7 @@ fn apply_peer_settings(server: Server, settings: List[frames.Setting]) -> Bool!:
                 server.conn.set_encoder_table_size(capped)
             elif s.id == SETTINGS_MAX_FRAME_SIZE:
                 server.peer_max_frame_size = s.value
+                server.peer_max_frame_atomic.store(s.value)
             elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:
                 delta := s.value - server.peer_initial_window
                 for sid in server.active:
@@ -1276,9 +1338,13 @@ fn header_fields_are_clean(fields: List[hpack.HeaderField]) -> Bool:
 fn validate_header_block(fields: List[hpack.HeaderField], is_trailer: Bool) -> Bool:
     mut seen_regular := false
     mut seen_method := false
+    mut method_val := ""
     mut seen_path := false
     mut seen_scheme := false
     mut seen_authority := false
+    mut authority_val := ""
+    mut seen_host := false
+    mut host_val := ""
     for field in fields:
         if field.name.starts_with(":"):
             if is_trailer or seen_regular:
@@ -1287,6 +1353,7 @@ fn validate_header_block(fields: List[hpack.HeaderField], is_trailer: Bool) -> B
                 if seen_method or not is_http_token(field.value):
                     return false
                 seen_method = true
+                method_val = field.value
             elif field.name == ":path":
                 if seen_path or field.value == "" or not pseudo_value_no_space_or_ctl(field.value):
                     return false
@@ -1299,12 +1366,33 @@ fn validate_header_block(fields: List[hpack.HeaderField], is_trailer: Bool) -> B
                 if seen_authority or not pseudo_value_no_space_or_ctl(field.value):
                     return false
                 seen_authority = true
+                authority_val = field.value
             else:
                 return false
         else:
             seen_regular = true
             if not is_h2_header_name(field.name) or not field_value_is_clean(field.value):
                 return false
+            # RFC 9113 §8.2.2: connection-specific headers are forbidden in HTTP/2,
+            # and `te` may appear only with the exact value `trailers`.
+            if is_hop_by_hop(field.name):
+                return false
+            if field.name == "te" and field.value != "trailers":
+                return false
+            if field.name == "host":
+                if seen_host or not pseudo_value_no_space_or_ctl(field.value):
+                    return false
+                seen_host = true
+                host_val = field.value
+    if not is_trailer:
+        if not seen_method:
+            return false
+        if method_val != "CONNECT":
+            if not seen_path or not seen_scheme:
+                return false
+        # RFC 9113 §8.3.1: if both :authority and host are present, they must agree.
+        if seen_authority and seen_host and authority_val.to_lower() != host_val.to_lower():
+            return false
     return true
 
 # whether a decoded header list stays within the server's size limits, so a giant
@@ -1319,48 +1407,64 @@ fn header_list_within_limits(fields: List[hpack.HeaderField]) -> Bool:
 
 # open (or feed) a request stream from a decoded HEADERS block. a new odd stream
 # id that passes validation gets an inbox and a handler task; a duplicate id feeds
-# the existing stream (trailers). malformed requests and over-cap streams are
-# refused with RST_STREAM.
-fn open_stream(server: Server, hf: frames.HeadersFrame, fields: List[hpack.HeaderField]):
+# the existing stream (trailers). non-monotonic stream ids fail the connection
+# (RFC 9113 §5.1.1); malformed requests and over-cap streams are refused with
+# RST_STREAM.
+fn open_stream(server: Server, hf: frames.HeadersFrame, fields: List[hpack.HeaderField]) -> Bool!:
     stream_id := hf.stream_id
+    if stream_id <= 0:
+        fail "http2: HEADERS frame on invalid stream id"
     # a header block for a stream we already know is the request trailers.
     mut known := false
+    mut last_sid := 0
     locked server.mu:
         known = server.streams.contains_key(stream_id)
-    # refuse a request or trailer block whose headers would splice extra lines
-    # or spoof pseudo-headers when bridged to http/1.1, or whose header list is
-    # over-large, before opening or feeding any stream. the block was already
-    # decoded by the caller, so the shared hpack decoder stays in step even
-    # though we drop the request.
-    if not validate_header_block(fields, known):
-        server.reset(stream_id, frames.ERROR_PROTOCOL_ERROR)
-        return
-    if not header_list_within_limits(fields):
-        server.reset(stream_id, frames.ERROR_ENHANCE_YOUR_CALM)
-        return
+        last_sid = server.last_stream_id
     if known:
+        # RFC 9113 §8.1: a trailing HEADERS frame must end the stream.
+        if not hf.end_stream:
+            server.reset(stream_id, frames.ERROR_PROTOCOL_ERROR)
+            return true
+        if not header_list_within_limits(fields):
+            server.reset(stream_id, frames.ERROR_ENHANCE_YOUR_CALM)
+            return true
+        if not validate_header_block(fields, true):
+            server.reset(stream_id, frames.ERROR_PROTOCOL_ERROR)
+            return true
         if let inbox = server.inbox_for(stream_id):
-            inbox.send(headers_event(fields, hf.end_stream))
-        return
+            if not inbox.try_send(headers_event(fields, hf.end_stream)):
+                server.reset(stream_id, frames.ERROR_ENHANCE_YOUR_CALM)
+        return true
     # client-initiated streams are odd (RFC 9113 §5.1.1); reject anything else.
     if stream_id % 2 == 0:
         server.reset(stream_id, frames.ERROR_PROTOCOL_ERROR)
-        return
-    # a request must carry ":method" and ":path" (RFC 9113 §8.3.1).
-    if pseudo(fields, ":method") == "" or pseudo(fields, ":path") == "":
+        return true
+    # RFC 9113 §5.1.1: newly initiated stream ids must be strictly increasing.
+    if stream_id <= last_sid:
+        fail "http2: stream id is not strictly increasing"
+    # record the stream id before any stream-level rejection so the peer cannot
+    # replay or reuse this id after a reset.
+    locked server.mu:
+        if stream_id > server.last_stream_id:
+            server.last_stream_id = stream_id
+    if not header_list_within_limits(fields):
+        server.reset(stream_id, frames.ERROR_ENHANCE_YOUR_CALM)
+        return true
+    if not validate_header_block(fields, false):
         server.reset(stream_id, frames.ERROR_PROTOCOL_ERROR)
-        return
+        return true
     # enforce the advertised concurrency cap.
     if server.active_count() >= SERVER_MAX_CONCURRENT_STREAMS:
         server.reset(stream_id, frames.ERROR_REFUSED_STREAM)
-        return
+        return true
     inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
     server.register(stream_id, inbox)
     # spawn the handler before delivering the first event: the inbox is buffered,
-    # so the send never blocks the reader waiting for the handler to start.
+    # so try_send succeeds immediately without blocking the reader.
     spawn handle_stream(server, stream_id, inbox)
     if let registered = server.inbox_for(stream_id):
-        registered.send(headers_event(fields, hf.end_stream))
+        registered.try_send(headers_event(fields, hf.end_stream))
+    return true
 
 # grant flow-control credit for consumed body bytes: at the connection level
 # always, and at the stream level while the stream stays open. mirrors the
@@ -1392,6 +1496,8 @@ fn run_reader(server: Server):
         if outcome.is_err:
             if outcome.err == FLOW_CONTROL_OVERFLOW:
                 send_goaway(server, frames.ERROR_FLOW_CONTROL_ERROR)
+            elif outcome.err == RAPID_RESET_ERROR:
+                send_goaway(server, frames.ERROR_ENHANCE_YOUR_CALM)
             else:
                 send_goaway(server, frames.ERROR_PROTOCOL_ERROR)
             break
@@ -1541,14 +1647,15 @@ fn run_connection(conn: ServerConn, handlers: Handlers) -> Bool!:
     conn.send_frame(server_settings_frame()!)!
     outbound := Channel[Outbound](OUTBOUND_CAP)
     closed := AtomicInt(0)
-    writer := spawn writer_loop(conn, outbound, closed)
+    peer_max_frame := AtomicInt(frames.DEFAULT_MAX_FRAME_SIZE)
+    writer := spawn writer_loop(conn, outbound, closed, peer_max_frame)
     streams: Map[Int, Channel[StreamEvent]] := {}
     ids: List[Int] := []
     send_windows: Map[Int, Int] := {}
     credit: Map[Int, Channel[Int]] := {}
     # the send side starts at http/2's defaults; the client's SETTINGS (its first
     # frame) revises the initial window and max frame size before any stream opens.
-    server := Server(conn, handlers, outbound, closed, streams, ids, 0, DEFAULT_INITIAL_WINDOW, frames.DEFAULT_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW, send_windows, credit)
+    server := Server(conn, handlers, outbound, closed, peer_max_frame, streams, ids, 0, 0, DEFAULT_INITIAL_WINDOW, frames.DEFAULT_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW, send_windows, credit)
     # the wind-down watches the shutdown flag for this connection's whole life and
     # stops when the connection does, so it is spawned rather than awaited.
     spawn drain_watch(server)
@@ -1609,6 +1716,8 @@ fn serve_h2_tls_session(tls_conn: tls.Conn, handlers: Handlers):
     if tls_conn.negotiated_protocol() != "h2":
         tls_conn.close()
         return
+    if tls_conn.socket() > 0:
+        tcp_set_timeout(tls_conn.socket(), CONNECTION_TIMEOUT_MS)
     conn := new_tls_server_conn(tls_conn)
     run_connection(conn, handlers) catch false
     conn.close()
@@ -1766,7 +1875,7 @@ fn test_server_with(conn: ServerConn, handlers: Handlers) -> Server:
     ids: List[Int] := []
     send_windows: Map[Int, Int] := {}
     credit: Map[Int, Channel[Int]] := {}
-    return Server(conn, handlers, Channel[Outbound](OUTBOUND_CAP), AtomicInt(0), streams, ids, 0, DEFAULT_INITIAL_WINDOW, frames.DEFAULT_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW, send_windows, credit)
+    return Server(conn, handlers, Channel[Outbound](OUTBOUND_CAP), AtomicInt(0), AtomicInt(frames.DEFAULT_MAX_FRAME_SIZE), streams, ids, 0, 0, DEFAULT_INITIAL_WINDOW, frames.DEFAULT_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW, send_windows, credit)
 
 # the ":status" of a decoded response header list, or 0 when absent.
 fn find_status(fields: List[hpack.HeaderField]) -> Int:
@@ -1867,9 +1976,9 @@ test "a client PING is answered with a PING ack carrying the same payload":
 
 test "open_stream refuses an even stream id with RST_STREAM":
     server := test_server(server_conn_from_bytes(bytes.empty()))
-    fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/")]
+    fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "http")]
     hf := frames.parse_headers(frames.headers_frame(2, encode_block(fields), true, true))!
-    open_stream(server, hf, fields)
+    open_stream(server, hf, fields)!
     opt := server.outbound.try_recv()
     assert(opt != none)
     item := opt.unwrap_or(raw_item(bytes.empty()))
@@ -1880,7 +1989,7 @@ test "open_stream refuses a request missing :path with RST_STREAM":
     server := test_server(server_conn_from_bytes(bytes.empty()))
     fields := [hpack.header_field(":method", "GET"), hpack.header_field(":scheme", "http")]
     hf := frames.parse_headers(frames.headers_frame(1, encode_block(fields), true, true))!
-    open_stream(server, hf, fields)
+    open_stream(server, hf, fields)!
     opt := server.outbound.try_recv()
     assert(opt != none)
     item := opt.unwrap_or(raw_item(bytes.empty()))
@@ -1901,9 +2010,9 @@ test "open_stream refuses a header value carrying a CRLF injection with RST_STRE
     # a value that, if concatenated into an http/1.1 head, would splice a new
     # header line — exactly the request-smuggling vector the guard closes.
     evil := "keep" + chr(13) + chr(10) + "x-injected: yes"
-    fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field("x-note", evil)]
+    fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "http"), hpack.header_field("x-note", evil)]
     hf := frames.parse_headers(frames.headers_frame(1, encode_block(fields), true, true))!
-    open_stream(server, hf, fields)
+    open_stream(server, hf, fields)!
     # rejected with a stream error, and no stream was opened for it.
     opt := server.outbound.try_recv()
     assert(opt != none)
@@ -1915,7 +2024,7 @@ test "open_stream refuses a header value carrying a CRLF injection with RST_STRE
 
 test "open_stream refuses an over-large header list with RST_STREAM":
     server := test_server(server_conn_from_bytes(bytes.empty()))
-    mut fields: List[hpack.HeaderField] := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/")]
+    mut fields: List[hpack.HeaderField] := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "http")]
     # push the field count past MAX_HEADER_COUNT so the size guard trips.
     mut n := 0
     while n <= MAX_HEADER_COUNT:
@@ -1923,7 +2032,7 @@ test "open_stream refuses an over-large header list with RST_STREAM":
         n = n + 1
     assert(not header_list_within_limits(fields))
     hf := frames.parse_headers(frames.headers_frame(1, encode_block(fields), true, true))!
-    open_stream(server, hf, fields)
+    open_stream(server, hf, fields)!
     opt := server.outbound.try_recv()
     assert(opt != none)
     item := opt.unwrap_or(raw_item(bytes.empty()))
@@ -2340,3 +2449,106 @@ test "response_fields emits repeated headers from HttpResponse.add_header":
     assert_eq(cookies.len(), 2)
     assert_eq(cookies[0], "s=1")
     assert_eq(cookies[1], "s=2")
+
+test "http2 server rejects stream-0 DATA, non-monotonic stream ids, rapid resets, and full-inbox deadlock":
+    # 1. Stream-0 DATA fails with PROTOCOL_ERROR rather than replenishing window 0.
+    s1 := test_server(server_conn_from_bytes(bytes.empty()))
+    assert(handle_frame(s1, frames.data_frame(0, bytes.from_string_utf8("x"), false)).is_err)
+    assert(s1.outbound.try_recv() == none)
+
+    # 2. Non-monotonic stream id (lower or already-closed) fails the connection (RFC 9113 §5.1.1).
+    s2 := test_server(server_conn_from_bytes(bytes.empty()))
+    req_fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "example.com")]
+    open_stream(s2, frames.parse_headers(frames.headers_frame(5, encode_block(req_fields), true, true))!, req_fields)!
+    assert(open_stream(s2, frames.parse_headers(frames.headers_frame(3, encode_block(req_fields), true, true))!, req_fields).is_err)
+    s2.forget(5)
+    assert(open_stream(s2, frames.parse_headers(frames.headers_frame(5, encode_block(req_fields), true, true))!, req_fields).is_err)
+    s2.shutdown_streams()
+
+    # 3. Rapid Reset flood trips RAPID_RESET_ERROR -> GOAWAY(ENHANCE_YOUR_CALM).
+    s3 := test_server(server_conn_from_bytes(bytes.empty()))
+    mut r := 0
+    mut tripped := false
+    while r <= MAX_RAPID_RESETS + 2:
+        res := handle_frame(s3, frames.rst_stream_frame(1, frames.ERROR_CANCEL)!)
+        if res.is_err:
+            assert_eq(res.err, RAPID_RESET_ERROR)
+            tripped = true
+            break
+        r = r + 1
+    assert(tripped)
+
+    # 4. Full stream inbox resets the stalled stream instead of blocking handle_frame.
+    s4 := test_server(server_conn_from_bytes(bytes.empty()))
+    tiny := Channel[StreamEvent](1)
+    s4.register(1, tiny)
+    tiny.try_send(data_event(bytes.from_string_utf8("fill"), false))
+    handle_frame(s4, frames.data_frame(1, bytes.from_string_utf8("overflow"), false))!
+    assert_eq(s4.active_count(), 0)
+
+test "http2 request validation enforces :scheme, host/:authority agreement, forbidden headers, and trailer END_STREAM":
+    # missing :scheme rejected
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/")]))
+    # conflicting :authority and host rejected
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", "a.example"), hpack.header_field("host", "b.example")]))
+    # matching :authority and host accepted, and build_request emits Host only once
+    matching := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", "a.example"), hpack.header_field("host", "A.EXAMPLE")]
+    assert(header_fields_are_clean(matching))
+    req_both := build_request(matching, bytes.empty())!
+    assert_eq(req_both.header_values("host").len(), 1)
+    assert_eq(req_both.header_or("host", ""), "a.example")
+    # omitted :authority falls back cleanly to regular host header without blank duplicate
+    host_only := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "https"), hpack.header_field("host", "only.example")]
+    assert(header_fields_are_clean(host_only))
+    req_host := build_request(host_only, bytes.empty())!
+    assert_eq(req_host.header_values("host").len(), 1)
+    assert_eq(req_host.header_or("host", ""), "only.example")
+    # forbidden connection-specific headers and non-trailers TE rejected
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "https"), hpack.header_field("transfer-encoding", "chunked")]))
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "https"), hpack.header_field("connection", "keep-alive")]))
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "https"), hpack.header_field("te", "gzip")]))
+    assert(header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field(":scheme", "https"), hpack.header_field("te", "trailers")]))
+    # trailers without END_STREAM are reset with PROTOCOL_ERROR
+    s := test_server(server_conn_from_bytes(bytes.empty()))
+    inbox := Channel[StreamEvent](4)
+    s.register(1, inbox)
+    trailer_hf := frames.parse_headers(frames.headers_frame(1, encode_block([hpack.header_field("x-tail", "1")]), false, true))!
+    open_stream(s, trailer_hf, [hpack.header_field("x-tail", "1")])!
+    assert_eq(s.active_count(), 0)
+
+test "send_headers_bounded splits large response headers into HEADERS and CONTINUATION frames":
+    conn := server_conn_from_bytes(bytes.empty())
+    mut big_fields: List[hpack.HeaderField] := [hpack.header_field(":status", "200")]
+    big_val := "v".repeat(1000)
+    mut i := 0
+    while i < 24:
+        big_fields.push(hpack.header_field("x-hdr-" + i.to_string(), big_val))
+        i = i + 1
+    send_headers_bounded(conn, 1, big_fields, true, frames.DEFAULT_MAX_FRAME_SIZE)!
+    reader := binary.reader(conn.sent_bytes())
+    f1 := frames.read_frame(reader, frames.DEFAULT_MAX_FRAME_SIZE)!
+    assert_eq(f1.header.frame_type, frames.FRAME_HEADERS)
+    hf := frames.parse_headers(f1)!
+    assert(hf.end_stream)
+    assert(not hf.end_headers)
+    assert(f1.payload.len() <= frames.DEFAULT_MAX_FRAME_SIZE)
+    assembled := bytes.buffer()
+    defer assembled.free()
+    assembled.write(hf.block_fragment)!
+    mut cont_count := 0
+    mut done := hf.end_headers
+    while not done:
+        fc := frames.read_frame(reader, frames.DEFAULT_MAX_FRAME_SIZE)!
+        assert_eq(fc.header.frame_type, frames.FRAME_CONTINUATION)
+        assert_eq(fc.header.stream_id, 1)
+        assert(fc.payload.len() <= frames.DEFAULT_MAX_FRAME_SIZE)
+        cf := frames.parse_continuation(fc)!
+        assembled.write(cf.block_fragment)!
+        done = cf.end_headers
+        cont_count = cont_count + 1
+    assert(cont_count >= 1)
+    assert_eq(binary.remaining(reader), 0)
+    dec := hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE)
+    decoded := dec.decode(assembled.bytes())!
+    assert_eq(decoded.len(), big_fields.len())
+    assert_eq(find_status(decoded), 200)

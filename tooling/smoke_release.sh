@@ -34,5 +34,9 @@ pith build hello.pith
 test "$(./hello)" = "hello, PITH"
 pith test hello.pith
 pith fmt hello.pith > /dev/null
-test "$(pith doc markdown | head -n 1)" = "# markdown"
+pith lint hello.pith > /dev/null
+test "$(pith doc markdown | head -n 1)" = "# Markdown"
+pith doc search json | grep -q "std.json"
+pith new myapp
+(cd myapp && pith package check && pith package test)
 echo "smoke ok"

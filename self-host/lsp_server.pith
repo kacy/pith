@@ -36,6 +36,7 @@ mut exit_code := 0
 # when set, analysis runs inside the didOpen/didChange/didSave handler
 # instead of on the debounce timeout.
 mut no_debounce := false
+mut server_version := "0.2.16"
 
 # ---------------------------------------------------------------
 # output
@@ -119,7 +120,7 @@ fn handle_initialize(m: Message):
     json.object_set(caps, "workspaceSymbolProvider", json.make_bool(true))
     info := json.make_object()
     json.object_set(info, "name", json.make_string("pith-lsp"))
-    json.object_set(info, "version", json.make_string("0.1.0"))
+    json.object_set(info, "version", json.make_string(server_version))
     result := json.make_object()
     json.object_set(result, "capabilities", caps)
     json.object_set(result, "serverInfo", info)
@@ -501,7 +502,9 @@ fn debounced_analysis():
 ## run the language server over stdio until the client says exit or
 ## the stream closes. returns the process exit code: 0 after a proper
 ## shutdown/exit handshake, 1 otherwise.
-pub fn run_lsp_server() -> Int:
+pub fn run_lsp_server(version: String) -> Int:
+    if version != "":
+        server_version = version
     no_debounce = env("PITH_LSP_NO_DEBOUNCE") == "1"
     # a server checks the same closure per keystroke; keep the imports
     # between runs (see the closure cache in check_pipeline)

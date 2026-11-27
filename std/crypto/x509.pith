@@ -36,8 +36,9 @@ OID_BASIC_CONSTRAINTS := "2.5.29.19"
 OID_KEY_USAGE := "2.5.29.15"
 OID_EXTENDED_KEY_USAGE := "2.5.29.37"
 OID_NAME_CONSTRAINTS := "2.5.29.30"
-# extendedKeyUsage purpose ids we recognise for a tls server certificate.
+# extendedKeyUsage purpose ids we recognise for tls server and client certificates.
 OID_SERVER_AUTH := "1.3.6.1.5.5.7.3.1"
+OID_CLIENT_AUTH := "1.3.6.1.5.5.7.3.2"
 OID_ANY_EKU := "2.5.29.37.0"
 
 # one der tag-length-value entry.
@@ -628,6 +629,19 @@ fn leaf_permits_server_auth(cert: Certificate) -> Bool:
             return true
     return false
 
+# a tls client leaf may carry an extendedKeyUsage extension. when it does, it
+# must allow clientAuth (or anyExtendedKeyUsage); a cert that lists only
+# serverAuth, emailProtection, codeSigning, etc. is being misused as a client
+# certificate and is rejected. an absent eku extension permits any purpose per
+# rfc 5280, so those certs pass.
+fn leaf_permits_client_auth(cert: Certificate) -> Bool:
+    if not cert.has_eku:
+        return true
+    for oid in cert.eku_oids:
+        if oid == OID_CLIENT_AUTH or oid == OID_ANY_EKU:
+            return true
+    return false
+
 # rfc 5280 dnsname constraint match: a constraint of "example.com" matches
 # "example.com" and any subdomain; a leading-dot constraint (".example.com")
 # matches subdomains only. an empty constraint matches everything.
@@ -917,6 +931,7 @@ pub EXPIRED_REASON := "certificate is expired or not yet valid"
 ## The reason a chain that never reaches a trusted root is refused.
 pub UNTRUSTED_ISSUER_REASON := "certificate issuer is not trusted"
 EKU_REASON := "certificate is not valid for tls server authentication"
+CLIENT_EKU_REASON := "certificate is not valid for tls client authentication"
 NAME_CONSTRAINT_REASON := "certificate name is outside a ca name constraint"
 KEY_USAGE_REASON := "certificate issuer is not permitted to sign certificates"
 LEAF_KEY_USAGE_REASON := "certificate key usage does not permit digital signatures"
@@ -1102,6 +1117,8 @@ pub fn verify_client_chain(chain: List[Certificate], trusted_roots: List[Certifi
         return VerificationResult(false, true, false, false, false, "certificate chain is empty")
     if trusted_roots.len() == 0:
         return VerificationResult(false, true, false, false, false, "trusted roots are empty")
+    if not leaf_permits_client_auth(chain[0]):
+        return VerificationResult(false, true, false, false, false, CLIENT_EKU_REASON)
     if not leaf_permits_signing(chain[0]):
         return VerificationResult(false, true, false, false, false, LEAF_KEY_USAGE_REASON)
     return verify_chain_issuers(chain, trusted_roots, true)
@@ -1148,6 +1165,28 @@ test "x509 rejects a clientauth-only leaf used as a server certificate":
     # real chain that we reject only for the wrong purpose.
     client := verify_client_chain([leaf], [ca])
     assert(client.ok)
+
+test "x509 rejects a serverauth-only leaf used as a client certificate":
+    # this leaf chains to its ca and passes server verification, but its
+    # extendedKeyUsage lists only serverAuth. it must not verify as an mtls
+    # client certificate.
+    leaf := parse_pem(read_file("tests/live/fixtures/nc-good-leaf.crt")!)!
+    ca := parse_pem(read_file("tests/live/fixtures/nc-ca.crt")!)!
+
+    assert(leaf.has_eku)
+    assert(leaf.eku_oids.contains(OID_SERVER_AUTH))
+    assert(not leaf.eku_oids.contains(OID_CLIENT_AUTH))
+
+    server := verify_server_chain([leaf], [ca], "good.example.com")
+    assert(server.ok)
+
+    client := verify_client_chain([leaf], [ca])
+    assert(not client.ok)
+    assert_eq(client.reason, CLIENT_EKU_REASON)
+
+    # a certificate with no eku extension permits any purpose per rfc 5280.
+    assert(not ca.has_eku)
+    assert(leaf_permits_client_auth(ca))
 
 test "x509 accepts a serverauth leaf and an eku-less leaf":
     # localhost.crt carries a serverAuth eku and must be accepted.

@@ -51,6 +51,8 @@ jobs:
           fi
 
       - name: package
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
         run: sh tooling/package_release.sh
 
       - name: smoke test the package
@@ -87,6 +89,6 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "pith ${TAG#v}" --notes ""
+            gh release create "$TAG" --verify-tag --title "pith ${TAG#v}" --generate-notes
           fi
           gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 install.sh --clobber

@@ -24,11 +24,26 @@ case "$(uname -m)" in
 esac
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+if [ -n "${RELEASE_TAG:-}" ] && [ "v$version" != "$RELEASE_TAG" ]; then
+    echo "error: Cargo.toml version ($version) does not match RELEASE_TAG ($RELEASE_TAG)" >&2
+    exit 1
+fi
 asset="pith-$os-$arch"
 stage="dist/pith-$version-$os-$arch"
 
-cargo build --release
+cargo build --release --locked
 make self-host-ir-driver self-host
+
+cli_version=$(./target/release/pith version)
+self_host_version=$(./self-host/pith_main version)
+if [ "$cli_version" != "pith $version" ]; then
+    echo "error: target/release/pith version ($cli_version) != pith $version" >&2
+    exit 1
+fi
+if [ "$self_host_version" != "pith $version (self-hosted)" ]; then
+    echo "error: self-host/pith_main version ($self_host_version) != pith $version (self-hosted)" >&2
+    exit 1
+fi
 
 rm -rf "$stage" "dist/$asset.tar.gz" "dist/$asset.tar.gz.sha256"
 mkdir -p "$stage/bin" "$stage/lib"

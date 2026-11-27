@@ -681,7 +681,11 @@ struct PithClosure {
     magic: u32,
     func_ptr: i64,
     ref_count: std::sync::atomic::AtomicI64,
-    env: [i64; PITH_CLOSURE_ENV_SLOTS],
+    // inline capture slots; left uninitialized on allocation (matching
+    // `closure_stack` in codegen) so `pith_closure_new` avoids zeroing 128 B
+    // on every construction. each slot is written before the closure body
+    // reads it, and capture walkers check `env_tags` before touching `env`.
+    env: [std::mem::MaybeUninit<i64>; PITH_CLOSURE_ENV_SLOTS],
     env_tags: [u8; PITH_CLOSURE_ENV_SLOTS],
     // bit 0: this closure sits in the cycle collector's suspect buffer.
     // bit 7: shared (`share::CONTAINER_SHARED_FLAG`). codegen zeroes this
@@ -727,18 +731,29 @@ impl PithClosure {
         &mut overflow.captures[idx]
     }
 
-    /// Every capture in walk order (inline slots 0..PITH_CLOSURE_ENV_SLOTS
-    /// first, then the spill in index order) as (value, tag) pairs. the
-    /// three capture walkers (the release walk, the cycle child scan, and
-    /// the cycle env release) all iterate through here, so none of them
-    /// can disagree about the order or forget the spill.
+    /// Every tagged (refcounted) capture in walk order (inline slots
+    /// 0..PITH_CLOSURE_ENV_SLOTS first, then the spill in index order) as
+    /// (value, tag) pairs. Only slots with a nonzero tag are read, because
+    /// unwritten inline `env` slots remain uninitialized.
     fn captures(&self) -> impl Iterator<Item = (i64, u8)> + '_ {
         self.env
             .iter()
-            .copied()
             .zip(self.env_tags.iter().copied())
+            .filter_map(|(value, tag)| {
+                if tag != 0 {
+                    // SAFETY: a nonzero tag is only written by `pith_closure_set_env_rc`
+                    // (or codegen) alongside an initialized `value`.
+                    Some((unsafe { value.assume_init() }, tag))
+                } else {
+                    None
+                }
+            })
             .chain(self.overflow.iter().flat_map(|overflow| {
-                overflow.captures.iter().map(|c| (c.value, c.tag))
+                overflow
+                    .captures
+                    .iter()
+                    .filter(|c| c.tag != 0)
+                    .map(|c| (c.value, c.tag))
             }))
     }
 
@@ -754,8 +769,9 @@ impl PithClosure {
             for (value, tag) in self.env.iter().zip(self.env_tags.iter()) {
                 if *tag != 0 {
                     // SAFETY: a nonzero tag marks a slot that holds one count
-                    // on a value of that kind, taken when it was captured.
-                    unsafe { release_captured_value(*value, *tag) };
+                    // on a value of that kind, taken when it was captured, so
+                    // `value` was initialized alongside `*tag`.
+                    unsafe { release_captured_value(value.assume_init(), *tag) };
                 }
             }
         }
@@ -769,7 +785,7 @@ impl PithClosure {
         }
     }
 
-    /// Copy every capture out in walk order and blank the slots so a later
+    /// Copy every tagged capture out in walk order and blank the slots so a later
     /// shell free (or cyclic back-edge release) can never release them a
     /// second time.
     fn take_captures(&mut self) -> ([Capture; PITH_CLOSURE_ENV_SLOTS], Vec<Capture>) {
@@ -779,12 +795,14 @@ impl PithClosure {
             .zip(self.env.iter_mut())
             .zip(self.env_tags.iter_mut())
         {
-            *dst = Capture {
-                value: *value,
-                tag: *tag,
-            };
-            *value = 0;
-            *tag = 0;
+            let t = *tag;
+            if t != 0 {
+                // SAFETY: a nonzero tag guarantees `value` was initialized.
+                let v = unsafe { value.assume_init() };
+                *dst = Capture { value: v, tag: t };
+                *value = std::mem::MaybeUninit::new(0);
+                *tag = 0;
+            }
         }
         let spill = match &mut self.overflow {
             Some(overflow) => {
@@ -884,21 +902,32 @@ pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
     if !pooled.is_null() {
         let ptr = pooled as *mut PithClosure;
         // SAFETY: `pooled` is an unowned recycled `PithClosure` allocation.
-        unsafe { ptr.write(fresh_closure(func_ptr)) };
+        unsafe { init_closure_header(ptr, func_ptr) };
         return ptr as i64;
     }
-    Box::into_raw(Box::new(fresh_closure(func_ptr))) as i64
+    let mut boxed = Box::<PithClosure>::new_uninit();
+    // SAFETY: `init_closure_header` initializes every field except `env`, whose
+    // `MaybeUninit<i64>` elements require no initialization.
+    unsafe {
+        init_closure_header(boxed.as_mut_ptr(), func_ptr);
+        Box::into_raw(boxed.assume_init()) as i64
+    }
 }
 
-fn fresh_closure(func_ptr: i64) -> PithClosure {
-    PithClosure {
-        magic: CLOSURE_MAGIC,
-        func_ptr,
-        ref_count: std::sync::atomic::AtomicI64::new(1),
-        env: [0; PITH_CLOSURE_ENV_SLOTS],
-        env_tags: [0; PITH_CLOSURE_ENV_SLOTS],
-        cycle_flags: std::sync::atomic::AtomicU8::new(0),
-        overflow: None,
+/// Initialize a closure shell's header and tag table without zeroing the 128 B
+/// inline `env` array. Matches the invariant codegen already relies on for
+/// stack-built closures (`closure_stack`): callers write every inline slot they
+/// later read, and release/cycle walks gate on `env_tags` (zeroed here).
+#[inline(always)]
+unsafe fn init_closure_header(ptr: *mut PithClosure, func_ptr: i64) {
+    // SAFETY: Caller guarantees `ptr` points to writable memory for `PithClosure`.
+    unsafe {
+        std::ptr::addr_of_mut!((*ptr).magic).write(CLOSURE_MAGIC);
+        std::ptr::addr_of_mut!((*ptr).func_ptr).write(func_ptr);
+        std::ptr::addr_of_mut!((*ptr).ref_count).write(std::sync::atomic::AtomicI64::new(1));
+        std::ptr::addr_of_mut!((*ptr).env_tags).write([0; PITH_CLOSURE_ENV_SLOTS]);
+        std::ptr::addr_of_mut!((*ptr).cycle_flags).write(std::sync::atomic::AtomicU8::new(0));
+        std::ptr::addr_of_mut!((*ptr).overflow).write(None);
     }
 }
 
@@ -1175,7 +1204,9 @@ pub unsafe extern "C" fn pith_closure_get_fn(handle: i64) -> i64 {
 #[inline(always)]
 fn closure_set_env_impl(closure: &mut PithClosure, slot: EnvSlot, value: i64) {
     match slot {
-        EnvSlot::Inline(idx) => closure.env[idx] = value,
+        EnvSlot::Inline(idx) => {
+            closure.env[idx].write(value);
+        }
         EnvSlot::Spill(idx) => closure.spill_capture(idx).value = value,
     }
 }
@@ -1193,7 +1224,7 @@ pub unsafe extern "C" fn pith_closure_set_env(handle: i64, slot: i64, value: i64
 fn closure_set_env_rc_impl(closure: &mut PithClosure, slot: EnvSlot, value: i64, tag: u8) {
     match slot {
         EnvSlot::Inline(idx) => {
-            closure.env[idx] = value;
+            closure.env[idx].write(value);
             closure.env_tags[idx] = tag;
         }
         EnvSlot::Spill(idx) => {
@@ -1220,11 +1251,12 @@ pub unsafe extern "C" fn pith_closure_set_env_rc(handle: i64, slot: i64, value: 
 }
 
 #[inline(always)]
-fn closure_get_env_impl(closure: &PithClosure, slot: EnvSlot) -> i64 {
+unsafe fn closure_get_env_impl(closure: &PithClosure, slot: EnvSlot) -> i64 {
     match slot {
-        EnvSlot::Inline(idx) => closure.env[idx],
-        // an unwritten (or never-spilled) slot answers 0, like an
-        // unwritten inline slot
+        // SAFETY: Caller guarantees inline slots are written during construction
+        // before the closure body reads them (same invariant as `closure_stack`).
+        EnvSlot::Inline(idx) => unsafe { closure.env[idx].assume_init() },
+        // an unwritten (or never-spilled) slot answers 0
         EnvSlot::Spill(idx) => closure
             .overflow
             .as_ref()
@@ -1233,6 +1265,12 @@ fn closure_get_env_impl(closure: &PithClosure, slot: EnvSlot) -> i64 {
     }
 }
 
+/// Read a captured slot value.
+///
+/// # Safety
+/// `handle` must be a valid closure handle or garbage (magic-checked), and any
+/// inline slot `0..PITH_CLOSURE_ENV_SLOTS` read from a valid handle must have
+/// been initialized during closure construction.
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_get_env(handle: i64, slot: i64) -> i64 {
     let Some(slot) = EnvSlot::classify(slot) else {
@@ -1860,6 +1898,35 @@ mod tests {
             );
             pith_closure_release(handle);
             assert_eq!(struct_counts(s).0, 1, "spilled capture was not released");
+            pith_struct_release(s);
+        }
+    }
+
+    // a recycled closure shell keeps stale bytes in `env` (we skip zeroing
+    // 128 B on construction), but zeroes `env_tags` so an overwritten or
+    // untouched slot can never double-release an older closure's RC capture.
+    #[test]
+    fn recycled_closure_clears_tags_without_zeroing_env() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_retain(s); // owned by first closure
+            assert_eq!(struct_counts(s).0, 2);
+
+            let first = pith_closure_new(11);
+            pith_closure_set_env(first, 0, 100);
+            pith_closure_set_env_rc(first, 1, s, CLOSURE_TAG_STRUCT as i64);
+            pith_closure_release(first);
+            assert_eq!(struct_counts(s).0, 1, "first closure released its capture");
+
+            // allocate a second closure (recycles `first`'s shell when pooled),
+            // write only slot 0, and release: slot 1's tag must be 0 so `s` is
+            // not released a second time.
+            let second = pith_closure_new(22);
+            pith_closure_set_env(second, 0, 200);
+            assert_eq!(pith_closure_get_fn(second), 22);
+            assert_eq!(pith_closure_get_env(second, 0), 200);
+            pith_closure_release(second);
+            assert_eq!(struct_counts(s).0, 1, "stale slot tag must not double-release");
             pith_struct_release(s);
         }
     }

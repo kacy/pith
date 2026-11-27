@@ -1,0 +1,36 @@
+# Regression test for #1508: comparing self-referential generic structs or
+# enums structurally must not recurse infinitely and overflow the checker stack.
+
+struct Vault[T]:
+    inner: T
+    tag: String
+    peer: T?
+    next: Vault[T]?
+
+enum Chain[T]:
+    Nil
+    Cons(T, Chain[T]?)
+
+fn wrap[T](v: T) -> Vault[T]:
+    return Vault(v, "w", none, none)
+
+fn head_chain[T](v: T) -> Chain[T]:
+    return Chain.Cons(v, none)
+
+fn main():
+    a := wrap[String]("hello")
+    b := wrap(42)
+    c := Vault[Int](55, "child", b.peer, b)
+    print("{a.inner}:{b.inner}:{c.inner}")
+    match c.next:
+        nx => print("next:{nx.tag}:{nx.inner}")
+        none => print("none")
+
+    ch1 := head_chain("x")
+    ch2 := Chain.Cons(7, head_chain(9))
+    match ch1:
+        Chain.Cons(v, _) => print("ch1:{v}")
+        Chain.Nil => print("nil")
+    match ch2:
+        Chain.Cons(v, _) => print("ch2:{v}")
+        Chain.Nil => print("nil")

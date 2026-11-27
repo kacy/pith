@@ -1821,7 +1821,7 @@ impl BlockParser:
     # as many cells. the lines before that one stay a paragraph. a paragraph
     # whose last line has the wrong number of cells is not tried again.
     fn start_table(container: Int) -> Int:
-        if self.kind_of(container) != BlockKind.Paragraph or container == self.table_refused:
+        if self.kind_of(container) != BlockKind.Paragraph or container == self.table_refused or self.lines.len() == 0:
             return 0
         alignments := delimiter_row(self.source, self.line_start + self.next_nonspace, self.line_end)
         if alignments == "":
@@ -2917,10 +2917,13 @@ fn email_links(line: String) -> List[Int]:
             while sign + link_end < length:
                 c := ord(line[sign + link_end])
                 if c == 64:
-                    # another `@`: start over from it, keeping what the
-                    # search has seen, as cmark-gfm does.
+                    # another `@`: start over from it, resetting scheme and dot
+                    # state from the abandoned candidate.
                     offset += max_rewind + 1
                     max_rewind = link_end - 1
+                    dots = 0
+                    mailto = true
+                    xmpp = false
                     searching = true
                     break
                 if c == 46 and sign + link_end + 1 < length and is_ascii_alphanumeric(ord(line[sign + link_end + 1])):
@@ -2994,7 +2997,9 @@ fn is_disallowed_tag(content: String, at: Int) -> Bool:
     if name_end == name_start or name_end >= length:
         return false
     c := ord(content[name_end])
-    closes := is_ascii_whitespace(c) or c == 62 or (c == 47 and name_end + 1 < length and ord(content[name_end + 1]) == 62)
+    # html5 §13.2.5.6 and gfm §6.11 treat `/` as terminating the tag name even
+    # when followed by attributes (e.g. `<script/src=...>`), not only `/>`.
+    closes := is_ascii_whitespace(c) or c == 62 or c == 47
     return closes and DISALLOWED_TAGS.contains(" " + content.substring(name_start, name_end).to_lower() + " ")
 
 fn is_email_local_char(c: Int) -> Bool:
@@ -4400,6 +4405,8 @@ test "the tag filter escapes disallowed raw html":
     allowed := options().allow_html(true)
     assert_eq(render("<script>x</script> <em>y</em> <TITLE> </style >", allowed), "&lt;script>x&lt;/script> <em>y</em> &lt;TITLE> &lt;/style >\n")
     assert_eq(render("a <iframe src=x> <xmp/> <plaintext>", allowed), "<p>a &lt;iframe src=x> &lt;xmp/> &lt;plaintext></p>\n")
+    assert_eq(render("<div><script/src=https://example.test/x.js></script/x></div>", allowed), "<div>&lt;script/src=https://example.test/x.js>&lt;/script/x></div>\n")
+    assert_eq(render("<div><iframe/onload=alert(1)></div>", allowed), "<div>&lt;iframe/onload=alert(1)></div>\n")
     assert_eq(render("a <titles> <scripts>", allowed), "<p>a <titles> <scripts></p>\n")
     assert_eq(render("<script>x</script>", allowed.gfm(false)), "<script>x</script>\n")
 
@@ -4418,3 +4425,18 @@ test "short table rows are padded within a budget":
     assert(rows > 1)
     assert(rows < 100)
     assert(page.len() < 3000000)
+
+test "reference definition followed by setext dash does not crash table start":
+    # [a]: /u consumes the whole paragraph in start_setext_heading, leaving
+    # self.lines empty before start_table sees `-` as a table delimiter row.
+    assert_eq(to_html("[a]: /u\n-"), "<p>-</p>\n")
+    assert_eq(to_html("[a]: /u\n--"), "<p>--</p>\n")
+    assert_eq(to_html("[a]: /u\n---"), "<hr />\n")
+    assert_eq(to_html("[a]: /u\n="), "<p>=</p>\n")
+
+test "email autolink resets scheme state across a second at-sign":
+    page := to_html("mailto:a@b.c@d.e")
+    assert(not page.contains("href=\"b.c@d.e\""))
+    assert(page.contains("href=\"mailto:b.c@d.e\""))
+    # dots from the abandoned domain must not validate a dotless second domain
+    assert_eq(to_html("a@b.c@d"), "<p>a@b.c@d</p>\n")

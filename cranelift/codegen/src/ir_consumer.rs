@@ -451,7 +451,12 @@ fn bits_builtin_op(builtin: &str) -> Option<&'static str> {
 // exact shape the emitter produces (two param loads, the builtin call on
 // them, the return, and the emitter's dead fallthrough tail), so an edited
 // wrapper simply stops matching and keeps its call semantics.
-fn detect_bits_wrapper(param_names: &[String], body_lines: &[&str]) -> Option<&'static str> {
+fn detect_bits_wrapper(
+    param_names: &[String],
+    body_lines: &[&str],
+    declared_funcs: &HashMap<String, FuncId>,
+    global_data: &HashMap<String, DataId>,
+) -> Option<&'static str> {
     if param_names.len() != 2 {
         return None;
     }
@@ -476,6 +481,14 @@ fn detect_bits_wrapper(param_names: &[String], body_lines: &[&str]) -> Option<&'
         || c[4] != "2"
         || c[5] != a[1]
         || c[6] != b[1]
+    {
+        return None;
+    }
+    // Never alias a builtin name that is shadowed by a user function, parameter,
+    // or global closure in this module.
+    if declared_funcs.contains_key(c[2])
+        || global_data.contains_key(c[2])
+        || param_names.iter().any(|n| n == c[2])
     {
         return None;
     }
@@ -2633,7 +2646,12 @@ pub fn compile_from_ir(
     // the wrappers in the stream.
     let mut bits_aliases: HashMap<String, &'static str> = HashMap::new();
     for function in &functions {
-        if let Some(op) = detect_bits_wrapper(&function.params, &function.body) {
+        if let Some(op) = detect_bits_wrapper(
+            &function.params,
+            &function.body,
+            &declared_funcs,
+            &global_data,
+        ) {
             bits_aliases.entry(function.name.to_string()).or_insert(op);
         }
     }
@@ -2658,17 +2676,17 @@ pub fn compile_from_ir(
             continue;
         }
         compiled_funcs.insert(func_name.clone());
-        let fused = fuse_concat_chains(&body_lines);
+        let fused = fuse_concat_chains(&body_lines, param_names, &declared_funcs, &global_data);
         let body_lines: Vec<&str> = match &fused {
             Some(lines) => lines.iter().map(String::as_str).collect(),
             None => body_lines,
         };
-        let appended = fuse_self_appends(&body_lines);
+        let appended = fuse_self_appends(&body_lines, &global_data);
         let body_lines: Vec<&str> = match &appended {
             Some(lines) => lines.iter().map(String::as_str).collect(),
             None => body_lines,
         };
-        let with_ints = fuse_int_parts(&body_lines);
+        let with_ints = fuse_int_parts(&body_lines, param_names, &declared_funcs, &global_data);
         let body_lines: Vec<&str> = match &with_ints {
             Some(lines) => lines.iter().map(String::as_str).collect(),
             None => body_lines,
@@ -2872,7 +2890,12 @@ impl cranelift::codegen::inline::Inline for SmallFnInliner<'_> {
 /// the chain's parts that sat inside the chain moves to just after the
 /// `concatn`, so every part is still alive when it is read. A string is
 /// immutable, so releasing it later changes nothing but when it is freed.
-fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
+fn fuse_concat_chains(
+    body: &[&str],
+    param_names: &[String],
+    declared_funcs: &HashMap<String, FuncId>,
+    global_data: &HashMap<String, DataId>,
+) -> Option<Vec<String>> {
     let parsed: Vec<Vec<&str>> = body.iter().map(|l| l.split_whitespace().collect()).collect();
     if !parsed.iter().any(|p| p.first() == Some(&"concat")) {
         return None;
@@ -2885,7 +2908,56 @@ fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
             None
         }
     };
-    let is_barrier = |p: &[&str]| matches!(p.first(), Some(&"label" | &"brif" | &"jmp" | &"ret"));
+    let mut local_vars: HashSet<&str> = param_names.iter().map(String::as_str).collect();
+    for p in &parsed {
+        if p.len() >= 3 && p[0] == "store" {
+            local_vars.insert(p[1]);
+        }
+    }
+    // Only pure string-formatting / cstring-RC runtime helpers can sit between
+    // two fused concats without risking mutation or deallocation of an earlier
+    // borrowed string part (e.g., `h.name + " " + mutate(h)` or a temporary
+    // container release). Any user call, indirect call, store, or non-string
+    // release acts as a fusion barrier.
+    let is_pure_concat_call = |callee: &str| -> bool {
+        if declared_funcs.contains_key(callee)
+            || global_data.contains_key(callee)
+            || local_vars.contains(callee)
+        {
+            return false;
+        }
+        matches!(
+            callee,
+            "pith_cstring_release"
+                | "pith_cstring_retain"
+                | "int_to_string"
+                | "pith_int_to_cstr"
+                | "uint_to_string"
+                | "pith_uint_to_cstr"
+                | "bool_to_string"
+                | "pith_bool_to_cstr"
+                | "float_to_string"
+                | "pith_float_to_cstr"
+                | "float_format"
+                | "pith_float_format"
+                | "format_pad"
+                | "pith_format_pad"
+                | "char_to_string"
+                | "pith_char_to_string"
+                | "chr"
+                | "string_len"
+                | "pith_cstring_len"
+                | "byte_at"
+                | "pith_cstring_byte_at"
+        )
+    };
+    let is_barrier = |p: &[&str]| match p.first().copied() {
+        Some("label" | "brif" | "jmp" | "ret" | "ret2" | "store" | "sstore" | "rcall" | "calli") => {
+            true
+        }
+        Some("call") => p.get(2).is_none_or(|callee| !is_pure_concat_call(callee)),
+        _ => false,
+    };
 
     // every token after the opcode, counted. a register's own definition and
     // its uses all show up here, and so does anything that looks like it.
@@ -3028,7 +3100,10 @@ fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
 /// loads to the store, nothing else loads or stores V and no label, branch
 /// or return intervenes; O, A and D have no other use; and V is not a global
 /// (`__g_`), which another task may be reading.
-fn fuse_self_appends(body: &[&str]) -> Option<Vec<String>> {
+fn fuse_self_appends(
+    body: &[&str],
+    global_data: &HashMap<String, DataId>,
+) -> Option<Vec<String>> {
     let parsed: Vec<Vec<&str>> = body.iter().map(|l| l.split_whitespace().collect()).collect();
     let is_join = |p: &[&str]| (p.len() == 4 && p[0] == "concat") || (p.len() >= 5 && p[0] == "concatn");
     if !parsed.iter().any(|p| is_join(p)) {
@@ -3055,7 +3130,11 @@ fn fuse_self_appends(body: &[&str]) -> Option<Vec<String>> {
     let mut dropped = vec![false; parsed.len()];
     let mut replaced: HashMap<usize, String> = HashMap::new();
     for (k, p) in parsed.iter().enumerate() {
-        if p.len() != 3 || p[0] != "store" || p[1].starts_with("__g_") {
+        if p.len() != 3
+            || p[0] != "store"
+            || p[1].starts_with("__g_")
+            || global_data.contains_key(p[1])
+        {
             continue;
         }
         let (var, dst) = (p[1], p[2]);
@@ -3086,7 +3165,7 @@ fn fuse_self_appends(body: &[&str]) -> Option<Vec<String>> {
         let start = o.min(a);
         let clean = (start..=k).all(|i| {
             let q = &parsed[i];
-            let barrier = matches!(q.first(), Some(&"label" | &"brif" | &"jmp" | &"ret"));
+            let barrier = matches!(q.first(), Some(&"label" | &"brif" | &"jmp" | &"ret" | &"ret2"));
             let stores_var = i != k && q.len() == 3 && q[0] == "store" && q[1] == var;
             let loads_var = q.len() == 3 && q[0] == "load" && q[2] == var && i != o && i != a;
             !barrier && !stores_var && !loads_var
@@ -3154,9 +3233,11 @@ fn normalize_runtime_result(
 }
 
 /// The start of `main`: `pith_runtime_start`, which arms the stack overflow
-/// report, then every module's tracer registration, then each unprefixed
-/// `__init_globals_N`, then the main module's `__init_globals`, then the
-/// string globals, which point at their literals.
+/// report, then the static string globals (which point at their literals so
+/// any global initializer that reads them sees a valid pointer and any
+/// initializer that mutates a `mut` string global keeps its write), then every
+/// module's tracer registration, then each unprefixed `__init_globals_N`, then
+/// the main module's `__init_globals`.
 ///
 /// The tracers come before any global is built: a global is marked shared
 /// as it is stored, and the marking walks a struct's fields through its
@@ -3185,6 +3266,17 @@ fn emit_main_prologue(
         let start_ref = codegen.module.declare_func_in_func(start_id, builder.func);
         builder.ins().call(start_ref, &[]);
     }
+    for (gname, str_id) in str_globals.iter() {
+        if let (Some(&data_id), Some(&lit_id)) = (
+            global_data.get(gname.as_str()),
+            string_lits.get(str_id.as_str()),
+        ) {
+            let str_result = string_lit_addr(codegen, builder, lit_id);
+            let gv = codegen.module.declare_data_in_func(data_id, builder.func);
+            let addr = builder.ins().global_value(types::I64, gv);
+            builder.ins().store(MemFlags::new(), str_result, addr, 0);
+        }
+    }
     let mut startup: Vec<(&String, FuncId)> = declared_funcs
         .iter()
         .filter(|(name, _)| name.contains("__cc_register_tracers"))
@@ -3212,26 +3304,17 @@ fn emit_main_prologue(
             builder.ins().call(init_ref, &[]);
         }
     }
-    for (gname, str_id) in str_globals.iter() {
-        if let (Some(&data_id), Some(&lit_id)) = (
-            global_data.get(gname.as_str()),
-            string_lits.get(str_id.as_str()),
-        ) {
-            let str_result = string_lit_addr(codegen, builder, lit_id);
-            let gv = codegen.module.declare_data_in_func(data_id, builder.func);
-            let addr = builder.ins().global_value(types::I64, gv);
-            builder.ins().store(MemFlags::new(), str_result, addr, 0);
-        }
-    }
 }
 
 /// The named variables of a function body that hold a float. The IR does
 /// not type its locals, so this infers them: a variable stored from the
 /// result of a float instruction is a float. A parameter is a float when its
-/// param line says `float`; one whose line names no kind is taken for a
-/// float when the function does any float arithmetic. Then three rounds
-/// propagate the kind through loads, integer-spelled arithmetic on a float
-/// operand, and stores.
+/// param line says `float`; one whose line names no kind (e.g. a lambda
+/// parameter) is inferred as float only when a register loaded from it is
+/// directly consumed by a float operation or a float-taking runtime call, so
+/// an Int parameter in a lambda that also touches Floats is never poisoned.
+/// Then three rounds propagate the kind through loads, float-typed consumers,
+/// integer-spelled arithmetic on a float operand, and stores.
 fn scan_float_vars(
     param_names: &[String],
     param_kinds: &[String],
@@ -3239,8 +3322,27 @@ fn scan_float_vars(
 ) -> HashSet<String> {
     let mut float_vars: HashSet<String> = HashSet::new();
     let mut float_source_regs: HashSet<usize> = HashSet::new();
-    for line in body_lines {
-        let p: Vec<&str> = line.split_whitespace().collect();
+    let mut unannotated_params: HashSet<&str> = HashSet::new();
+    for (i, name) in param_names.iter().enumerate() {
+        match param_kinds.get(i).map(String::as_str) {
+            Some("float") => {
+                float_vars.insert(name.clone());
+            }
+            Some("word") => {}
+            _ => {
+                if name != "__closure" {
+                    unannotated_params.insert(name.as_str());
+                }
+            }
+        }
+    }
+
+    let parsed: Vec<Vec<&str>> = body_lines
+        .iter()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    let mut reg_from_param: HashMap<usize, &str> = HashMap::new();
+    for p in &parsed {
         if p.is_empty() {
             continue;
         }
@@ -3248,6 +3350,38 @@ fn scan_float_vars(
             "fconst" | "fadd" | "fsub" | "fmul" | "fdiv" if p.len() >= 2 => {
                 if let Ok(r) = p[1].parse::<usize>() {
                     float_source_regs.insert(r);
+                }
+            }
+            "call" if p.len() >= 5 => {
+                if p[3] == "float"
+                    || matches!(
+                        p[2],
+                        "int_to_float"
+                            | "pith_int_to_float"
+                            | "bits_to_float"
+                            | "pith_bits_to_float"
+                    )
+                {
+                    if let Ok(r) = p[1].parse::<usize>() {
+                        float_source_regs.insert(r);
+                    }
+                }
+            }
+            "rcall" if p.len() >= 6 && p[4] == "float" => {
+                if let Ok(r) = p[2].parse::<usize>() {
+                    float_source_regs.insert(r);
+                }
+            }
+            "field" if p.len() >= 6 && p[4] == "float" => {
+                if let Ok(r) = p[1].parse::<usize>() {
+                    float_source_regs.insert(r);
+                }
+            }
+            "load" if p.len() >= 3 => {
+                if let Ok(r) = p[1].parse::<usize>() {
+                    if unannotated_params.contains(p[2]) {
+                        reg_from_param.insert(r, p[2]);
+                    }
                 }
             }
             "store" if p.len() >= 3 => {
@@ -3260,31 +3394,44 @@ fn scan_float_vars(
             _ => {}
         }
     }
-    // a param line that names its kind settles it. a parameter whose kind the
-    // emitter did not know (a lambda's, say) is taken for a Float when the
-    // body does float math: wrong for an Int beside it, so it is only the
-    // fallback. taking every parameter of such a function for a Float lowered
-    // `a * b` on two Ints as a float multiply of their bit patterns.
-    let has_float_ops = body_lines.iter().any(|line| {
-        let p: Vec<&str> = line.split_whitespace().collect();
-        !p.is_empty() && matches!(p[0], "fconst" | "fmul" | "fadd" | "fsub" | "fdiv")
-    });
-    for (i, name) in param_names.iter().enumerate() {
-        match param_kinds.get(i).map(String::as_str) {
-            Some("float") => {
-                float_vars.insert(name.clone());
-            }
-            Some("word") => {}
-            _ if has_float_ops => {
-                float_vars.insert(name.clone());
-            }
-            _ => {}
-        }
-    }
+
+    let takes_float_arg = |fname: &str, arg_pos: usize| -> bool {
+        matches!(
+            (fname, arg_pos),
+            (
+                "float_to_string"
+                    | "pith_float_to_cstr"
+                    | "float_format"
+                    | "pith_float_format"
+                    | "float_to_int"
+                    | "pith_float_to_int"
+                    | "float_to_bits"
+                    | "pith_float_to_bits"
+                    | "sqrt"
+                    | "floor"
+                    | "ceil"
+                    | "round"
+                    | "sin"
+                    | "cos"
+                    | "tan"
+                    | "asin"
+                    | "acos"
+                    | "atan"
+                    | "log"
+                    | "log2"
+                    | "log10"
+                    | "exp"
+                    | "fabs"
+                    | "is_nan"
+                    | "is_inf",
+                0
+            ) | ("pow" | "atan2" | "fmin" | "fmax", 0 | 1)
+        )
+    };
+
     for _ in 0..3 {
         // a load of a float variable yields a float
-        for line in body_lines.iter() {
-            let p: Vec<&str> = line.split_whitespace().collect();
+        for p in &parsed {
             if p.len() >= 3 && p[0] == "load" {
                 if let Ok(r) = p[1].parse::<usize>() {
                     if float_vars.contains(p[2]) {
@@ -3293,26 +3440,78 @@ fn scan_float_vars(
                 }
             }
         }
-        // Propagate: if mul/div/add/sub uses a float reg, its result is float
-        for line in body_lines.iter() {
-            let p: Vec<&str> = line.split_whitespace().collect();
-            if p.len() >= 4 && matches!(plain_arith_op(p[0]), "mul" | "div" | "add" | "sub") {
-                let a_float = p[2]
-                    .parse::<usize>()
-                    .map_or(false, |r| float_source_regs.contains(&r));
-                let b_float = p[3]
-                    .parse::<usize>()
-                    .map_or(false, |r| float_source_regs.contains(&r));
-                if a_float || b_float {
-                    if let Ok(r) = p[1].parse::<usize>() {
-                        float_source_regs.insert(r);
+        // Infer unannotated params from direct float consumers, and propagate
+        // float kind through integer-spelled arithmetic on a float operand.
+        for p in &parsed {
+            if p.is_empty() {
+                continue;
+            }
+            match p[0] {
+                "fadd" | "fsub" | "fmul" | "fdiv" if p.len() >= 4 => {
+                    for tok in [p[2], p[3]] {
+                        if let Ok(r) = tok.parse::<usize>() {
+                            if let Some(&pname) = reg_from_param.get(&r) {
+                                float_vars.insert(pname.to_string());
+                                float_source_regs.insert(r);
+                            }
+                        }
                     }
                 }
+                op if p.len() >= 4
+                    && matches!(
+                        plain_arith_op(op),
+                        "mul" | "div" | "add" | "sub" | "eq" | "neq" | "lt" | "gt" | "lte" | "gte"
+                    ) =>
+                {
+                    let a_reg = p[2].parse::<usize>().ok();
+                    let b_reg = p[3].parse::<usize>().ok();
+                    let a_float = a_reg.is_some_and(|r| float_source_regs.contains(&r));
+                    let b_float = b_reg.is_some_and(|r| float_source_regs.contains(&r));
+                    if a_float && !b_float {
+                        if let Some(r) = b_reg {
+                            if let Some(&pname) = reg_from_param.get(&r) {
+                                float_vars.insert(pname.to_string());
+                                float_source_regs.insert(r);
+                            }
+                        }
+                    } else if b_float && !a_float {
+                        if let Some(r) = a_reg {
+                            if let Some(&pname) = reg_from_param.get(&r) {
+                                float_vars.insert(pname.to_string());
+                                float_source_regs.insert(r);
+                            }
+                        }
+                    }
+                    if (a_float || b_float)
+                        && matches!(plain_arith_op(op), "mul" | "div" | "add" | "sub")
+                    {
+                        if let Ok(r) = p[1].parse::<usize>() {
+                            float_source_regs.insert(r);
+                        }
+                    }
+                }
+                "call" if p.len() >= 6 => {
+                    let fname = p[2];
+                    if let Ok(nargs) = p[4].parse::<usize>() {
+                        for j in 0..nargs {
+                            if let Some(tok) = p.get(5 + j) {
+                                if takes_float_arg(fname, j) {
+                                    if let Ok(r) = tok.parse::<usize>() {
+                                        if let Some(&pname) = reg_from_param.get(&r) {
+                                            float_vars.insert(pname.to_string());
+                                            float_source_regs.insert(r);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         // Store propagation
-        for line in body_lines.iter() {
-            let p: Vec<&str> = line.split_whitespace().collect();
+        for p in &parsed {
             if p.len() >= 3 && p[0] == "store" {
                 if let Ok(r) = p[2].parse::<usize>() {
                     if float_source_regs.contains(&r) {
@@ -4180,7 +4379,7 @@ fn compile_ir_function(
                         name_is_shadowed || !fast_paths,
                     )? {
                         regs.insert(reg, value);
-                        kinds.clear(reg);
+                        kinds.set(reg, retkind);
                         continue;
                     }
                     // `xs[i]`: inline the in-bounds read and leave every
@@ -4331,7 +4530,7 @@ fn compile_ir_function(
                             &args,
                         );
                         regs.insert(reg, result);
-                        kinds.clear(reg);
+                        kinds.set(reg, retkind);
                     } else if let Some(&data_id) = global_data.get(fname) {
                         // a module-level global holding a closure value,
                         // called by name. the checker only allows calling a
@@ -4357,7 +4556,7 @@ fn compile_ir_function(
                             &args,
                         );
                         regs.insert(reg, result);
-                        kinds.clear(reg);
+                        kinds.set(reg, retkind);
                     } else {
                         // a call that resolves to nothing is a compiler bug
                         // upstream (a phantom import, a missed rename, an
@@ -5031,8 +5230,25 @@ impl RegKinds {
 /// word (`pith_runtime::JOIN_INT_SHIFT`). A plain `concat` becomes a
 /// two-part `concatn`. A join of more parts than one runtime call takes is
 /// left alone, since the Int bits describe a single call.
-fn fuse_int_parts(body: &[&str]) -> Option<Vec<String>> {
+fn fuse_int_parts(
+    body: &[&str],
+    param_names: &[String],
+    declared_funcs: &HashMap<String, FuncId>,
+    global_data: &HashMap<String, DataId>,
+) -> Option<Vec<String>> {
+    if declared_funcs.contains_key("int_to_string")
+        || global_data.contains_key("int_to_string")
+        || param_names.iter().any(|n| n == "int_to_string")
+    {
+        return None;
+    }
     let parsed: Vec<Vec<&str>> = body.iter().map(|l| l.split_whitespace().collect()).collect();
+    if parsed
+        .iter()
+        .any(|p| p.len() >= 3 && p[0] == "store" && p[1] == "int_to_string")
+    {
+        return None;
+    }
     // R -> (line of its definition, X)
     let mut made: HashMap<&str, (usize, &str)> = HashMap::new();
     for (i, p) in parsed.iter().enumerate() {
@@ -5148,7 +5364,7 @@ mod tests {
 
     fn fuse(body: &str) -> Option<Vec<String>> {
         let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        fuse_concat_chains(&lines)
+        fuse_concat_chains(&lines, &[], &HashMap::new(), &HashMap::new())
     }
 
     /// `chr(123) + q + "id" + q`, as the emitter lowers it.
@@ -5170,7 +5386,7 @@ mod tests {
 
     fn appends(body: &str) -> Option<Vec<String>> {
         let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        fuse_self_appends(&lines)
+        fuse_self_appends(&lines, &HashMap::new())
     }
 
     /// `s = s + "ab"`, as the emitter lowers it.
@@ -5208,7 +5424,7 @@ mod tests {
 
     fn int_parts(body: &str) -> Option<Vec<String>> {
         let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        fuse_int_parts(&lines)
+        fuse_int_parts(&lines, &[], &HashMap::new(), &HashMap::new())
     }
 
     /// `"value-" + n.to_string()`, as the emitter lowers it.
@@ -5546,7 +5762,9 @@ mod tests {
             "iconst 5 0",
             "ret 5",
         ];
-        assert_eq!(detect_bits_wrapper(&params, &wrapper), Some("band"));
+        let no_funcs = HashMap::new();
+        let no_globals = HashMap::new();
+        assert_eq!(detect_bits_wrapper(&params, &wrapper, &no_funcs, &no_globals), Some("band"));
 
         // swapped operands are a different function; it must keep its call
         let swapped = vec![
@@ -5555,7 +5773,7 @@ mod tests {
             "call 4 bit_and int 2 3 2",
             "ret 4",
         ];
-        assert_eq!(detect_bits_wrapper(&params, &swapped), None);
+        assert_eq!(detect_bits_wrapper(&params, &swapped, &no_funcs, &no_globals), None);
 
         // extra work after the return means the body is not just the builtin
         let with_extra = vec![
@@ -5565,7 +5783,7 @@ mod tests {
             "ret 4",
             "call 6 print void 1 4",
         ];
-        assert_eq!(detect_bits_wrapper(&params, &with_extra), None);
+        assert_eq!(detect_bits_wrapper(&params, &with_extra, &no_funcs, &no_globals), None);
 
         // a non-bit builtin never aliases
         let other_call = vec![
@@ -5574,7 +5792,15 @@ mod tests {
             "call 4 map_get int 2 2 3",
             "ret 4",
         ];
-        assert_eq!(detect_bits_wrapper(&params, &other_call), None);
+        assert_eq!(detect_bits_wrapper(&params, &other_call, &no_funcs, &no_globals), None);
+
+        // a shadowed bit_and user function must never alias to the native instruction
+        let mut shadowed_funcs = HashMap::new();
+        shadowed_funcs.insert("bit_and".to_string(), FuncId::from_u32(1));
+        assert_eq!(
+            detect_bits_wrapper(&params, &wrapper, &shadowed_funcs, &no_globals),
+            None
+        );
     }
 
     #[test]
@@ -6028,5 +6254,131 @@ mod tests {
     fn invalid_parameter_count_returns_compile_error() {
         let err = compile_err_for_ir("func main x int\nendfunc\n");
         assert!(err.contains("invalid parameter count 'x'"));
+    }
+
+    #[test]
+    fn concat_chain_does_not_fuse_across_mutating_call_or_non_string_release() {
+        // C-06: `h.name + " " + mutate(h)` must not defer reading `h.name` past `mutate(h)`.
+        let mutated = "
+            field 1 10 0 string name
+            strref 2 m0s0
+            concat 3 1 2
+            call 4 mutate string 1 10
+            concat 5 3 4
+            call 6 pith_cstring_release void 1 3
+            call 7 pith_cstring_release void 1 4
+            ret 5
+        ";
+        assert!(fuse(mutated).is_none());
+
+        // Releasing a temporary struct between concats can free a borrowed field string.
+        let temp_struct = "
+            field 1 10 0 string name
+            strref 2 m0s0
+            concat 3 1 2
+            call 4 pith_struct_release void 1 10
+            load 5 b
+            concat 6 3 5
+            call 7 pith_cstring_release void 1 3
+            ret 6
+        ";
+        assert!(fuse(temp_struct).is_none());
+
+        // A user-defined function shadowing `chr` acts as a barrier too.
+        let lines: Vec<&str> = CHAIN.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let mut declared = HashMap::new();
+        declared.insert("chr".to_string(), FuncId::from_u32(1));
+        // `chr` runs before the first concat in CHAIN, so add one between concats:
+        let shadowed_chain = "
+            load 1 a
+            strref 2 m0s0
+            concat 3 1 2
+            iconst 4 65
+            call 5 chr string 1 4
+            concat 6 3 5
+            call 7 pith_cstring_release void 1 3
+            call 8 pith_cstring_release void 1 5
+            ret 6
+        ";
+        let slines: Vec<&str> = shadowed_chain
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(fuse_concat_chains(&slines, &[], &declared, &HashMap::new()).is_none());
+        assert!(fuse_concat_chains(&lines, &[], &HashMap::new(), &HashMap::new()).is_some());
+    }
+
+    #[test]
+    fn self_append_skips_module_prefixed_globals() {
+        // C-07: imported module globals are named `<mod>___g_<name>`, not `__g_<name>`.
+        let lines: Vec<String> = SELF_APPEND
+            .replace(" s", " other___g_s")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut globals = HashMap::new();
+        globals.insert("other___g_s".to_string(), DataId::from_u32(1));
+        assert!(fuse_self_appends(&refs, &globals).is_none());
+    }
+
+    #[test]
+    fn scan_float_vars_does_not_poison_int_lambda_params() {
+        // C-16: `fn(n: Int) -> Float: k := n * 2; return k.to_float() + 0.5`
+        let params = vec!["__closure".to_string(), "n".to_string()];
+        let kinds = vec![String::new(), String::new()];
+        let body = vec![
+            "load 1 n",
+            "iconst 2 2",
+            "mulc 3 1 2",
+            "store k 3",
+            "load 4 k",
+            "call 5 int_to_float float 1 4",
+            "fconst 6 0.5",
+            "addc 7 5 6",
+            "ret 7",
+        ];
+        let floats = scan_float_vars(&params, &kinds, &body);
+        assert!(!floats.contains("__closure"));
+        assert!(!floats.contains("n"));
+        assert!(!floats.contains("k"));
+
+        // A genuinely Float unannotated param paired with a float op IS inferred.
+        let float_params = vec!["__closure".to_string(), "x".to_string(), "n".to_string()];
+        let float_kinds = vec![String::new(), String::new(), String::new()];
+        let mixed_body = vec![
+            "load 1 x",
+            "fconst 2 1.0",
+            "addc 3 1 2",
+            "store y 3",
+            "load 4 n",
+            "iconst 5 2",
+            "mulc 6 4 5",
+            "store k 6",
+            "ret 3",
+        ];
+        let mixed_floats = scan_float_vars(&float_params, &float_kinds, &mixed_body);
+        assert!(mixed_floats.contains("x"));
+        assert!(mixed_floats.contains("y"));
+        assert!(!mixed_floats.contains("n"));
+        assert!(!mixed_floats.contains("k"));
+    }
+
+    #[test]
+    fn fuse_int_parts_respects_shadowed_int_to_string() {
+        let lines: Vec<&str> = INT_CONCAT
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut declared = HashMap::new();
+        declared.insert("int_to_string".to_string(), FuncId::from_u32(1));
+        assert!(fuse_int_parts(&lines, &[], &declared, &HashMap::new()).is_none());
+
+        let param_shadow = vec!["int_to_string".to_string()];
+        assert!(fuse_int_parts(&lines, &param_shadow, &HashMap::new(), &HashMap::new()).is_none());
     }
 }

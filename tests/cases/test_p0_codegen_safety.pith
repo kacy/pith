@@ -1,0 +1,73 @@
+# Regression tests for P0 codegen safety fixes:
+# - C-06: concat chain fusion must not defer borrowed part reads past mutating calls
+# - C-16: lambda Int params must not be poisoned as Float when body uses Float
+# - C-17: float closure / float list / float capture values must preserve float kind
+# - C-18: static string globals must initialize before __init_globals runs
+# - H-21: user functions shadowing int_to_string / bit_and must not be bypassed
+
+PREFIX := "hello"
+GREETING := PREFIX + " world"
+
+mut MUT_STR := "initial"
+
+fn bump_mut_str() -> String:
+    MUT_STR = "updated-during-init"
+    return "ok"
+
+INIT_DONE := bump_mut_str()
+
+GLOBAL_ID_F := fn(x: Float) -> Float => x
+
+struct Holder:
+    mut name: String
+
+fn mutate_holder(h: Holder) -> String:
+    h.name = "replaced-" + "value"
+    return "after"
+
+fn int_to_string(n: Int) -> String:
+    if n == 7:
+        return "custom(7)"
+    return "custom(?)"
+
+fn bit_and(a: Int, b: Int) -> Int:
+    return a + b + 100
+
+fn wrap_bit_and(a: Int, b: Int) -> Int:
+    return bit_and(a, b)
+
+fn main():
+    # C-18: global initialized from another string literal global, and mut string
+    # global mutated during __init_globals must not be overwritten afterwards
+    print(GREETING)
+    print(INIT_DONE + ":" + MUT_STR)
+
+    # C-06: borrowed field string concatenated before mutating call
+    h := Holder("orig-" + "name")
+    combined := h.name + " " + mutate_holder(h)
+    print(combined)
+    print(h.name)
+
+    # C-16: Int parameter in lambda that also computes Float
+    scale := fn(n: Int) -> Float:
+        k := n * 2
+        return k.to_float() + 0.5
+    print(scale(10).to_string())
+
+    # C-17: Float local closure, global closure, Float list element, and captured Float
+    # Using negative floats because signed i64 bit order reverses IEEE-754 order:
+    # -2.0 < -1.0 is true as f64, false as signed i64 bits.
+    id_f := fn(x: Float) -> Float => x
+    print((id_f(-2.0) < id_f(-1.0)).to_string())
+    print((GLOBAL_ID_F(-2.0) < GLOBAL_ID_F(-1.0)).to_string())
+
+    fs: List[Float] := [-2.0, -1.0]
+    print((fs[0] < fs[1]).to_string())
+
+    cap := -2.0
+    cmp_cap := fn() -> Bool => cap < -1.0
+    print(cmp_cap().to_string())
+
+    # H-21: shadowed int_to_string and bit_and wrappers
+    print("tag=" + int_to_string(7))
+    print((wrap_bit_and(3, 4) == 107).to_string())

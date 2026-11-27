@@ -26,6 +26,16 @@ const PLATFORM_LINK_ARGS: &[&str] = &[
 #[cfg(not(target_os = "macos"))]
 const PLATFORM_LINK_ARGS: &[&str] = &["-ldl", "-Wl,--gc-sections", "-s"];
 
+/// Prefix relative paths starting with `-` with `./` so the system linker
+/// driver never interprets an output, object, or archive filename as a flag.
+fn safe_linker_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.starts_with('-') {
+        std::borrow::Cow::Owned(format!("./{}", path))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
 /// Link object files with runtime to create executable
 pub fn link_executable(
     obj_file: &str,
@@ -40,10 +50,14 @@ pub fn link_executable(
         .unwrap_or_else(|| "cc".to_string());
     let mut cmd = Command::new(&linker);
 
+    let safe_output = safe_linker_path(output);
+    let safe_obj = safe_linker_path(obj_file);
+    let safe_runtime = safe_linker_path(runtime_lib);
+
     cmd.arg("-o")
-        .arg(output)
-        .arg(obj_file)
-        .arg(runtime_lib)
+        .arg(safe_output.as_ref())
+        .arg(safe_obj.as_ref())
+        .arg(safe_runtime.as_ref())
         .arg("-lpthread") // Required by our runtime
         .arg("-lm"); // Math library
 
@@ -225,4 +239,17 @@ pub fn build_executable(obj_file: &str, output: &str) -> Result<(), CompileError
     link_executable(obj_file, &runtime_lib, output)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_linker_path;
+
+    #[test]
+    fn leading_dash_paths_are_prefixed_with_dot_slash() {
+        assert_eq!(safe_linker_path("-Wl,--version").as_ref(), "./-Wl,--version");
+        assert_eq!(safe_linker_path("-out.o").as_ref(), "./-out.o");
+        assert_eq!(safe_linker_path("out.o").as_ref(), "out.o");
+        assert_eq!(safe_linker_path("/tmp/-out.o").as_ref(), "/tmp/-out.o");
+    }
 }

@@ -1,0 +1,13 @@
+# Building a frozen field from an aliased mutable local must be rejected (C-09).
+struct Config:
+    frozen items: List[Int]
+
+fn read_len(c: Config) -> Int:
+    return c.items.len()
+
+fn main():
+    xs := [1, 2, 3]
+    cfg := Config(items: xs)
+    t := spawn read_len(cfg)
+    xs.push(4)
+    print((await t).to_string())

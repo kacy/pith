@@ -1,0 +1,19 @@
+# Sync primitives and interface values without show() must not interpolate as
+# raw pointers (C-12b).
+interface Greeter:
+    fn greet() -> String
+
+struct Person:
+    name: String
+
+impl Greeter for Person:
+    fn greet() -> String:
+        return self.name
+
+fn show_greeter(g: Greeter) -> String:
+    return "{g}"
+
+fn main():
+    m := Mutex()
+    print("{m}")
+    print(show_greeter(Person(name: "a")))

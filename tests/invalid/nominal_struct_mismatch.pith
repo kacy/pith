@@ -1,0 +1,22 @@
+# Nominal structs, interfaces, and sync primitives must never match by field
+# shape alone (C-01).
+interface Greeter:
+    fn greet() -> String
+
+struct Alpha:
+    x: Int
+
+struct Beta:
+    x: Int
+
+fn takes_greeter(g: Greeter) -> String:
+    return g.greet()
+
+fn takes_beta(b: Beta) -> Int:
+    return b.x
+
+fn main():
+    a := AtomicInt(1)
+    print(takes_greeter(a))
+    alpha := Alpha(x: 1)
+    print(takes_beta(alpha).to_string())

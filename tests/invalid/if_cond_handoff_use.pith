@@ -1,0 +1,15 @@
+# A value handed off in an `if` condition is NOT mutually exclusive with the
+# `then` / `else` branches (C-10).
+fn consumer(ch: Channel[List[Int]]) -> Int:
+    match ch.recv():
+        xs => return xs.len()
+        none => return 0
+
+fn main():
+    ch := Channel[List[Int]](1)
+    t := spawn consumer(ch)
+    xs := [1, 2]
+    if ch.try_send(xs):
+        xs.push(3)
+    ch.close()
+    print((await t).to_string())

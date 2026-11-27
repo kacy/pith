@@ -1,0 +1,133 @@
+# Regression tests for P0 self-hosted compiler safety fixes:
+# - C-11: shadowed local closure callee & pinning non-lambda closure args
+# - C-12: precision-only interp spec on borrowed String & generic struct interp
+# - C-13: nested match saving/restoring ir_match_subject_tid
+# - C-14: poisoning uncounted pat_binding/pat_tuple/select_recv_arm binds
+# - C-15: defer/errdefer reassigning returned or failed owned local
+# - Lambda typed param kinds: float comparison in lambda without float constants
+
+struct Box[T]:
+    val: T
+
+struct CallbackHolder:
+    mut cb: fn() -> Int
+
+mut SAVED_CBS: List[fn() -> Int] := []
+
+fn helper(f: fn() -> Int) -> Int:
+    return f()
+
+fn shadowed_helper(f: fn() -> Int) -> Int:
+    helper := fn(g: fn() -> Int) -> Int:
+        SAVED_CBS.push(g)
+        return g()
+    return helper(f)
+
+fn make_and_stash(base: Int) -> Int:
+    return shadowed_helper(fn() -> Int => base + 1)
+
+fn run_with_side_effect(cb: fn() -> Int, tag: Int) -> Int:
+    return cb() + tag
+
+fn replace_cb(h: CallbackHolder) -> Int:
+    h.cb = fn() -> Int => 999
+    return 10
+
+enum Item:
+    Text(String)
+    Num(Int)
+
+fn match_nested(opt: Int?, k: Int) -> Int:
+    return match opt:
+        none => match k:
+            0 => 100
+            other => other + 100
+        v => v + 1
+
+fn match_mixed_bind(it: Item) -> Int:
+    mut total := 0
+    match it:
+        Item.Text(v) =>
+            total = v.len()
+        v =>
+            match v:
+                Item.Num(n) =>
+                    total = n
+                _ =>
+                    total = 0
+    return total
+
+fn match_tuple_then_str(pair: (Int, Int), flag: Bool) -> Int:
+    if flag:
+        v := "owned-" + "str"
+        return v.len()
+    return match pair:
+        (v, w) => v + w
+
+fn return_with_defer() -> String:
+    mut s := "original-" + "ret"
+    defer s = "overwritten-" + "ret"
+    return s
+
+fn fail_with_errdefer() -> Int!:
+    mut e := "original-" + "err"
+    errdefer e = "overwritten-" + "err"
+    fail e
+
+fn select_reuse_name() -> Int:
+    ch := Channel[Int](1)
+    ch.send(77)
+    mut out := 0
+    if false:
+        v := "unused-" + "owned"
+        out = v.len()
+    got := select:
+        v := ch.recv() => v.unwrap_or(0)
+        default => 0
+    ch.close()
+    return out + got
+
+fn catch_err_msg() -> String:
+    ok := fail_with_errdefer() catch err:
+        return err
+    return ok.to_string()
+
+fn main():
+    # C-11a: shadowed `helper` must not stack-allocate escaped closure arg
+    print(make_and_stash(41).to_string())
+    print(SAVED_CBS[0]().to_string())
+    SAVED_CBS.clear()
+
+    # C-11b: non-lambda closure arg `h.cb` must be pinned across `replace_cb(h)`
+    k := 5
+    holder := CallbackHolder(cb: fn() -> Int => k + 20)
+    print(run_with_side_effect(holder.cb, replace_cb(holder)).to_string())
+
+    # C-12a: precision-only format spec on borrowed string must not double-free
+    borrowed := "hello-" + "world"
+    formatted := "{borrowed:.2}"
+    print(formatted + "|" + borrowed)
+
+    # C-12b: generic struct interpolation must render fields, not raw pointer
+    bi := Box[Int](val: 42)
+    bs := Box[String](val: "hi")
+    print("{bi}")
+    print("{bs}")
+
+    # C-13: nested match preserves outer Optional subject tid for later arm
+    print(match_nested(none, 7).to_string())
+    print(match_nested(9, 7).to_string())
+
+    # C-14: sibling/reused binding names across enum/catch-all/tuple/select
+    print(match_mixed_bind(Item.Text("abc-" + "def")).to_string())
+    print(match_mixed_bind(Item.Num(55)).to_string())
+    print(match_tuple_then_str((12, 30), false).to_string())
+    print(select_reuse_name().to_string())
+
+    # C-15: defer/errdefer reassigning returned/failed local must not UAF or leak
+    print(return_with_defer())
+    print(catch_err_msg())
+
+    # Typed float lambda comparison with no float constants inside body
+    lt_f := fn(x: Float, y: Float) -> Bool => x < y
+    print(lt_f(-2.0, -1.0).to_string())

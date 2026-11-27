@@ -1033,19 +1033,23 @@ fn reader_loop(client: Client):
 # the body is kept as its DATA payloads and joined once at the end, so a body of
 # many frames costs one copy rather than one per frame. a body of one frame, the
 # grpc unary case, is passed on with no copy at all.
+# immutable wrapper for a decoded header/trailer block stored inside UnaryAccum
+# until end-of-stream. wrapping at decode time proves the list is never mutated
+# before it moves into StreamEvent's frozen fields, with zero copies.
+struct FrozenHeaders:
+    frozen fields: List[hpack.HeaderField]
+
 struct UnaryAccum:
-    mut headers: List[hpack.HeaderField]
-    mut trailers: List[hpack.HeaderField]
+    mut headers: FrozenHeaders
+    mut trailers: FrozenHeaders
     mut parts: List[Bytes]
     mut size: Int
     mut got_headers: Bool
 
 # a fresh accumulator with empty headers, trailers, and body.
 fn new_unary_accum() -> UnaryAccum:
-    empty_headers: List[hpack.HeaderField] := []
-    empty_trailers: List[hpack.HeaderField] := []
     empty_parts: List[Bytes] := []
-    return UnaryAccum(empty_headers, empty_trailers, empty_parts, 0, false)
+    return UnaryAccum(FrozenHeaders(NO_FIELDS), FrozenHeaders(NO_FIELDS), empty_parts, 0, false)
 
 impl UnaryAccum:
     # the body so far, joined.
@@ -1061,7 +1065,7 @@ impl UnaryAccum:
 
     # the coalesced event carrying the whole response.
     fn to_event() -> StreamEvent:
-        return unary_event(self.headers, self.trailers, self.body())
+        return unary_event(self.headers.fields, self.trailers.fields, self.body())
 
 # whether the reader should coalesce this stream's frames. an already-open
 # accumulator answers yes immediately; otherwise the first frame of a stream the
@@ -1098,10 +1102,10 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
             # the first header block is the response headers; a later one (after
             # the body has begun) is the trailers.
             if not a.got_headers:
-                a.headers = decoded
+                a.headers = FrozenHeaders(decoded)
                 a.got_headers = true
             else:
-                a.trailers = decoded
+                a.trailers = FrozenHeaders(decoded)
             if hf.end_stream:
                 if let inbox = inbox_for(client, hf.stream_id):
                     inbox.send(a.to_event())

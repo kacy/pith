@@ -200,6 +200,7 @@ pub mut struct_instance_type_args: Map[Int, String] := {}
 pub mut struct_instance_base_name: Map[Int, String] := {}
 mut enum_instance_type_args: Map[Int, String] := {}
 mut enum_instance_base_name: Map[Int, String] := {}
+mut enum_instance_decl_idx: Map[Int, Int] := {}
 # Pith's cross-module Map read is unreliable for iterating, so we also
 # maintain a parallel list of instance tids that callers can use to walk
 # every generic struct instantiation the program has registered.
@@ -326,6 +327,7 @@ pub fn initialize_checker(file_path: String):
     struct_instance_base_name = {}
     enum_instance_type_args = {}
     enum_instance_base_name = {}
+    enum_instance_decl_idx = {}
     struct_instance_tids = []
     suppress_unknown_type_for = {}
     expression_type_cache = {}
@@ -2391,12 +2393,16 @@ fn check_drop_escapes(root: Node):
             continue
         target := get_type_node_name(get_node(get_node(cn.children[1]).children[0]))
         for m in cn.children:
-            mn := get_node(m)
+            mut fn_idx := m
+            mut mn := get_node(fn_idx)
+            if mn.kind == "pub" and mn.children.len() > 0:
+                fn_idx = mn.children[0]
+                mn = get_node(fn_idx)
             body := drop_escape_body(mn)
             if mn.value != "drop" or body < 0:
                 continue
             if has_generic_declaration(target):
-                generic_drop_decls.insert(m, get_generic_declaration_index(target))
+                generic_drop_decls.insert(fn_idx, get_generic_declaration_index(target))
             else:
                 drop_escape_walk(body, ["self"], false, true)
 
@@ -4425,6 +4431,8 @@ fn type_supports_stringify(tid: Int) -> Bool:
     if info.kind == "map":
         return type_supports_stringify(info.key_type) and type_supports_stringify(info.value_type)
     if info.kind == "struct":
+        if is_interface_type(tid) or is_reserved_type_name(info.name):
+            return false
         return true
     # an optional renders as "none" or as its payload's own text, so it is
     # stringifiable exactly when the payload is
@@ -9948,6 +9956,7 @@ fn instantiate_generic_enum_type(decl_idx: Int, type_args: List[Int]) -> Int:
     register_type_name(inst_name, tid)
     enum_instance_type_args.insert(tid, encode_tid_list(type_args))
     enum_instance_base_name.insert(tid, base_name)
+    enum_instance_decl_idx.insert(tid, decl_idx)
     mut variant_names: List[String] := []
     mut variant_types: List[List[Int]] := []
     for child in decl.children:
@@ -10043,9 +10052,16 @@ fn types_structurally_equal(a: Int, b: Int) -> Bool:
     if ai.kind == "channel":
         if bi.kind == "channel":
             return types_structurally_equal(ai.inner, bi.inner)
-    # struct structural equality
+    # struct nominal + structural equality
     if ai.kind == "struct":
         if bi.kind == "struct":
+            if struct_instance_decl_idx.contains_key(a) and struct_instance_decl_idx.contains_key(b):
+                if struct_instance_decl_idx[a] != struct_instance_decl_idx[b]:
+                    return false
+            elif ai.name != bi.name:
+                return false
+            if is_interface_type(a) != is_interface_type(b):
+                return false
             if ai.fields.len() != bi.fields.len():
                 return false
             pair_key := a.to_string() + ":" + b.to_string()
@@ -10059,14 +10075,28 @@ fn types_structurally_equal(a: Int, b: Int) -> Bool:
                 if field_name != bi.fields[i]:
                     same = false
                     break
+                if is_frozen_field(a, field_name) != is_frozen_field(b, field_name):
+                    same = false
+                    break
+                if is_guarded_field(a, field_name) != is_guarded_field(b, field_name):
+                    same = false
+                    break
+                if struct_field_weak.contains_key(a.to_string() + "." + field_name) != struct_field_weak.contains_key(b.to_string() + "." + field_name):
+                    same = false
+                    break
                 if types_structurally_equal(ai.field_types[i], bi.field_types[i]) == false:
                     same = false
                     break
             structural_eq_visiting.remove(pair_key)
             return same
-    # enum structural equality
+    # enum nominal + structural equality
     if ai.kind == "enum":
         if bi.kind == "enum":
+            if enum_instance_decl_idx.contains_key(a) and enum_instance_decl_idx.contains_key(b):
+                if enum_instance_decl_idx[a] != enum_instance_decl_idx[b]:
+                    return false
+            elif ai.name != bi.name:
+                return false
             if ai.variants.len() != bi.variants.len():
                 return false
             pair_key := a.to_string() + ":" + b.to_string()
@@ -10607,6 +10637,7 @@ pub struct CheckerSnapshot:
     pub struct_instance_base_name: Map[Int, String]
     pub enum_instance_type_args: Map[Int, String]
     pub enum_instance_base_name: Map[Int, String]
+    pub enum_instance_decl_idx: Map[Int, Int]
     pub struct_instance_tids: List[Int]
     pub suppress_unknown_type_for: Map[String, Int]
     pub expression_type_cache: Map[Int, Int]
@@ -10702,6 +10733,7 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         struct_instance_base_name: copy_map(struct_instance_base_name),
         enum_instance_type_args: copy_map(enum_instance_type_args),
         enum_instance_base_name: copy_map(enum_instance_base_name),
+        enum_instance_decl_idx: copy_map(enum_instance_decl_idx),
         struct_instance_tids: copy_list(struct_instance_tids),
         suppress_unknown_type_for: copy_map(suppress_unknown_type_for),
         expression_type_cache: copy_map(expression_type_cache),
@@ -10797,6 +10829,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     struct_instance_base_name = copy_map(s.struct_instance_base_name)
     enum_instance_type_args = copy_map(s.enum_instance_type_args)
     enum_instance_base_name = copy_map(s.enum_instance_base_name)
+    enum_instance_decl_idx = copy_map(s.enum_instance_decl_idx)
     struct_instance_tids = copy_list(s.struct_instance_tids)
     suppress_unknown_type_for = copy_map(s.suppress_unknown_type_for)
     expression_type_cache = copy_map(s.expression_type_cache)

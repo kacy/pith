@@ -1,0 +1,13 @@
+# pub fn drop() must still be checked for self-escape (C-08).
+struct Node:
+    name: String
+
+mut keep: List[Node] := []
+
+impl Drop for Node:
+    pub fn drop():
+        keep.push(self)
+
+fn main():
+    n := Node(name: "n")
+    print(n.name)

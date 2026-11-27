@@ -2332,6 +2332,8 @@ fn ir_record_fn_closure_params(decl_idx: Int, sym: String) -> Bool:
     body_idx := ir_tuple_walk_fn_body(decl_idx)
     if body_idx < 0:
         return false
+    mut shadowed: Map[String, Bool] := {}
+    ir_collect_decl_shadow_names(decl_idx, body_idx, shadowed)
     mut added := false
     mut pos := 0
     for child in get_node(decl_idx).children:
@@ -2341,16 +2343,47 @@ fn ir_record_fn_closure_params(decl_idx: Int, sym: String) -> Bool:
             is_fn := cn.children.len() > 0 and get_node(ir_alias_target_node(cn.children[0])).kind == "fn_type"
             if is_fn and not ir_borrow_param_local.contains_key(sym + key_tail) and not cn.value.contains(" "):
                 name := cn.value
-                if not ir_subtree_assigns_name(body_idx, name) and ir_count_name_nodes(body_idx, name) == ir_count_local_closure_uses(body_idx, name):
+                if not ir_subtree_assigns_name(body_idx, name) and ir_count_name_nodes(body_idx, name) == ir_count_local_closure_uses(body_idx, name, shadowed):
                     ir_record_borrow_param(sym, pos, "closure")
                     added = true
             pos = pos + 1
     return added
 
+# collect names bound locally inside `decl_idx` (parameters and local/pattern/
+# loop/select bindings in its body, excluding nested lambda scopes) so a call
+# to a local closure variable that shares a name with a top-level helper is
+# never mistaken for a static call to that helper.
+fn ir_collect_decl_shadow_names(decl_idx: Int, body_idx: Int, out: Map[String, Bool]):
+    for child in get_node(decl_idx).children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            mut pname := cn.value
+            if pname.ends_with(" mut"):
+                pname = pname.substring(0, pname.len() - 4)
+            elif pname.ends_with(" ref"):
+                pname = pname.substring(0, pname.len() - 4)
+            if pname.len() > 0:
+                out.insert(pname, true)
+    ir_collect_body_shadow_names(body_idx, out)
+
+fn ir_collect_body_shadow_names(idx: Int, out: Map[String, Bool]):
+    node := get_node(idx)
+    if node.kind == "lambda":
+        return
+    if ir_is_binding_kind(node.kind):
+        parts := ir_collect_bind_parts(node)
+        if parts.name.len() > 0:
+            out.insert(parts.name, true)
+    elif node.kind == "loop_var" or node.kind == "pat_binding" or node.kind == "select_recv_arm":
+        if node.value.len() > 0:
+            out.insert(node.value, true)
+    for child in node.children:
+        ir_collect_body_shadow_names(child, out)
+
 # the mentions of `name` that keep a closure in this frame: the callee of a
 # call, or a positional argument to a recorded closure parameter. none inside
 # a lambda or a spawn counts.
-fn ir_count_local_closure_uses(idx: Int, name: String) -> Int:
+fn ir_count_local_closure_uses(idx: Int, name: String, shadowed: Map[String, Bool]) -> Int:
     node := get_node(idx)
     if node.kind == "lambda" or node.kind == "spawn":
         return 0
@@ -2359,14 +2392,14 @@ fn ir_count_local_closure_uses(idx: Int, name: String) -> Int:
         callee := get_node(node.children[0])
         if callee.kind == "ident" and callee.value == name:
             n = 1
-        elif callee.kind == "ident":
+        elif callee.kind == "ident" and not shadowed.contains_key(callee.value) and not ir_global_slot_names.contains(callee.value):
             for pos in ir_local_closure_arg_positions(node, ir_resolve_static_callee(node.children[0]).name):
                 arg_idx := ir_call_arg_expr_index(node.children[pos + 1])
                 arg := get_node(arg_idx)
                 if arg.kind == "ident" and arg.value == name:
                     n = n + 1
     for child in node.children:
-        n = n + ir_count_local_closure_uses(child, name)
+        n = n + ir_count_local_closure_uses(child, name, shadowed)
     return n
 
 # the positional arguments of a static call that land in a recorded closure
@@ -3355,6 +3388,21 @@ fn ir_prepass_track_payload_tuple_binds(pat_idx: Int, names: List[String], poiso
         else:
             ir_prepass_track_payload_tuple_binds(sub_idx, names, poisoned)
 
+# a top-level match pattern on a non-optional subject binds uncounted views
+# (pat_binding, pat_tuple, or alternatives under pat_or). poison each such
+# binding name so a sibling arm or earlier local binding the same name with
+# an owned rc value becomes a kinded local instead of releasing an integer or
+# view under the other binding's rc kind at function exit. stops at
+# pat_variant because variant payload bindings own their own counts and are
+# handled by the pat_variant branch below.
+fn ir_prepass_poison_uncounted_pat_binds(pat_idx: Int, names: List[String], poisoned: List[String]):
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_binding":
+        ir_prepass_track_or_poison(pat.value, "", names, poisoned)
+    elif pat.kind == "pat_tuple" or pat.kind == "pat_or":
+        for child in pat.children:
+            ir_prepass_poison_uncounted_pat_binds(child, names, poisoned)
+
 # pre-pass: names of rc-typed binds anywhere in the body. an
 # under-approximation is safe (a missed name is never released, a leak),
 # while emission-time classification only widens, never narrows, so every
@@ -3403,7 +3451,21 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
                     pn := get_node(arm.children[0])
                     if pn.kind == "pat_binding":
                         ir_prepass_track_or_poison(pn.value, payload_kind, names, poisoned)
+                    else:
+                        ir_prepass_poison_uncounted_pat_binds(arm.children[0], names, poisoned)
                 ai = ai + 1
+        else:
+            mut ai := 1
+            while ai < node.children.len():
+                arm := get_node(node.children[ai])
+                if arm.children.len() > 0:
+                    ir_prepass_poison_uncounted_pat_binds(arm.children[0], names, poisoned)
+                ai = ai + 1
+    # a select receive arm manages its received binding's own lifetime (released
+    # at the end of the arm or moved as the select value), so poison its name if
+    # another site in the function tracks the same name as an rc local.
+    if node.kind == "select_recv_arm" and node.value.len() > 0:
+        ir_prepass_track_or_poison(node.value, "", names, poisoned)
     # an `if let` / `while let` bare binding on an optional subject binds the
     # unwrapped payload the way a match arm does, and ir_emit_let_bindings
     # gives an rc payload its own count on the terms of the shared
@@ -4151,7 +4213,7 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List
             if cn.children.len() == 0:
                 continue
             expr_idx = cn.children[0]
-        if local_fn_positions.contains(i - start_idx):
+        if local_fn_positions.contains(i - start_idx) and node_kind(expr_idx) == "lambda":
             arg_regs.push(ir_emit_local_fn_arg(expr_idx))
             pins.push("")
         else:
@@ -5439,6 +5501,11 @@ fn ir_emit_interp_spec_part(node: Node) -> Int:
         str_r = ir_string_interp_expr_part(expr_idx)
     width := ir_interp_spec_width(spec)
     if width <= 0:
+        # ir_string_interp_part_owned treats every interp_spec part as owned, so
+        # a borrowed string that bypasses format_pad (e.g. `{s:.2}`) must take a
+        # count of its own before the interpolation fold releases it.
+        if (prec < 0 or part_type != "float") and part_type == "string" and ir_expr_is_borrowed(expr_idx):
+            ir_string_retain_reg(str_r)
         return str_r
     w_r := ir_reg()
     ir_emit("iconst " + w_r.to_string() + " " + width.to_string())
@@ -5509,9 +5576,14 @@ fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
             ir_rc_release_reg(converted, "list")
             ir_release_owned_operand(expr_idx, part_r, part_type)
             return text_r
-    if part_type.len() > 0 and ir_struct_names.contains_key(part_type):
-        if not ir_boxed_enums.contains_key(part_type):
-            text_r := ir_emit_display_struct(part_r, part_type)
+    if part_type.len() > 0:
+        mut display_name := part_type
+        if not ir_struct_names.contains_key(display_name):
+            base := ir_struct_base_name(part_type)
+            if base.len() > 0 and ir_struct_names.contains_key(base):
+                display_name = base
+        if ir_struct_names.contains_key(display_name) and not ir_boxed_enums.contains_key(display_name):
+            text_r := ir_emit_display_struct(part_r, part_type, display_name, part_tid)
             ir_release_owned_operand(expr_idx, part_r, part_type)
             return text_r
     return part_r
@@ -5551,8 +5623,8 @@ fn ir_emit_display_map(map_r: Int, key_kind: String, val_kind: String) -> Int:
 # a struct in interpolation renders through its show() impl when one
 # exists; otherwise as "Name(field: value, ...)" with scalar and string
 # fields formatted and anything deeper shown as "...".
-fn ir_emit_display_struct(obj_r: Int, struct_name: String) -> Int:
-    show_name := ir_lookup_impl_method_name(struct_name, "show")
+fn ir_emit_display_struct(obj_r: Int, full_name: String, struct_name: String, struct_tid: Int) -> Int:
+    show_name := ir_lookup_impl_method_name(full_name, "show")
     if show_name.len() > 0:
         r := ir_reg()
         ir_emit_call1(r, show_name, "string", obj_r)
@@ -5563,7 +5635,13 @@ fn ir_emit_display_struct(obj_r: Int, struct_name: String) -> Int:
     mut fi := 0
     while fi < total:
         field_name := ir_struct_field_name_at(struct_name, fi)
-        field_kind := ir_struct_field_type_name(struct_name, field_name)
+        mut field_kind := ir_struct_field_type_name(struct_name, field_name)
+        if struct_tid >= 0:
+            sinfo := get_type_info(struct_tid)
+            if sinfo.kind == "struct" and fi < sinfo.field_types.len():
+                concrete_fk := ir_type_from_tid(sinfo.field_types[fi])
+                if concrete_fk.len() > 0:
+                    field_kind = concrete_fk
         mut label := field_name + ": "
         if fi > 0:
             label = ", " + field_name + ": "
@@ -5669,7 +5747,7 @@ fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String], borrowed
 fn ir_emit_lambda_hidden_param():
     closure_r := ir_reg()
     ir_var_regs.insert("__closure", closure_r)
-    ir_emit("param __closure")
+    ir_emit("param __closure word")
 
 fn ir_emit_lambda_capture_loads(captures: List[String]):
     closure_r := ir_var_regs["__closure"]
@@ -8807,8 +8885,14 @@ fn ir_emit_stringify_value(value_r: Int, value_tid: Int) -> Int:
             return ir_emit_display_list(value_r, ir_type_from_tid(value_info.inner), false)
         if value_info.kind == "map":
             return ir_emit_display_map(value_r, ir_type_from_tid(value_info.key_type), ir_type_from_tid(value_info.value_type))
-    if value_type.len() > 0 and ir_struct_names.contains_key(value_type) and not ir_boxed_enums.contains_key(value_type):
-        return ir_emit_display_struct(value_r, value_type)
+    if value_type.len() > 0:
+        mut display_name := value_type
+        if not ir_struct_names.contains_key(display_name):
+            base := ir_struct_base_name(value_type)
+            if base.len() > 0 and ir_struct_names.contains_key(base):
+                display_name = base
+        if ir_struct_names.contains_key(display_name) and not ir_boxed_enums.contains_key(display_name):
+            return ir_emit_display_struct(value_r, value_type, display_name, value_tid)
     return value_r
 
 fn ir_emit_result_to_string(node: Node) -> Int:
@@ -9859,6 +9943,7 @@ fn ir_emit_string_interp(idx: Int) -> Int:
 # --- lambda compilation ---
 struct LambdaParts:
     params: List[String]
+    param_types: List[String]
     body_idx: Int
     captures: List[String]
     # the lambda's declared return kind and, when that is an optional, its
@@ -9869,6 +9954,7 @@ struct LambdaParts:
 
 fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
     mut params: List[String] := []
+    mut param_types: List[String] := []
     mut body_idx := 0 - 1
     mut ret_kind := ""
     mut ret_inner := ""
@@ -9878,6 +9964,7 @@ fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
         cn := get_node(child)
         if cn.kind == "param":
             params.push(cn.value)
+            param_types.push(ir_extract_param_type(child))
         elif cn.kind == "body" or cn.kind == "block":
             body_idx = child
         elif cn.kind == "returns":
@@ -9888,7 +9975,7 @@ fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
     mut captures: List[String] := []
     if body_idx >= 0:
         captures = ir_find_free_vars(body_idx, params)
-    return LambdaParts(params, body_idx, captures, ret_kind, ret_inner)
+    return LambdaParts(params, param_types, body_idx, captures, ret_kind, ret_inner)
 
 fn ir_reset_lambda_emit_state():
     ir_builder_reset_function()
@@ -9904,11 +9991,19 @@ fn ir_reset_lambda_emit_state():
     # caller saves the outer mapping first and puts it back afterwards.
     ir_loop_var_slots = {}
 
-fn ir_emit_lambda_params(params: List[String]):
-    for param in params:
+fn ir_emit_lambda_params(params: List[String], param_types: List[String]):
+    for param, i in params:
         lr := ir_reg()
-        ir_var_regs.insert(param, lr)
-        ir_emit("param " + param)
+        mut bare := param
+        if bare.ends_with(" mut"):
+            bare = bare.substring(0, bare.len() - 4)
+        ir_var_regs.insert(bare, lr)
+        mut ptype := ""
+        if i < param_types.len():
+            ptype = param_types[i]
+        if ptype.len() > 0 and ptype != "unknown":
+            ir_var_types.insert(bare, ptype)
+        ir_emit("param " + param + ir_param_kind_suffix(ptype))
 
 # a lambda's returned value transfers to the caller, like any function
 # return: a borrowed value (a field read, a parameter, a captured name) takes
@@ -10036,7 +10131,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # global spelled the same.
     ir_emit_func_header(lambda_name, parts.params.len() + 1, "unknown")
     ir_emit_lambda_hidden_param()
-    ir_emit_lambda_params(parts.params)
+    ir_emit_lambda_params(parts.params, parts.param_types)
     ir_emit_lambda_capture_loads(parts.captures)
     # the body's own owned locals, collected the way a named function's are,
     # and in the same position: after the header and the params, so the
@@ -10775,6 +10870,15 @@ fn ir_emit_main_error_exit(err_r: Int, err_kind: String):
         ir_rc_release_reg(err_r, err_kind)
     ir_emit_main_zero_ret()
 
+# whether any deferred statement in scope will execute at this exit edge.
+fn ir_has_active_defers(is_error_exit: Bool) -> Bool:
+    mut i := 0
+    while i < ir_defer_nodes.len():
+        if is_error_exit or ir_defer_is_err[i] == 0:
+            return true
+        i = i + 1
+    return false
+
 fn ir_emit_fail_expr(node: Node) -> Int:
     if node.children.len() > 0:
         err_r := ir_expr(node.children[0])
@@ -10783,12 +10887,18 @@ fn ir_emit_fail_expr(node: Node) -> Int:
         # returned borrow gets a fresh count. the result tuple only borrows
         # the error slot, so without this the function's other owned locals
         # leaked on every fail (cleanup ran only on the normal return).
+        # when defers/errdefers are active, retain `err_r` before running them
+        # and let cleanup release the local slot afterward so a defer that
+        # reassigns the local can neither free `err_r` nor leak its new value.
         mut exclude := ""
         expr_node := get_node(node.children[0])
         err_kind := ir_rc_kind(ir_infer_type(node.children[0]))
         if err_kind.len() > 0:
             if ir_rc_local_kind(ir_returned_local_name(expr_node)) == err_kind:
-                exclude = expr_node.value
+                if ir_has_active_defers(true):
+                    ir_rc_retain_reg(err_r, err_kind)
+                else:
+                    exclude = expr_node.value
             elif ir_expr_is_borrowed(node.children[0]):
                 ir_rc_retain_reg(err_r, err_kind)
         if ir_current_func_return_kind == "result_reg":
@@ -11972,10 +12082,21 @@ pub fn ir_emit_return_value(expr_child: Int):
     # in a generic body the inferred type can miss (a tuple-lowered
     # optional reads back as the optional type, whose rc_kind is empty),
     # yet the local is still tracked and returning it must not release it.
-    if ir_rc_local_kind(ir_returned_local_name(expr_node)).len() > 0:
-        exclude = expr_node.value
-        pair_source = "local"
-        box_may_share = true
+    local_rc_kind := ir_rc_local_kind(ir_returned_local_name(expr_node))
+    if local_rc_kind.len() > 0:
+        if ir_has_active_defers(false) and (local_rc_kind != "tuple" or not ir_tuple_cascade_names.contains(expr_node.value)):
+            # defers run before exit cleanup and may reassign the returned
+            # local, dropping the count it held when `r` was loaded and leaving
+            # a fresh value in the slot. retain `r` now and let exit cleanup
+            # release the slot after defers finish so neither a UAF nor a leak
+            # can happen.
+            ir_rc_retain_reg(r, local_rc_kind)
+            pair_source = "local"
+            box_may_share = true
+        else:
+            exclude = expr_node.value
+            pair_source = "local"
+            box_may_share = true
     else:
         # substitute struct params (T -> the concrete type) so a specialized
         # impl method returning a borrowed T still retains it. without this

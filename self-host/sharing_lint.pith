@@ -1448,6 +1448,8 @@ fn alias_call_events(af: AliasFlow, body: AliasBody, idx: Int, block: Int):
                     fname = info.fields[i - 1]
                 if fname != "" and is_guarded_field(tid, fname):
                     push_alias_event(body, "guarded_init", 0 - 1, arg_value(child), idx, block, fname)
+                elif fname != "" and is_frozen_field(tid, fname):
+                    push_alias_event(body, "frozen_init", tid, arg_value(child), idx, block, fname)
         return
     # an enum variant or a builtin function keeps nothing. a method on a
     # value whose type names no declaration may keep its receiver and
@@ -1929,6 +1931,23 @@ fn alias_solve(af: AliasFlow, body: AliasBody, report: Bool) -> AliasSummary:
                             changed = true
     groups := alias_groups(st)
     consumed := judge_sinks(af, body, st, groups, report)
+    # any unmutated non-parameter local stored into a frozen field now backs
+    # that frozen slot; record its `z<tid>.<field>` source on the group before
+    # summarizing so any return of that local (e.g. a cache that inserts and
+    # returns the same list) hands callers a frozen buffer they may read but
+    # never mutate (E275). parameters are excluded here because their callers
+    # are judged through `consumed` ("E248f") instead.
+    for ev in body.events:
+        if ev.kind == "frozen_init" and ev.a >= 0 and node_may_share(af, ev.b):
+            fr := alias_roots(af, st, ev.b)
+            zsrc := "z" + ev.a.to_string() + "." + ev.what
+            for l in fr.locals:
+                if body.initial.contains_key(l):
+                    continue
+                root := uf_find(st, l)
+                if not groups.mutated.contains_key(root) and not groups.escaped.contains_key(root):
+                    add_local_source(groups.own, root, zsrc)
+                    add_local_source(groups.all, root, zsrc)
     summary := summarize(af, body, st, groups, consumed)
     if report:
         report_alias_errors(af, body, st, groups)
@@ -2221,15 +2240,28 @@ fn returns_after(parent: Int, child: Int) -> Bool:
     return false
 
 # whether `use` sits in another branch of an `if` or a `match` than the
-# value whose path up the tree `path` records
+# value whose path up the tree `path` records. a condition (`if` / `elif`
+# test), a `match` subject, or a `match` arm guard runs before the branches
+# that follow it, so it is never mutually exclusive with them.
 fn exclusive_branches(body: AliasBody, path: Map[Int, Int], use: Int) -> Bool:
     mut at := use
     while body.parents.contains_key(at):
         parent := body.parents[at]
         if path.contains_key(parent):
-            kind := get_node(parent).kind
+            pn := get_node(parent)
+            kind := pn.kind
             branching := kind == "if_stmt" or kind == "if_expr" or kind == "match" or kind == "match_expr"
-            return branching and path[parent] != at
+            if not branching or path[parent] == at:
+                return false
+            val_branch := path[parent]
+            if pn.children.len() > 0 and val_branch == pn.children[0]:
+                return false
+            vbn := get_node(val_branch)
+            if vbn.kind == "elif" and vbn.children.len() > 0 and path.contains_key(val_branch) and path[val_branch] == vbn.children[0]:
+                return false
+            if (kind == "match" or kind == "match_expr") and path.contains_key(val_branch) and get_node(path[val_branch]).kind == "guard":
+                return false
+            return true
         at = parent
     return false
 
@@ -2261,6 +2293,60 @@ fn guarded_store_refusal(af: AliasFlow, body: AliasBody, st: AliasSolve, g: Alia
     if not af.aliasing_guards.contains_key(guard):
         guard = ""
     return shared_refusal(af, body, st, g, ev.b, consumed, guard)
+
+# why a value initializing a `frozen` field may still be mutated through
+# another name, or "". a frozen field is immutable, so module globals (`g*`),
+# other frozen fields (`z*`), moved locals, and unmutated/unescaped read-only
+# locals are safe; unmutated/unescaped parameters (or self) are propagated to
+# callers via `consumed` so every caller judges what it passes.
+fn frozen_refusal(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, value: Int, consumed: List[String]) -> String:
+    r := alias_roots(af, st, value)
+    for src in r.sources:
+        if not allowed_source(src, "*"):
+            return describe_source(af, src)
+    for src in r.held_sources:
+        if not allowed_source(src, "*"):
+            return describe_source(af, src)
+    mut groups: List[Int] := []
+    for l in r.locals:
+        push_local(groups, uf_find(st, l))
+    for l in r.held_locals:
+        push_local(groups, uf_find(st, l))
+    mut at := 0
+    while at < groups.len():
+        for h, i in st.holders:
+            if uf_find(st, h) == groups[at]:
+                push_local(groups, uf_find(st, st.held[i]))
+        at = at + 1
+    mut propagated: List[String] := []
+    for root in groups:
+        mut members: List[Int] := [root]
+        if g.members.contains_key(root):
+            members = g.members[root]
+        name := "'" + local_name(members[0]) + "'"
+        mut own_params: List[String] := []
+        for m in members:
+            if body.initial.contains_key(m):
+                if body.initial[m] == "x":
+                    return "'" + local_name(m) + "', a closure's argument, which its caller may still change"
+                push_source(own_params, body.initial[m])
+        for src in list_of(g.all, root):
+            if not own_params.contains(src) and not allowed_source(src, "*"):
+                return describe_source(af, src)
+        if g.escaped.contains_key(root):
+            return name + ", which is also stored where the checker cannot follow it"
+        for h, i in st.holders:
+            if uf_find(st, st.held[i]) == root and not groups.contains(uf_find(st, h)):
+                hroot := uf_find(st, h)
+                if g.mutated.contains_key(hroot) or g.escaped.contains_key(hroot):
+                    return name + ", which '" + local_name(h) + "' also holds"
+        if used_again(af, body, members, value) and g.mutated.contains_key(root):
+            return name + ", which this scope still changes in place"
+        for src in own_params:
+            push_source(propagated, src)
+    for src in propagated:
+        push_source(consumed, src)
+    return ""
 
 # judge each value the body hands to another task, stores into a guarded
 # collection, or passes to a parameter its callee keeps that way, reporting
@@ -2304,6 +2390,14 @@ fn judge_sinks(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, r
             elif report:
                 node := get_node(ev.b)
                 af.out.push(Diagnostic("error", "E276", "'" + ev.what + "' is guarded, and the value this builds it with shares a buffer with " + what + ", so the buffer is reached outside the lock", file, node.line, node.col, "build the value in the call, or store a copy"))
+        elif ev.kind == "frozen_init" and node_may_share(af, ev.b):
+            mut moved: List[String] := []
+            what := frozen_refusal(af, body, st, g, ev.b, moved)
+            if what == "":
+                note_consumed(consumed, moved, "E248f")
+            elif report:
+                node := get_node(ev.b)
+                af.out.push(Diagnostic("error", "E248", "'" + ev.what + "' is frozen, and the value this builds it with shares a buffer with " + what + ", so this scope could still change what a task reads", file, node.line, node.col, "build the value in the call, move a local the scope does not use again, or pass a copy"))
         elif ev.kind == "call":
             for t in af.targets[ev.a]:
                 if af.summaries.contains_key(t):
@@ -2312,15 +2406,23 @@ fn judge_sinks(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, r
                         arg := call_arg(af, ev.a, t, key)
                         if arg >= 0 and node_may_share(af, arg):
                             mut moved: List[String] := []
-                            what := shared_refusal(af, body, st, g, arg, moved, "")
+                            mut what := ""
+                            if kept[key] == "E248f":
+                                what = frozen_refusal(af, body, st, g, arg, moved)
+                            else:
+                                what = shared_refusal(af, body, st, g, arg, moved, "")
                             if what == "":
                                 note_consumed(consumed, moved, kept[key])
                             elif report:
+                                mut code := kept[key]
                                 mut where := "hands it to another task"
-                                if kept[key] == "E276":
+                                if code == "E276":
                                     where = "stores it under a lock"
+                                elif code == "E248f":
+                                    code = "E248"
+                                    where = "stores it in a frozen field"
                                 node := get_node(arg)
-                                af.out.push(Diagnostic("error", kept[key], "'" + get_node(t).value + "' " + where + ", so it must hold no buffer anything else reaches, and this argument shares one with " + what, file, node.line, node.col, "pass a value nothing else holds, or a copy"))
+                                af.out.push(Diagnostic("error", code, "'" + get_node(t).value + "' " + where + ", so it must hold no buffer anything else reaches, and this argument shares one with " + what, file, node.line, node.col, "pass a value nothing else holds, or a copy"))
     if report:
         report_lock_leaks(af, body, st, g)
     for ev in st.guarded_stores:

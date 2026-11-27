@@ -1,0 +1,60 @@
+# Regression test for #1130: unguarded fused map upserts (`m[k] = m[k] + d`,
+# `m.insert(k, m[k] + d)`, `m[k] += d`) must fuse into `map_try_upsert_add*`
+# inside `-> T!` functions, updating in one probe on hit and propagating a
+# missing key as an error without mutating the map.
+
+import std.bytes as bytes
+
+mut defer_hits := 0
+
+fn note_defer():
+    defer_hits += 1
+
+fn bump_str(m: Map[String, Int], k: String, d: Int) -> Int!:
+    defer note_defer()
+    m[k] = m[k] + d
+    m.insert(k, m[k] + 2)
+    m[k] += 3
+    return m[k]
+
+fn bump_int(m: Map[Int, Int], k: Int, d: Int) -> Int!:
+    m[k] = m[k] + d
+    m.insert(k, m[k] + 2)
+    m[k] += 3
+    return m[k]
+
+fn bump_bytes(m: Map[Bytes, Int], k: Bytes, d: Int) -> Int!:
+    m[k] = m[k] + d
+    m.insert(k, m[k] + 2)
+    m[k] += 3
+    return m[k]
+
+struct MyErr:
+    code: Int
+
+fn bump_custom_err(m: Map[String, Int], k: String, d: Int) -> Int!MyErr:
+    m[k] += d
+    return m[k]
+
+fn main() -> Int!:
+    mut sm: Map[String, Int] := {"a": 10}
+    s_ok := bump_str(sm, "a", 5)!
+    s_miss := bump_str(sm, "missing", 5)
+    print("str_ok={s_ok} str_miss={s_miss.is_err} str_len={sm.len()} defers={defer_hits}")
+
+    mut im: Map[Int, Int] := {7: 20}
+    i_ok := bump_int(im, 7, 4)!
+    i_miss := bump_int(im, 99, 4)
+    print("int_ok={i_ok} int_miss={i_miss.is_err} int_len={im.len()}")
+
+    k1 := bytes.from_string_utf8("k1")
+    k2 := bytes.from_string_utf8("k2")
+    mut bm: Map[Bytes, Int] := {}
+    bm[k1] = 30
+    b_ok := bump_bytes(bm, k1, 6)!
+    b_miss := bump_bytes(bm, k2, 6)
+    print("bytes_ok={b_ok} bytes_miss={b_miss.is_err} bytes_len={bm.len()}")
+
+    c_ok := bump_custom_err(sm, "a", 1) catch 0
+    print("custom_ok={c_ok}")
+    return 0

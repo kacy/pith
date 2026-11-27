@@ -385,9 +385,11 @@ fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
     return out
 
 # the 64-bit sha-2 core behind sha-384 and sha-512, shaped like sha2_32
-# with 128-byte blocks and 80 rounds. sha2_64_reference below is the
-# definition this replaced, kept as the randomized test's oracle.
-fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
+# with 128-byte blocks and 80 rounds. when `hardware` is true, whole blocks go
+# through the runtime's native `sha512_blocks` kernel first; tests pass false
+# to keep the pith block loop verified alongside it. sha2_64_reference below is
+# the definition this replaced, kept as the randomized test's oracle.
+fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int, hardware: Bool) -> String:
     mut h0 := ih0
     mut h1 := ih1
     mut h2 := ih2
@@ -405,6 +407,18 @@ fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
     k := sha512_round_constants
 
     mut block := 0
+    if hardware and full > 0:
+        state := [h0, h1, h2, h3, h4, h5, h6, h7]
+        if sha512_blocks(state, input, full / 128):
+            h0 = state[0]
+            h1 = state[1]
+            h2 = state[2]
+            h3 = state[3]
+            h4 = state[4]
+            h5 = state[5]
+            h6 = state[6]
+            h7 = state[7]
+            block = full
     while block < total:
         if block < full:
             sha_load_words64(w, input, block)
@@ -756,7 +770,7 @@ pub fn sha224_string(input: String) -> String:
 
 # compute a sha-512 digest and return it as lowercase hex.
 pub fn sha512(input: Bytes) -> String:
-    return sha2_64(input, 7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809, 8)
+    return sha2_64(input, 7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809, 8, true)
 
 # compute a sha-512 digest and return raw bytes.
 pub fn sha512_bytes(input: Bytes) -> Bytes:
@@ -772,7 +786,7 @@ pub fn sha512_string(input: String) -> String:
 
 # compute a sha-384 digest and return it as lowercase hex.
 pub fn sha384(input: Bytes) -> String:
-    return sha2_64(input, -3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257, 7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076, 6)
+    return sha2_64(input, -3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257, 7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076, 6, true)
 
 # compute a sha-384 digest and return raw bytes.
 pub fn sha384_bytes(input: Bytes) -> Bytes:
@@ -1311,6 +1325,9 @@ test "sha2_64 agrees with the copy-into-a-list definition":
         assert_eq(data.len(), want)
         assert_eq(sha512(data), sha2_64_reference(data, 7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809, 8))
         assert_eq(sha384(data), sha2_64_reference(data, -3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257, 7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076, 6))
+        # the pith block loop alone, which sha512/sha384 bypass via sha512_blocks
+        assert_eq(sha2_64(data, 7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809, 8, false), sha512(data))
+        assert_eq(sha2_64(data, -3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257, 7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076, 6, false), sha384(data))
         trial = trial + 1
 
 test "sha1 agrees with the copy-into-a-list definition":

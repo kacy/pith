@@ -275,6 +275,12 @@ unsafe fn invoke_tracer(tracer: usize, ptr: i64) {
 /// The children a struct's tracer reports, weak fields included (kind 8), for
 /// the shared-marking walk. A struct without a tracer reports none.
 pub(crate) unsafe fn struct_children(ptr: i64, f: &mut dyn FnMut(i64, u8)) {
+    // Never invoke a tracer on a dead or mid-destructor struct whose fields
+    // have already been released or poisoned.
+    // SAFETY: `cycle_struct_alive` validates the struct header magic.
+    if unsafe { crate::runtime_core::cycle_struct_alive(ptr) } != Some(true) {
+        return;
+    }
     // SAFETY: Caller guarantees `ptr` is a live struct pointer.
     let dtor = unsafe { crate::runtime_core::cycle_struct_dtor_slot(ptr) };
     if dtor == 0 {
@@ -631,17 +637,25 @@ fn exit_native() {
 }
 
 /// wait out a stop request on the gc condvar, then come back as `running`.
-/// spurious wakes just re-check `GC_STOP` under the gate lock and wait again.
+/// spurious wakes just re-check `GC_STOP` under the gate lock and wait again,
+/// and after publishing `MUTATOR_RUNNING` we re-check `GC_STOP` (the same
+/// Dekker handshake as `exit_native`) so a back-to-back stop that observed
+/// `MUTATOR_PARKED_FOR_GC` right before our store cannot run concurrently.
 fn park_for_gc(slot: &MutatorSlot) {
-    slot.state.store(MUTATOR_PARKED_FOR_GC, Ordering::SeqCst);
-    let mut guard = lock_gate();
-    while GC_STOP.load(Ordering::SeqCst) {
-        guard = GC_GATE_CV
-            .wait(guard)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        slot.state.store(MUTATOR_PARKED_FOR_GC, Ordering::SeqCst);
+        let mut guard = lock_gate();
+        while GC_STOP.load(Ordering::SeqCst) {
+            guard = GC_GATE_CV
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(guard);
+        slot.state.store(MUTATOR_RUNNING, Ordering::SeqCst);
+        if !GC_STOP.load(Ordering::SeqCst) {
+            break;
+        }
     }
-    drop(guard);
-    slot.state.store(MUTATOR_RUNNING, Ordering::SeqCst);
 }
 
 /// is every registered mutator provably not running? `native`, `parked`, and
@@ -1244,19 +1258,23 @@ unsafe fn validate_suspect(ptr: usize, kind: u8) -> Option<(u8, bool)> {
         }
         CYCLE_KIND_CLOSURE => {
             // SAFETY: Caller holds STW and `ptr` came from a buffered closure entry.
-            if unsafe { crate::runtime_core::cycle_closure_strong_count(ptr as i64) }.is_some() {
+            if unsafe { crate::runtime_core::cycle_closure_strong_count(ptr as i64) }
+                .is_some_and(|c| c > 0)
+            {
                 // SAFETY: Closure validated live above.
                 unsafe { crate::runtime_core::cycle_clear_closure_buffered(ptr as i64) };
                 Some((CHILD_KIND_CLOSURE, false))
             } else {
-                // scrubbed magic: the object died into the graveyard, whose
-                // snapshot below frees the shell.
+                // scrubbed magic or dying (rc == 0): the object died into the
+                // graveyard, whose snapshot below frees the shell.
                 None
             }
         }
         CYCLE_KIND_LIST => {
             // SAFETY: Caller holds STW and `ptr` came from a buffered list entry.
-            if unsafe { crate::collections::list::cycle_list_strong_count(ptr as i64) }.is_some() {
+            if unsafe { crate::collections::list::cycle_list_strong_count(ptr as i64) }
+                .is_some_and(|c| c > 0)
+            {
                 // SAFETY: List validated live above.
                 unsafe { crate::collections::list::cycle_clear_list_buffered(ptr as i64) };
                 Some((CHILD_KIND_LIST, false))
@@ -1266,7 +1284,9 @@ unsafe fn validate_suspect(ptr: usize, kind: u8) -> Option<(u8, bool)> {
         }
         CYCLE_KIND_MAP => {
             // SAFETY: Caller holds STW and `ptr` came from a buffered map entry.
-            if unsafe { crate::collections::map::cycle_map_strong_count(ptr as i64) }.is_some() {
+            if unsafe { crate::collections::map::cycle_map_strong_count(ptr as i64) }
+                .is_some_and(|c| c > 0)
+            {
                 // SAFETY: Map validated live above.
                 unsafe { crate::collections::map::cycle_clear_map_buffered(ptr as i64) };
                 Some((CHILD_KIND_MAP, false))

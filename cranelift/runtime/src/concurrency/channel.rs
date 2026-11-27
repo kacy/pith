@@ -1000,7 +1000,7 @@ fn channel_send_impl(t: &TaggedChannel, value: i64) -> i64 {
             // wake on `sender_waiting`, so an uncounted sender here would
             // never be notified (a hang on the rendezvous handshake).
             state.sender_waiting += 1;
-            while !state.closed && state.pending_value.is_some() {
+            while !state.closed && state.deliveries == handoffs_before {
                 state = block_on_channel(&park, inner, state, green_task, Role::Sender);
             }
             state.sender_waiting -= 1;
@@ -1819,6 +1819,35 @@ mod tests {
             assert_eq!(got, Some(42));
             // Subsequent recv observes closed & drained.
             assert_eq!(channel_recv(ch), None);
+            pith_channel_release(ch);
+        }
+    }
+
+    #[test]
+    fn unbuffered_multi_sender_rendezvous_does_not_deadlock() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let ch = pith_channel_new(0, 0);
+            let senders = 4i64;
+            let per = 50i64;
+            let handles: Vec<_> = (0..senders)
+                .map(|s| {
+                    std::thread::spawn(move || {
+                        for i in 0..per {
+                            assert_eq!(pith_channel_send(ch, s * per + i), 1);
+                        }
+                    })
+                })
+                .collect();
+            let mut total = 0i64;
+            for _ in 0..(senders * per) {
+                total += channel_recv(ch).expect("unbuffered value");
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            let n = senders * per;
+            assert_eq!(total, n * (n - 1) / 2);
             pith_channel_release(ch);
         }
     }

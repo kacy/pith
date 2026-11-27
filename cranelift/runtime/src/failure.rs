@@ -101,15 +101,28 @@ pub unsafe extern "C" fn pith_isolate_call(closure: i64) -> *mut i8 {
         message: None,
         locks: Vec::new(),
     };
+    // Restore the previous isolation frame head even if `run` unwinds via a
+    // Rust panic, so neither `THREAD_FRAME` nor a recycled green task's
+    // `TlsMap::isolation` can ever retain a dangling stack pointer.
+    struct HeadGuard {
+        prev: *mut Frame,
+    }
+    impl Drop for HeadGuard {
+        fn drop(&mut self) {
+            set_head(self.prev);
+        }
+    }
     // every access below goes through `fp`, so the compiler reloads the frame
     // after the call: a failure writes it from another function.
     let fp: *mut Frame = &mut frame;
+    let head_guard = HeadGuard { prev: frame.prev };
     set_head(fp);
     // SAFETY: `fp` points to our live stack frame and `func`/`closure` form a valid pith closure.
     unsafe { run(fp, func, closure) };
     // read the head's slot afresh: the task may be on another thread by now.
     // SAFETY: `fp` points to our stack-local `frame`.
     let prev = unsafe { (*fp).prev };
+    drop(head_guard);
     set_head(prev);
     // SAFETY: `fp` is unlinked from the catch chain and uniquely owned by this stack frame.
     let (locks, message) = unsafe { (std::mem::take(&mut (*fp).locks), (*fp).message.take()) };

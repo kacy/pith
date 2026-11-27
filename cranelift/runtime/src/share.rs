@@ -231,3 +231,47 @@ fn check_local_slow(ptr: i64, op: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DEAD_TRACER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn dead_dtor(_ptr: i64) {}
+
+    extern "C" fn dead_tracer(_ptr: i64) {
+        DEAD_TRACER_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn mark_shared_skips_tracer_on_dead_weak_struct() {
+        DEAD_TRACER_CALLS.store(0, Ordering::Relaxed);
+        unsafe {
+            crate::cycle::pith_cc_register_tracer(
+                dead_dtor as *const () as usize as i64,
+                dead_tracer as *const () as usize as i64,
+            );
+            let target = crate::runtime_core::pith_struct_alloc(1);
+            crate::runtime_core::pith_struct_set_dtor(
+                target,
+                dead_dtor as *const () as usize as i64,
+            );
+            // Hold a weak ref so the header survives after the last strong release.
+            crate::runtime_core::pith_struct_weak_retain(target);
+            crate::runtime_core::pith_struct_release(target);
+            // Struct is now dead (`STRUCT_DEAD_BIT` set), header still alive via weak count.
+            assert_eq!(crate::runtime_core::cycle_struct_alive(target), Some(false));
+            // Sharing through a weak edge must set STRUCT_SHARED_BIT without running its tracer.
+            share_value(target, ListTypeTag::Struct);
+            assert!(crate::runtime_core::struct_is_shared(target));
+            assert_eq!(
+                DEAD_TRACER_CALLS.load(Ordering::Relaxed),
+                0,
+                "share.rs must never invoke a tracer on a dead weak-referenced struct"
+            );
+            crate::runtime_core::pith_struct_weak_release(target);
+        }
+    }
+}

@@ -9,6 +9,9 @@
 #
 # __ROOT__ in a case or expectation stands for the repo root, so cases
 # can reference fixture files under tests/lsp/fixtures/ from any checkout.
+# __VERSION__ stands for the version in Cargo.toml, so the harness catches
+# drift between lsp_server and Cargo.toml without churning every golden file
+# on each release.
 #
 # LSP_CHECK_UPDATE=1 rewrites the expected files from the current output
 # instead of diffing; eyeball every line before freezing.
@@ -16,6 +19,7 @@ set -u
 export LC_ALL=C
 
 root="$PWD"
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 server="./self-host/pith_main"
 update="${LSP_CHECK_UPDATE:-0}"
 fail=0
@@ -41,8 +45,10 @@ for case_file in tests/lsp/cases/*.jsonl; do
     status=$?
 
     # deframe: put each body on its own line, drop headers and blank
-    # separators, and hide the repo root on the way out
-    got=$(sed 's/Content-Length:/\n&/g' "$tmp_out" | grep -v '^Content-Length' | sed '/^\r*$/d' | sed "s|$root|__ROOT__|g")
+    # separators, hide the repo root, and normalize the Cargo.toml version
+    # in serverInfo so version bumps don't churn every golden while drift
+    # between Cargo.toml and lsp_server still fails the check
+    got=$(sed 's/Content-Length:/\n&/g' "$tmp_out" | grep -v '^Content-Length' | sed '/^\r*$/d' | sed "s|$root|__ROOT__|g; s|\"serverInfo\":{\"name\":\"pith-lsp\",\"version\":\"$version\"}|\"serverInfo\":{\"name\":\"pith-lsp\",\"version\":\"__VERSION__\"}|g")
     rm -f "$tmp_in" "$tmp_out"
 
     if [ "$status" -ne 0 ]; then

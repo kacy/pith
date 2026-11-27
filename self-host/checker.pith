@@ -53,6 +53,10 @@ mut all_wildcard_import_sources: Map[String, List[String]] := {}
 mut current_checker_module_path: String := ""
 mut checked_module_paths: Map[String, Bool] := {}
 mut generic_inference_subst: Map[String, Int] := {}
+# active (a, b) type-id pairs inside types_structurally_equal so cyclic
+# self-referential or mutually recursive structs/enums terminate instead of
+# overflowing the stack (#1508).
+mut structural_eq_visiting: Map[String, Bool] := {}
 # the value expression the arm helper just typed, or -1 for a block arm or
 # an empty body. the match and select expression checkers read it straight
 # after each arm, so a branch can be recorded as widening into the optional
@@ -353,6 +357,7 @@ pub fn initialize_checker(file_path: String):
     current_checker_module_path = ""
     checked_module_paths = {}
     generic_inference_subst = {}
+    structural_eq_visiting = {}
     active_subst_params = []
     active_subst_args = []
     generic_call_subst = {}
@@ -10043,27 +10048,50 @@ fn types_structurally_equal(a: Int, b: Int) -> Bool:
         if bi.kind == "struct":
             if ai.fields.len() != bi.fields.len():
                 return false
+            pair_key := a.to_string() + ":" + b.to_string()
+            if structural_eq_visiting.contains_key(pair_key):
+                return true
+            if structural_eq_visiting.len() > 64:
+                return false
+            structural_eq_visiting.insert(pair_key, true)
+            mut same := true
             for field_name, i in ai.fields:
                 if field_name != bi.fields[i]:
-                    return false
+                    same = false
+                    break
                 if types_structurally_equal(ai.field_types[i], bi.field_types[i]) == false:
-                    return false
-            return true
+                    same = false
+                    break
+            structural_eq_visiting.remove(pair_key)
+            return same
     # enum structural equality
     if ai.kind == "enum":
         if bi.kind == "enum":
             if ai.variants.len() != bi.variants.len():
                 return false
+            pair_key := a.to_string() + ":" + b.to_string()
+            if structural_eq_visiting.contains_key(pair_key):
+                return true
+            if structural_eq_visiting.len() > 64:
+                return false
+            structural_eq_visiting.insert(pair_key, true)
+            mut same := true
             for variant_name, i in ai.variants:
                 if variant_name != bi.variants[i]:
-                    return false
+                    same = false
+                    break
                 # compare variant field types
                 if ai.variant_types[i].len() != bi.variant_types[i].len():
-                    return false
+                    same = false
+                    break
                 for field_type, j in ai.variant_types[i]:
                     if types_structurally_equal(field_type, bi.variant_types[i][j]) == false:
-                        return false
-            return true
+                        same = false
+                        break
+                if not same:
+                    break
+            structural_eq_visiting.remove(pair_key)
+            return same
     return false
 
 fn types_compatible(actual: Int, expected: Int) -> Bool:

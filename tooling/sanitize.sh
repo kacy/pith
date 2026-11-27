@@ -69,6 +69,7 @@ measures_memory=(
 # program several times over, so these can miss the bound; they still run,
 # and still fail on a report, but their output is not compared.
 measures_time=(
+  test_markdown_linear
   test_regex_linear
 )
 

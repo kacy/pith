@@ -1491,7 +1491,10 @@ fn parse_interp_expr(text: String, base_line: Int, base_col: Int) -> Int:
     while check("err"):
         advance_token()
     if not check("eof"):
-        parser_report_error_at(tok_line(current_token_position), tok_col(current_token_position), "E242", "unexpected token in interpolation: " + _cur_tok_kind(), "")
+        if check("colon"):
+            parser_report_error_at(tok_line(current_token_position), tok_col(current_token_position), "E242", "invalid format spec in interpolation; expected [<>^][0]digits[.digits]", "to print a brace, double it: `{{{{` or `}}}}`")
+        else:
+            parser_report_error_at(tok_line(current_token_position), tok_col(current_token_position), "E242", "unexpected token in interpolation: " + _cur_tok_kind(), "")
 
     # restore parser state
     load_token_snapshot(saved_kinds, saved_values, saved_lines, saved_cols, saved_offsets, saved_lens)

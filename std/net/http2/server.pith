@@ -592,7 +592,7 @@ impl Server:
                 ids.push(stream_id)
         for stream_id in ids:
             if let inbox = self.inbox_for(stream_id):
-                if not inbox.try_send(reset_event(frames.ERROR_CANCEL)):
+                if not try_deliver(inbox, reset_event(frames.ERROR_CANCEL)):
                     inbox.close()
 
     # close every open stream's inbox so handlers blocked on recv() unblock, then
@@ -614,6 +614,13 @@ impl Server:
             empty_credit: Map[Int, Channel[Int]] := {}
             self.credit = empty_credit
             self.active = []
+
+# non-blocking inbox delivery that drops the event cleanly when the channel is
+# full or closed, preventing reader-task deadlocks without leaking the event.
+fn try_deliver(inbox: Channel[StreamEvent], ev: StreamEvent) -> Bool:
+    return select:
+        inbox.send(ev) => true
+        default => false
 
 # --- the streaming handler surface ---
 #
@@ -1159,7 +1166,7 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
             fail "http2: DATA frame on stream 0"
         mut delivered := false
         if let inbox = server.inbox_for(df.stream_id):
-            if inbox.try_send(data_event(df.data, df.end_stream)):
+            if try_deliver(inbox, data_event(df.data, df.end_stream)):
                 delivered = true
             else:
                 # never block the single reader task on a stalled stream inbox
@@ -1204,7 +1211,7 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
         if too_many_resets:
             fail RAPID_RESET_ERROR
         if let inbox = server.inbox_for(rs.stream_id):
-            if not inbox.try_send(reset_event(rs.error_code)):
+            if not try_deliver(inbox, reset_event(rs.error_code)):
                 server.forget(rs.stream_id)
         return true
     if t == frames.FRAME_GOAWAY:
@@ -1432,7 +1439,7 @@ fn open_stream(server: Server, hf: frames.HeadersFrame, fields: List[hpack.Heade
             server.reset(stream_id, frames.ERROR_PROTOCOL_ERROR)
             return true
         if let inbox = server.inbox_for(stream_id):
-            if not inbox.try_send(headers_event(fields, hf.end_stream)):
+            if not try_deliver(inbox, headers_event(fields, hf.end_stream)):
                 server.reset(stream_id, frames.ERROR_ENHANCE_YOUR_CALM)
         return true
     # client-initiated streams are odd (RFC 9113 §5.1.1); reject anything else.
@@ -1463,7 +1470,7 @@ fn open_stream(server: Server, hf: frames.HeadersFrame, fields: List[hpack.Heade
     # so try_send succeeds immediately without blocking the reader.
     spawn handle_stream(server, stream_id, inbox)
     if let registered = server.inbox_for(stream_id):
-        registered.try_send(headers_event(fields, hf.end_stream))
+        try_deliver(registered, headers_event(fields, hf.end_stream))
     return true
 
 # grant flow-control credit for consumed body bytes: at the connection level

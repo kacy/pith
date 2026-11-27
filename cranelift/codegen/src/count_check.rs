@@ -266,6 +266,25 @@ enum SlotClass {
     Carrier,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TagTest {
+    ResultOk,
+    ResultNotOk,
+    OptSome,
+    OptNone,
+}
+
+impl TagTest {
+    fn invert(self) -> Self {
+        match self {
+            TagTest::ResultOk => TagTest::ResultNotOk,
+            TagTest::ResultNotOk => TagTest::ResultOk,
+            TagTest::OptSome => TagTest::OptNone,
+            TagTest::OptNone => TagTest::OptSome,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct State {
     counts: BTreeMap<String, i64>,
@@ -284,6 +303,11 @@ struct State {
     /// tuple shells built without a destructor: freeing one frees the shell
     /// alone, and the counts its fields held pass to whoever read them out
     shells: BTreeSet<String>,
+    /// 3-slot result-box shells (`is_ok`, `ok`, `err`)
+    result_shells: BTreeSet<String>,
+    /// stack-allocated closures (`closure_stack`): never released, so storing
+    /// a counted capture via `pith_closure_set_env_rc` leaks it
+    stack_closures: BTreeSet<String>,
     /// the shell fields, as "shell:index", that hold an owned payload
     owned_fields: BTreeSet<String>,
     /// a register that tests an object against null: test register ->
@@ -297,6 +321,18 @@ struct State {
     /// the read holding nothing, and a further release is one too many,
     /// not the release of the field's value a replace starts with
     counted_reads: HashSet<String>,
+    /// pending weak retains per register (`pith_struct_weak_retain`): each
+    /// credit covers exactly one subsequent weak `sstore` (or weak capture)
+    weak_credits: BTreeMap<String, usize>,
+    /// register holding an `is_ok`/`is_some`/`optflag` tag test on a shell
+    tag_tests: BTreeMap<String, (String, TagTest)>,
+    /// register holding `pith_struct_strong_count(obj)` -> `obj`
+    strong_count_of: BTreeMap<String, String>,
+    /// register holding `pith_struct_strong_count(obj) == 1` -> `obj`
+    unique_tests: BTreeMap<String, String>,
+    /// shells known to have `strong_count > 1` on this branch (releasing one
+    /// does not destroy its payloads; readers must retain explicitly)
+    shared_shells: BTreeSet<String>,
 }
 
 /// the state at a block boundary. an object a slot holds is named by its
@@ -322,10 +358,18 @@ struct Canon {
     unknowns: BTreeSet<String>,
     emptied: BTreeSet<String>,
     shells: BTreeSet<String>,
+    result_shells: BTreeSet<String>,
+    stack_closures: BTreeSet<String>,
     none_is_null: BTreeSet<String>,
     owned_fields: BTreeSet<String>,
     /// view slots that share an owned slot's value: view -> owned slot
     aliases: BTreeMap<String, String>,
+    /// pending weak-retain credits per register that hold on both incoming paths
+    weak_credits: BTreeMap<String, usize>,
+    /// register holding `strong_count(obj) == 1` -> canonical obj key
+    unique_tests: BTreeMap<String, String>,
+    /// shells proven `strong_count > 1` on both incoming paths
+    shared_shells: BTreeSet<String>,
 }
 
 /// where two paths meet. a slot holding one object on one side and a null on
@@ -348,12 +392,27 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>, mismatches: &mut Vec<(Str
         unknowns: a.unknowns.clone(),
         emptied: a.emptied.clone(),
         shells: a.shells.union(&b.shells).cloned().collect(),
+        result_shells: a.result_shells.union(&b.result_shells).cloned().collect(),
+        stack_closures: a.stack_closures.union(&b.stack_closures).cloned().collect(),
         // a receive's no-shell none holds only where both paths got the value
         // from a receive: an optional of another kind can be a real none shell
         none_is_null: a.none_is_null.intersection(&b.none_is_null).cloned().collect(),
         owned_fields: a.owned_fields.union(&b.owned_fields).cloned().collect(),
         // a view only one path pointed at a value is dead past the join
         aliases: a.aliases.iter().filter(|(v, h)| b.aliases.get(*v) == Some(*h)).map(|(v, h)| (v.clone(), h.clone())).collect(),
+        weak_credits: a
+            .weak_credits
+            .iter()
+            .filter_map(|(r, va)| b.weak_credits.get(r).map(|vb| (r.clone(), (*va).min(*vb))))
+            .filter(|(_, n)| *n > 0)
+            .collect(),
+        unique_tests: a
+            .unique_tests
+            .iter()
+            .filter(|(r, obj)| b.unique_tests.get(*r) == Some(*obj))
+            .map(|(r, obj)| (r.clone(), obj.clone()))
+            .collect(),
+        shared_shells: a.shared_shells.intersection(&b.shared_shells).cloned().collect(),
         ..Canon::default()
     };
     // a slot that holds a different value with one count on each path
@@ -531,9 +590,6 @@ struct FuncCheck<'a, 'f> {
     /// the slots this function stores to: a call through one is a call of
     /// the closure it holds
     stored_slots: HashSet<&'a str>,
-    /// registers a weak count was taken on: a store of one into a weak field
-    /// or a weak capture hands over that weak count, not a strong one
-    weak_regs: HashSet<&'a str>,
 }
 
 impl<'a, 'f> FuncCheck<'a, 'f> {
@@ -557,7 +613,6 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             join_detail: String::new(),
             counted_regs: HashSet::new(),
             stored_slots: HashSet::new(),
-            weak_regs: HashSet::new(),
         };
         c.scalar_temps = c.infer_scalar_temps();
         for ins in &f.body {
@@ -568,9 +623,6 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 c.counted_regs.insert(ins[5]);
             } else if ins[0] == "store" && ins.len() >= 3 {
                 c.stored_slots.insert(ins[1]);
-            }
-            if ins[0] == "call" && ins.len() >= 6 && ins[2] == "pith_struct_weak_retain" {
-                c.weak_regs.insert(ins[5]);
             }
         }
         // and a value stored into an unmarked slot that a counted register
@@ -794,6 +846,16 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 out.shells.insert(k.clone());
             }
         }
+        for o in &st.result_shells {
+            if let Some(k) = key_of.get(o) {
+                out.result_shells.insert(k.clone());
+            }
+        }
+        for o in &st.stack_closures {
+            if let Some(k) = key_of.get(o) {
+                out.stack_closures.insert(k.clone());
+            }
+        }
         for field in &st.owned_fields {
             let (base, off) = field.rsplit_once(':').unwrap_or((field.as_str(), ""));
             if let Some(k) = key_of.get(&base.to_string()) {
@@ -802,6 +864,17 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         }
         for field in &st.emptied {
             out.emptied.insert(rekey_field(&key_of, field));
+        }
+        out.weak_credits = st.weak_credits.clone();
+        for (r, o) in &st.unique_tests {
+            if let Some(k) = key_of.get(o) {
+                out.unique_tests.insert(r.clone(), k.clone());
+            }
+        }
+        for o in &st.shared_shells {
+            if let Some(k) = key_of.get(o) {
+                out.shared_shells.insert(k.clone());
+            }
         }
         out
     }
@@ -842,8 +915,13 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         }
         st.emptied = canon.emptied.clone();
         st.shells = canon.shells.clone();
+        st.result_shells = canon.result_shells.clone();
+        st.stack_closures = canon.stack_closures.clone();
         st.none_is_null = canon.none_is_null.clone();
         st.owned_fields = canon.owned_fields.clone();
+        st.weak_credits = canon.weak_credits.clone();
+        st.unique_tests = canon.unique_tests.clone();
+        st.shared_shells = canon.shared_shells.clone();
         st
     }
 
@@ -948,24 +1026,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             if ended {
                 continue;
             }
-            // a branch on whether a value is null settles its count: the null
-            // side holds none
+            // a branch on whether a value is null, a result/optional tag, or a
+            // shell's strong_count refines each successor side.
             let last = blocks[b].last().copied().unwrap_or(&[]);
             if last.first() == Some(&"brif") && last.len() >= 4 && succ[b].len() == 2 {
-                if let Some(obj) = st.cond_takes.get(last[1]).cloned() {
-                    for (i, s) in succ[b].iter().enumerate() {
-                        let mut side = st.clone();
-                        if i == 1 {
-                            *side.counts.entry(obj.clone()).or_insert(0) += 1;
-                        }
-                        side.cond_takes.clear();
-                        side.null_tests.clear();
-                        let out = self.canon(&side, &format!("the end of {}", order[b]));
-                        work.push((*s, out));
-                    }
-                    continue;
-                }
-                // (object, count when the test is set, count when it isn't)
+                let cond_take = st.cond_takes.get(last[1]).cloned();
                 let mut settle: Option<(String, Option<i64>, Option<i64>)> = None;
                 if let Some((obj, set_means_there)) = st.null_tests.get(last[1]).cloned() {
                     // the null side holds no count; the other keeps its own
@@ -973,27 +1038,58 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 } else if let Val::Obj(obj) = self.val(&st, last[1]) {
                     settle = Some((obj, None, Some(0)));
                 }
-                if let Some((obj, when_set, when_clear)) = settle {
+                let tag_test = st.tag_tests.get(last[1]).cloned();
+                let unique_test = st.unique_tests.get(last[1]).cloned();
+                if cond_take.is_some() || settle.is_some() || tag_test.is_some() || unique_test.is_some() {
                     for (i, s) in succ[b].iter().enumerate() {
                         let mut side = st.clone();
-                        if let Some(n) = if i == 0 { when_set } else { when_clear } {
-                            side.counts.insert(obj.clone(), n);
-                            // on the null side the registers and slots holding
-                            // it hold a null, and releasing one does nothing
-                            if n == 0 {
-                                for v in side.regs.values_mut() {
-                                    if *v == Val::Obj(obj.clone()) {
-                                        *v = Val::Null;
+                        if let Some(ref obj) = cond_take {
+                            if i == 1 {
+                                *side.counts.entry(obj.clone()).or_insert(0) += 1;
+                            }
+                        }
+                        if let Some((ref obj, when_set, when_clear)) = settle {
+                            if let Some(n) = if i == 0 { when_set } else { when_clear } {
+                                side.counts.insert(obj.clone(), n);
+                                // on the null side the registers and slots holding
+                                // it hold a null, and releasing one does nothing
+                                if n == 0 {
+                                    for v in side.regs.values_mut() {
+                                        if *v == Val::Obj(obj.clone()) {
+                                            *v = Val::Null;
+                                        }
                                     }
-                                }
-                                for v in side.slots.values_mut() {
-                                    if *v == Val::Obj(obj.clone()) {
-                                        *v = Val::Null;
+                                    for v in side.slots.values_mut() {
+                                        if *v == Val::Obj(obj.clone()) {
+                                            *v = Val::Null;
+                                        }
                                     }
                                 }
                             }
                         }
+                        if let Some((ref obj, kind)) = tag_test {
+                            match (kind, i) {
+                                (TagTest::ResultOk, 0) | (TagTest::ResultNotOk, 1) => {
+                                    side.owned_fields.remove(&format!("{obj}:2"));
+                                }
+                                (TagTest::ResultOk, 1) | (TagTest::ResultNotOk, 0) => {
+                                    side.owned_fields.remove(&format!("{obj}:1"));
+                                }
+                                (TagTest::OptSome, 1) | (TagTest::OptNone, 0) => {
+                                    side.owned_fields.remove(&format!("{obj}:1"));
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(ref obj) = unique_test {
+                            if i == 1 {
+                                side.shared_shells.insert(obj.clone());
+                            }
+                        }
+                        side.cond_takes.clear();
                         side.null_tests.clear();
+                        side.tag_tests.clear();
+                        side.strong_count_of.clear();
                         let out = self.canon(&side, &format!("the end of {}", order[b]));
                         work.push((*s, out));
                     }
@@ -1050,7 +1146,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                             return Ok(());
                         }
                         let base = field.rsplit_once(':').map(|(b, _)| b.to_string()).unwrap_or_default();
-                        if !st.shells.contains(&base) {
+                        if !st.shells.contains(&base) && !st.emptied.contains(&field) {
                             // the struct's count on the field's value, given
                             // up to replace it: the field must be stored again
                             st.emptied.insert(field);
@@ -1073,17 +1169,44 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                     && !is_emitted_unshare(why)
                 {
                     let prefix = format!("{o}:");
-                    let readers: Vec<String> = st
-                        .field_of
-                        .iter()
-                        .filter(|(r, (f, _))| {
-                            f.starts_with(&prefix) && st.owned_fields.contains(f) && st.counts.get(*r).copied().unwrap_or(0) == 0
-                        })
-                        .map(|(r, _)| r.clone())
-                        .collect();
-                    for r in readers {
-                        st.counts.insert(r.clone(), 1);
-                        st.field_of.remove(&r);
+                    if st.shared_shells.contains(&o) {
+                        // shell is proven strong_count > 1 on this path: our
+                        // release decrements the shell refcount without freeing
+                        // its payloads (any reader retained explicitly).
+                        st.owned_fields.retain(|f| !f.starts_with(&prefix));
+                        st.field_of.retain(|_, (rf, _)| !rf.starts_with(&prefix));
+                    } else {
+                        // each owned field transfers its single count to at most
+                        // one reader (the most recent); unread owned fields leak.
+                        let owned_in_shell: Vec<String> = st
+                            .owned_fields
+                            .iter()
+                            .filter(|f| f.starts_with(&prefix))
+                            .cloned()
+                            .collect();
+                        for f in owned_in_shell {
+                            st.owned_fields.remove(&f);
+                            let winner = st
+                                .field_of
+                                .iter()
+                                .filter(|(r, (rf, _))| {
+                                    *rf == f && st.counts.get(*r).copied().unwrap_or(0) == 0
+                                })
+                                .max_by_key(|(_, (_, seq))| *seq)
+                                .map(|(r, _)| r.clone());
+                            st.field_of.retain(|_, (rf, _)| *rf != f);
+                            if let Some(r) = winner {
+                                st.counts.insert(r, 1);
+                            } else if !st.result_shells.contains(&o) {
+                                // Unread owned fields on 2-slot optional/tuple shells
+                                // are reported immediately; 3-slot result boxes are
+                                // deferred until emitter result-reassignment & typed
+                                // error-enum rcall annotations land in self-host.
+                                self.problems.push(format!(
+                                    "{why} frees shell `{o}` without releasing owned field `{f}` (leak)"
+                                ));
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -1114,6 +1237,25 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 if let Some(o) = obj {
                     st.null_tests.insert(ins[1].to_string(), (o, op == "neq"));
                 }
+                // Propagate result/optional tag tests through `eq/neq` against 0 or 1.
+                for (lhs, rhs) in [(ins[2], ins[3]), (ins[3], ins[2])] {
+                    if let Some(&(ref o, kind)) = st.tag_tests.get(lhs) {
+                        match (op, self.consts.get(rhs).copied()) {
+                            ("eq", Some("0")) | ("neq", Some("1")) => {
+                                st.tag_tests.insert(ins[1].to_string(), (o.clone(), kind.invert()));
+                            }
+                            ("eq", Some("1")) | ("neq", Some("0")) => {
+                                st.tag_tests.insert(ins[1].to_string(), (o.clone(), kind));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if op == "eq" && self.consts.get(rhs).copied() == Some("1") {
+                        if let Some(o) = st.strong_count_of.get(lhs).cloned() {
+                            st.unique_tests.insert(ins[1].to_string(), o);
+                        }
+                    }
+                }
                 st.regs.insert(ins[1].to_string(), Val::Plain);
                 Ok(false)
             }
@@ -1124,8 +1266,9 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             "optflag" if ins.len() >= 3 => {
                 if let Val::Obj(o) = self.val(st, ins[2]) {
                     if st.none_is_null.contains(&o) {
-                        st.null_tests.insert(ins[1].to_string(), (o, true));
+                        st.null_tests.insert(ins[1].to_string(), (o.clone(), true));
                     }
+                    st.tag_tests.insert(ins[1].to_string(), (o, TagTest::OptSome));
                 }
                 st.regs.insert(ins[1].to_string(), Val::Plain);
                 Ok(false)
@@ -1170,6 +1313,17 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             }
             "field" if ins.len() >= 5 => {
                 let counted = self.counted_regs.contains(ins[1]);
+                let field_name = ins.get(5).copied().unwrap_or("");
+                if ins[3] == "0" && (field_name == "is_ok" || field_name == "is_some") {
+                    if let Val::Obj(o) = self.val(st, ins[2]) {
+                        let kind = if field_name == "is_ok" {
+                            TagTest::ResultOk
+                        } else {
+                            TagTest::OptSome
+                        };
+                        st.tag_tests.insert(ins[1].to_string(), (o, kind));
+                    }
+                }
                 let v = if kind_of_text(ins[4]) == "unknown" && !counted {
                     Val::Unknown
                 } else if counted || is_counted(ins[4]) {
@@ -1191,7 +1345,8 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                         matches!(v, Val::Obj(b) if *b == base) && self.f.kinds.get(s.as_str()).is_some_and(|k| *k != "tuple")
                     });
                     if box_slot && !in_struct_slot && st.counts.get(&base).copied().unwrap_or(0) > 0 {
-                        st.shells.insert(base);
+                        st.shells.insert(base.clone());
+                        st.result_shells.insert(base);
                         st.owned_fields.insert(field.clone());
                     }
                     self.reads += 1;
@@ -1203,8 +1358,17 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 st.regs.insert(ins[1].to_string(), v);
                 Ok(false)
             }
-            // a weak field keeps the weak count taken for it
-            "sstore" if ins.len() >= 4 && self.weak_regs.contains(ins[3]) => Ok(false),
+            // a weak field keeps the single weak count taken for it by a prior
+            // `pith_struct_weak_retain` on this register
+            "sstore" if ins.len() >= 4 && st.weak_credits.get(ins[3]).copied().unwrap_or(0) > 0 => {
+                if let Some(c) = st.weak_credits.get_mut(ins[3]) {
+                    *c -= 1;
+                    if *c == 0 {
+                        st.weak_credits.remove(ins[3]);
+                    }
+                }
+                Ok(false)
+            }
             "sstore" if ins.len() >= 4 => {
                 let field = format!("{}:{}", self.base_key(st, ins[1]), ins[2]);
                 let into_shell = matches!(self.val(st, ins[1]), Val::Obj(ref b) if st.shells.contains(b));
@@ -1238,7 +1402,13 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 }
                 Ok(false)
             }
-            "concat" | "concatn" | "appendn" if ins.len() >= 2 => {
+            "concat" | "concatn" if ins.len() >= 2 => {
+                let o = self.new_obj(st, 1);
+                st.regs.insert(ins[1].to_string(), Val::Obj(o));
+                Ok(false)
+            }
+            "appendn" if ins.len() >= 4 => {
+                self.take(st, ins[3], "appendn")?;
                 let o = self.new_obj(st, 1);
                 st.regs.insert(ins[1].to_string(), Val::Obj(o));
                 Ok(false)
@@ -1253,7 +1423,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             }
             "rcall" if ins.len() >= 6 => self.rcall(ins, st).map(|_| false),
             "ret2" if ins.len() >= 3 => {
-                self.ret(&["ret", ins[2]], st, true);
+                self.ret(&["ret", ins[2]], st, Some(ins[1]));
                 Ok(true)
             }
             // `optval REG OPT KIND NAME`: the payload of an optional, read
@@ -1284,11 +1454,12 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             }
             "closure_stack" if ins.len() >= 2 => {
                 let o = self.new_obj(st, 0);
+                st.stack_closures.insert(o.clone());
                 st.regs.insert(ins[1].to_string(), Val::Obj(o));
                 Ok(false)
             }
             "ret" => {
-                self.ret(ins, st, false);
+                self.ret(ins, st, None);
                 Ok(true)
             }
             _ => Err(format!("instruction {op}")),
@@ -1339,6 +1510,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             return Ok(());
         }
         if callee.contains("__tuple_stack_cascade_") {
+            if let Some(Val::Obj(o)) = args.first().map(|a| self.val(st, a)) {
+                let prefix = format!("{o}:");
+                st.owned_fields.retain(|f| !f.starts_with(&prefix));
+                st.field_of.retain(|_, (f, _)| !f.starts_with(&prefix));
+            }
             st.regs.insert(dst.to_string(), Val::Plain);
             return Ok(());
         }
@@ -1440,11 +1616,49 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         let result = if let Some(row) =
             runtime_ownership(callee).filter(|_| !closure_call && !self.user_funcs.contains(callee))
         {
+            if callee == "pith_struct_strong_count" {
+                if let Some(Val::Obj(o)) = args.first().map(|a| self.val(st, a)) {
+                    st.strong_count_of.insert(dst.to_string(), o);
+                }
+            }
+            if callee == "pith_struct_weak_retain" {
+                if let Some(a) = args.first() {
+                    *st.weak_credits.entry((*a).to_string()).or_insert(0) += 1;
+                }
+            }
+            if callee == "pith_closure_set_env_rc" {
+                let tag_const = args.get(3).and_then(|t| self.consts.get(t)).copied();
+                if tag_const == Some("8") {
+                    if let Some(val_reg) = args.get(2) {
+                        if let Some(c) = st.weak_credits.get_mut(*val_reg) {
+                            *c = c.saturating_sub(1);
+                            if *c == 0 {
+                                st.weak_credits.remove(*val_reg);
+                            }
+                        }
+                    }
+                }
+                if tag_const != Some("0") {
+                    if let Some(Val::Obj(c)) = args.first().map(|a| self.val(st, a)) {
+                        if st.stack_closures.contains(&c) {
+                            self.problems.push(format!(
+                                "{callee} stores a counted capture into a stack closure that is never released (leak)"
+                            ));
+                        }
+                    }
+                }
+            }
             for (i, a) in row.args.iter().enumerate() {
-                // a weak capture (tag 8) takes over a weak count
-                let weak_capture = callee == "pith_closure_set_env_rc"
-                    && self.weak_regs.contains(args.get(i).copied().unwrap_or(""));
-                if *a == ArgOwnership::Consume && i < args.len() && !weak_capture {
+                // a weak capture (tag 8) takes over a weak count, not a strong one;
+                // tag 0 stores a plain uncounted value.
+                let tag_const = if callee == "pith_closure_set_env_rc" {
+                    args.get(3).and_then(|t| self.consts.get(t)).copied()
+                } else {
+                    None
+                };
+                let weak_or_plain_capture = callee == "pith_closure_set_env_rc"
+                    && matches!(tag_const, Some("0") | Some("8"));
+                if *a == ArgOwnership::Consume && i < args.len() && !weak_or_plain_capture {
                     self.take(st, args[i], callee)?;
                     // these keep the value only when they report success
                     // (runtime_ownership.txt), so the failing side of a branch
@@ -1488,11 +1702,22 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         if callee == "pith_struct_alloc" && (typ == "struct:tuple" || typ == "tuple") {
             if let Val::Obj(o) = &result {
                 st.shells.insert(o.clone());
+                if args.first().and_then(|a| self.consts.get(a)).copied() == Some("3") {
+                    st.result_shells.insert(o.clone());
+                }
             }
         }
         if callee == "pith_channel_recv" || callee == "pith_channel_try_recv" {
             if let Val::Obj(o) = &result {
                 st.none_is_null.insert(o.clone());
+                st.shells.insert(o.clone());
+            }
+        }
+        if callee == "env_opt" || callee == "pith_cstring_char_at_opt" {
+            if let Val::Obj(o) = &result {
+                st.none_is_null.insert(o.clone());
+                st.shells.insert(o.clone());
+                st.owned_fields.insert(format!("{o}:1"));
             }
         }
         st.regs.insert(dst.to_string(), result);
@@ -1545,10 +1770,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         Ok(())
     }
 
-    /// a return. `pair` is a `ret2`, whose payload is handed off whatever the
-    /// function's return kind, except a plain ok payload forwarded from a
-    /// pair call, which holds no count there.
-    fn ret(&mut self, ins: &[&str], st: &mut State, pair: bool) {
+    /// a return. `pair_flag` is `Some(flag_reg)` for `ret2`, whose payload is
+    /// handed off whatever the function's return kind, except when `flag_reg`
+    /// is known to be ok (`1`) on a plain ok payload forwarded from a pair call.
+    fn ret(&mut self, ins: &[&str], st: &mut State, pair_flag: Option<&str>) {
+        let pair = pair_flag.is_some();
         if !st.emptied.is_empty() {
             self.problems.push("releases a field's value and returns without storing a new one (it dangles)".into());
         }
@@ -1558,7 +1784,13 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         // one count either way
         if ins.len() > 1 && (pair || is_counted(self.f.ret_kind) || self.f.ret_kind == "unknown") {
             if let Val::Obj(o) = self.val(st, ins[1]) {
-                let forwarded_plain = pair && self.plain_ok_payloads.contains(&o) && counts.get(&o).copied().unwrap_or(0) == 0;
+                let flag_is_ok = pair_flag
+                    .and_then(|f| self.consts.get(f))
+                    .is_some_and(|c| *c != "0");
+                let forwarded_plain = pair
+                    && flag_is_ok
+                    && self.plain_ok_payloads.contains(&o)
+                    && counts.get(&o).copied().unwrap_or(0) == 0;
                 if !forwarded_plain {
                     *counts.entry(o).or_insert(0) -= 1;
                 }
@@ -1630,7 +1862,18 @@ fn split_blocks<'a, 'b>(body: &'b [Vec<&'a str>]) -> (Vec<Vec<&'b [&'a str]>>, V
 /// element, overwrite a slot, or store a raw word over one. a push or an
 /// insert of a new key only adds, so a borrowed element stays alive
 const EVICTING_NAME_PARTS: &[&str] = &[
-    "clear", "remove", "pop", "set_value", "take", "truncate", "drain", "store_u64", "tls_set", "set_env",
+    "clear",
+    "remove",
+    "pop",
+    "set_value",
+    "set_kind",
+    "map_insert",
+    "take",
+    "truncate",
+    "drain",
+    "store_u64",
+    "tls_set",
+    "set_env",
 ];
 
 fn runtime_call_writes(callee: &str) -> bool {
@@ -1761,12 +2004,98 @@ pub fn check_loop_borrows(lines: &[&str]) -> Vec<String> {
         }
         let region = &body[start + 1..end];
         let fresh = fresh_allocations(body);
-        let Some(w) = region.iter().position(|ins| instruction_writes(ins, &globals, &user, &writers, &fresh)) else { continue };
-        if region[w + 1..].iter().any(|ins| ins[0] == "load" && ins.get(2) == Some(&var)) {
-            problems.push(format!(
-                "{name}: {var} borrows from {from}, and `{}` can drop the element before a later read",
-                region[w].join(" ")
-            ));
+        // track registers pre-loaded from `var` (and label positions inside
+        // `region` for inner-loop back-edges).
+        let mut loaded_regs: HashSet<&str> = HashSet::new();
+        let mut label_pos: HashMap<&str, usize> = HashMap::new();
+        for (idx, ins) in region.iter().enumerate() {
+            if ins[0] == "label" && ins.len() >= 2 {
+                label_pos.insert(ins[1], idx);
+            }
+        }
+        let mut inner_loops: Vec<(usize, usize)> = Vec::new();
+        for (idx, ins) in region.iter().enumerate() {
+            let targets: &[&str] = match ins[0] {
+                "jmp" if ins.len() >= 2 => &[ins[1]],
+                "brif" if ins.len() >= 4 => &[ins[2], ins[3]],
+                _ => &[],
+            };
+            for target in targets {
+                if let Some(&lpos) = label_pos.get(target) {
+                    if lpos < idx {
+                        inner_loops.push((lpos, idx));
+                    }
+                }
+            }
+        }
+        let uses_var_or_reg = |ins: &[&str], regs: &HashSet<&str>| -> bool {
+            if ins[0] == "load" && ins.get(2) == Some(&var) {
+                return true;
+            }
+            if regs.is_empty() {
+                return false;
+            }
+            let operands: &[&str] = match ins[0] {
+                "call" if ins.len() > 5 => &ins[5..],
+                "calli" if ins.len() > 5 => &ins[5..],
+                "rcall" if ins.len() > 6 => &ins[6..],
+                "store" if ins.len() >= 3 => &ins[2..3],
+                "sstore" if ins.len() >= 4 => &[ins[1], ins[3]],
+                "field" if ins.len() >= 3 => &ins[2..3],
+                "optval" if ins.len() >= 3 => &ins[2..3],
+                "concat" | "eq" | "neq" | "lt" | "gt" | "lte" | "gte" | "add" | "sub" | "mul" | "div" if ins.len() >= 4 => &ins[2..4],
+                "concatn" if ins.len() >= 4 => &ins[3..],
+                "appendn" if ins.len() >= 4 => &ins[3..],
+                "ret" if ins.len() >= 2 => &ins[1..2],
+                "ret2" if ins.len() >= 3 => &ins[2..3],
+                "brif" if ins.len() >= 2 => &ins[1..2],
+                _ => &[],
+            };
+            operands.iter().any(|op| regs.contains(op))
+        };
+        let mut reported = false;
+        let mut first_writer: Option<usize> = None;
+        for (idx, ins) in region.iter().enumerate() {
+            if let Some(w) = first_writer {
+                if uses_var_or_reg(ins, &loaded_regs) {
+                    problems.push(format!(
+                        "{name}: {var} borrows from {from}, and `{}` can drop the element before a later read",
+                        region[w].join(" ")
+                    ));
+                    reported = true;
+                    break;
+                }
+            }
+            if ins[0] == "load" && ins.len() >= 3 && ins[2] == var {
+                loaded_regs.insert(ins[1]);
+            }
+            if first_writer.is_none() && instruction_writes(ins, &globals, &user, &writers, &fresh) {
+                first_writer = Some(idx);
+            }
+        }
+        // an inner loop containing both a write and a read of `var` can drop
+        // `var` on one iteration and read it on the next via its back-edge.
+        if !reported {
+            for (lstart, lend) in inner_loops {
+                let inner = &region[lstart..=lend];
+                if let Some(w) = inner.iter().position(|ins| instruction_writes(ins, &globals, &user, &writers, &fresh)) {
+                    let mut inner_regs = HashSet::new();
+                    let has_read = inner.iter().any(|ins| {
+                        let hit = uses_var_or_reg(ins, &inner_regs);
+                        if ins[0] == "load" && ins.len() >= 3 && ins[2] == var {
+                            inner_regs.insert(ins[1]);
+                        }
+                        hit
+                    });
+                    if has_read {
+                        problems.push(format!(
+                            "{name}: {var} borrows from {from}, and `{}` can drop the element before a later read",
+                            inner[w].join(" ")
+                        ));
+                        break;
+                    }
+                }
+            }
         }
     }
     problems
@@ -3257,5 +3586,223 @@ endfunc
             .failed,
             1
         );
+    }
+
+    #[test]
+    fn double_release_of_struct_field_is_reported() {
+        // H-20(1): releasing a field twice before storing back into it is a double-free.
+        let ir = "
+func bad 1 void
+param b word
+load 1 b
+field 2 1 0 string name
+call 3 pith_cstring_release void 1 2
+load 4 b
+field 5 4 0 string name
+call 6 pith_cstring_release void 1 5
+call 7 int_to_string string 1 4
+sstore 1 0 7
+ret
+mark kind b Box
+endfunc
+";
+        let r = check(ir);
+        assert_eq!(r.failed, 1, "{r:?}");
+    }
+
+    #[test]
+    fn released_error_string_returned_on_ret2_is_reported() {
+        // H-20(2): returning a released error payload from a plain-ok rcall via ret2(0, val).
+        let ir = "
+func inner 0 result_reg
+iconst 1 1
+iconst 2 42
+ret2 1 2
+mark kind x int
+endfunc
+func bad 0 result_reg
+rcall 1 2 inner int 0
+brif 1 L1 L2
+label L1
+iconst 3 1
+ret2 3 2
+label L2
+call 4 pith_cstring_release void 1 2
+iconst 5 0
+ret2 5 2
+mark kind x int
+endfunc
+";
+        let r = check(ir);
+        assert_eq!(r.failed, 1, "{r:?}");
+    }
+
+    #[test]
+    fn shell_ownership_transfer_deduplicates_readers_and_catches_unread_fields() {
+        // H-20(3): releasing a destructor-less shell with an unread owned field leaks.
+        let unread_leak = "
+func leak_shell 0 void
+iconst 1 1
+call 2 int_to_string string 1 1
+iconst 3 2
+call 4 pith_struct_alloc struct:tuple 1 3
+sstore 4 1 2
+call 5 pith_struct_release void 1 4
+ret
+mark kind x int
+endfunc
+";
+        assert_eq!(check(unread_leak).failed, 1);
+
+        // Two reads of the same shell field cannot both inherit a count.
+        let dup_reader = "
+func dup_shell 0 void
+iconst 1 1
+call 2 int_to_string string 1 1
+iconst 3 2
+call 4 pith_struct_alloc struct:tuple 1 3
+sstore 4 1 2
+field 5 4 8 string value
+field 6 4 8 string value
+call 7 pith_struct_release void 1 4
+call 8 pith_cstring_release void 1 5
+call 9 pith_cstring_release void 1 6
+ret
+mark kind x int
+endfunc
+";
+        assert_eq!(check(dup_reader).failed, 1);
+    }
+
+    #[test]
+    fn stack_closure_with_counted_capture_is_reported() {
+        // M-14: closure_stack is never released, so a counted capture leaks.
+        let ir = "
+func leak_cap 1 void
+param s word
+closure_stack 1 target 1
+iconst 2 0
+load 3 s
+call 4 pith_cstring_retain void 1 3
+iconst 5 1
+call 6 pith_closure_set_env_rc void 4 1 2 3 5
+ret
+mark kind s string
+endfunc
+";
+        let r = check(ir);
+        assert_eq!(r.failed, 1, "{r:?}");
+    }
+
+    #[test]
+    fn appendn_consumes_its_base_string() {
+        // M-14: appendn takes ownership of its base operand; releasing it again fails.
+        let ir = "
+func bad_append 0 string
+iconst 1 7
+call 2 int_to_string string 1 1
+strref 3 m0s0
+appendn 4 2 2 3
+call 5 pith_cstring_release void 1 2
+ret 4
+mark kind x int
+endfunc
+";
+        assert_eq!(check(ir).failed, 1);
+    }
+
+    #[test]
+    fn weak_retain_covers_only_one_weak_sstore() {
+        // M-14: a single weak_retain covers one weak sstore, not a second strong sstore.
+        let ir = "
+func bad_strong 1 struct:Node
+param p word
+load 1 p
+call 2 pith_struct_weak_retain void 1 1
+iconst 3 2
+call 4 pith_struct_alloc struct:Node 1 3
+sstore 4 0 1
+sstore 4 1 1
+ret 4
+mark kind p Node
+endfunc
+";
+        assert_eq!(check(ir).failed, 1);
+    }
+
+    #[test]
+    fn loop_borrows_catches_map_insert_preloaded_reg_and_inner_backedge() {
+        // H-20(4): map_insert eviction + preloaded register read after clear + inner loop back-edge.
+        let map_evict = "
+func evict 1 void
+param m word
+mark kind m map
+mark kind __loopvar_1_v string
+mark borrow __loopvar_1_v m
+label L0
+load 10 __for_idx_1
+load 11 m
+call 12 pith_list_get_value string 2 11 10
+store __loopvar_1_v 12
+load 1 m
+load 2 __loopvar_1_v
+strref 3 m0s0
+call 4 map_insert void 3 1 3 2
+load 5 __loopvar_1_v
+call 6 print void 1 5
+jmp L0
+ret
+endfunc
+";
+        let lines: Vec<&str> = map_evict.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert_eq!(check_loop_borrows(&lines).len(), 1);
+
+        let preloaded = "
+func preloaded 1 void
+param xs word
+mark kind xs list
+mark kind __loopvar_1_item string
+mark borrow __loopvar_1_item xs
+label L0
+load 10 __for_idx_1
+load 11 xs
+call 12 pith_list_get_value string 2 11 10
+store __loopvar_1_item 12
+load 1 __loopvar_1_item
+load 2 xs
+call 3 list_clear void 1 2
+call 4 print void 1 1
+jmp L0
+ret
+endfunc
+";
+        let lines: Vec<&str> = preloaded.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert_eq!(check_loop_borrows(&lines).len(), 1);
+
+        let inner_loop = "
+func inner 1 void
+param xs word
+mark kind xs list
+mark kind __loopvar_1_item string
+mark borrow __loopvar_1_item xs
+label L0
+load 10 __for_idx_1
+load 11 xs
+call 12 pith_list_get_value string 2 11 10
+store __loopvar_1_item 12
+label L1
+load 1 __loopvar_1_item
+call 2 print void 1 1
+load 3 xs
+call 4 list_clear void 1 3
+iconst 5 1
+brif 5 L1 L2
+label L2
+jmp L0
+ret
+endfunc
+";
+        let lines: Vec<&str> = inner_loop.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert_eq!(check_loop_borrows(&lines).len(), 1);
     }
 }

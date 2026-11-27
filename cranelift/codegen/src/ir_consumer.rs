@@ -1009,7 +1009,16 @@ fn closure_fn_ptr(
     runtime_funcs: &HashMap<String, FuncId>,
     closure: Value,
     local: Option<&str>,
+    fast_paths: bool,
 ) -> Value {
+    if !fast_paths {
+        let Some(&fid) = runtime_funcs.get("pith_closure_get_fn") else {
+            return closure;
+        };
+        let fref = cached_func_ref(codegen, builder, func_ref_cache, fid);
+        let call = builder.ins().call(fref, &[closure]);
+        return builder.func.dfg.first_result(call);
+    }
     let key = match local {
         Some(name) => format!("n:{name}"),
         None => format!("v:{}", closure.as_u32()),
@@ -1085,8 +1094,17 @@ fn emit_closure_call(
     closure: Value,
     local: Option<&str>,
     args: &[Value],
+    fast_paths: bool,
 ) -> Value {
-    let fn_ptr = closure_fn_ptr(codegen, builder, func_ref_cache, runtime_funcs, closure, local);
+    let fn_ptr = closure_fn_ptr(
+        codegen,
+        builder,
+        func_ref_cache,
+        runtime_funcs,
+        closure,
+        local,
+        fast_paths,
+    );
     let mut sig = codegen.module.make_signature();
     sig.params.push(AbiParam::new(types::I64));
     for _ in args {
@@ -4171,11 +4189,11 @@ fn compile_ir_function(
                 // as an f64 and is cast here; a runtime builtin already returns
                 // the bits in its second integer word.
                 let payload_is_f64 = builder.func.dfg.value_type(payload_v) == types::F64;
-                if payload_kind == "float" && !payload_is_f64 {
-                    regs.insert(val_reg, payload_v);
-                } else if payload_kind == "float" {
+                if payload_is_f64 {
                     let cast = builder.ins().bitcast(types::I64, MemFlags::new(), payload_v);
                     regs.insert(val_reg, cast);
+                } else if payload_kind == "float" {
+                    regs.insert(val_reg, payload_v);
                 } else {
                     let zero2 = builder.ins().iconst(types::I64, 0);
                     let payload_norm = builder.ins().iadd(payload_v, zero2);
@@ -4528,6 +4546,7 @@ fn compile_ir_function(
                             closure_handle,
                             Some(fname),
                             &args,
+                            fast_paths,
                         );
                         regs.insert(reg, result);
                         kinds.set(reg, retkind);
@@ -4540,6 +4559,15 @@ fn compile_ir_function(
                         // slot instead of a named variable.
                         let gv = codegen.module.declare_data_in_func(data_id, builder.func);
                         let addr = builder.ins().global_value(types::I64, gv);
+                        emit_sanitize_check(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            sanitize,
+                            false,
+                            addr,
+                            0,
+                        );
                         let closure_handle = builder.ins().load(
                             types::I64,
                             MemFlags::new(),
@@ -4554,6 +4582,7 @@ fn compile_ir_function(
                             closure_handle,
                             None,
                             &args,
+                            fast_paths,
                         );
                         regs.insert(reg, result);
                         kinds.set(reg, retkind);
@@ -4721,11 +4750,27 @@ fn compile_ir_function(
                 let obj = get_reg(&regs, parts[2])?;
                 let (offset, field_kind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok()
                 {
-                    (parts[3].parse::<i32>().unwrap_or(0), parts[4])
+                    let off = parts[3].parse::<i32>().unwrap_or(0);
+                    if off < 0 {
+                        return Err(CompileError::ModuleError(format!(
+                            "ir consumer: negative field offset in {}: {}",
+                            func_name, line
+                        )));
+                    }
+                    (off, parts[4])
                 } else if parts.len() == 4 {
                     let field_name = parts[3];
-                    if let Ok(idx) = field_name.parse::<usize>() {
-                        ((idx * 8) as i32, "")
+                    if let Ok(idx) = field_name.parse::<i32>() {
+                        let off = idx
+                            .checked_mul(8)
+                            .filter(|&o| o >= 0)
+                            .ok_or_else(|| {
+                                CompileError::ModuleError(format!(
+                                    "ir consumer: field index overflow in {}: {}",
+                                    func_name, line
+                                ))
+                            })?;
+                        (off, "")
                     } else {
                         return Err(CompileError::ModuleError(format!(
                             "ir consumer: field instruction requires an explicit offset in {}: {}",
@@ -4876,9 +4921,21 @@ fn compile_ir_function(
                     ))
                 })?;
                 let header = STRUCT_HEADER as u32;
+                let payload_bytes = fields.checked_mul(8).ok_or_else(|| {
+                    CompileError::ModuleError(format!(
+                        "ir consumer: tuple_stack field count overflow in {}: {}",
+                        func_name, line
+                    ))
+                })?;
+                let total_bytes = header.checked_add(payload_bytes).ok_or_else(|| {
+                    CompileError::ModuleError(format!(
+                        "ir consumer: tuple_stack size overflow in {}: {}",
+                        func_name, line
+                    ))
+                })?;
                 let slot = builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    header + fields * 8,
+                    total_bytes,
                     3,
                 ));
                 let base = builder.ins().stack_addr(types::I64, slot, 0);
@@ -4890,7 +4947,7 @@ fn compile_ir_function(
                 builder.ins().store(flags, one, base, STRUCT_WEAK_OFFSET);
                 let zero32 = builder.ins().iconst(types::I32, 0);
                 builder.ins().store(flags, zero32, base, STRUCT_DEAD_OFFSET);
-                let size = builder.ins().iconst(types::I64, (fields * 8) as i64);
+                let size = builder.ins().iconst(types::I64, payload_bytes as i64);
                 builder.ins().store(flags, size, base, STRUCT_SIZE_OFFSET);
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.ins().store(flags, zero, base, STRUCT_DTOR_OFFSET);
@@ -4908,8 +4965,16 @@ fn compile_ir_function(
                         func_name, line
                     ))
                 })?;
+                let offset = field_idx
+                    .checked_mul(8)
+                    .filter(|&o| o >= 0)
+                    .ok_or_else(|| {
+                        CompileError::ModuleError(format!(
+                            "ir consumer: struct field offset overflow in {}: {}",
+                            func_name, line
+                        ))
+                    })?;
                 let val = get_reg(&regs, parts[3])?;
-                let offset = field_idx * 8;
                 emit_struct_access_checks(
                     codegen,
                     &mut builder,
@@ -5137,24 +5202,36 @@ fn parse_i64_operand(
     instruction: &str,
     func_name: &str,
 ) -> Result<i64, CompileError> {
-    let parsed = if let Some(rest) = s.strip_prefix('-') {
-        if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
-            i64::from_str_radix(hex, 16).map(|v| v.wrapping_neg())
-        } else if let Some(bin) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
-            i64::from_str_radix(bin, 2).map(|v| v.wrapping_neg())
-        } else if let Some(oct) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
-            i64::from_str_radix(oct, 8).map(|v| v.wrapping_neg())
+    let parse_unsigned = |raw: &str| -> Result<u64, std::num::ParseIntError> {
+        if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16)
+        } else if let Some(bin) = raw.strip_prefix("0b").or_else(|| raw.strip_prefix("0B")) {
+            u64::from_str_radix(bin, 2)
+        } else if let Some(oct) = raw.strip_prefix("0o").or_else(|| raw.strip_prefix("0O")) {
+            u64::from_str_radix(oct, 8)
         } else {
-            s.parse::<i64>()
+            raw.parse::<u64>()
         }
-    } else if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        i64::from_str_radix(hex, 16)
-    } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
-        i64::from_str_radix(bin, 2)
-    } else if let Some(oct) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
-        i64::from_str_radix(oct, 8)
+    };
+    let parsed: Result<i64, ()> = if let Some(rest) = s.strip_prefix('-') {
+        if rest.starts_with("0x")
+            || rest.starts_with("0X")
+            || rest.starts_with("0b")
+            || rest.starts_with("0B")
+            || rest.starts_with("0o")
+            || rest.starts_with("0O")
+        {
+            parse_unsigned(rest)
+                .ok()
+                .filter(|&v| v <= (i64::MAX as u64) + 1)
+                .map(|v| v.wrapping_neg() as i64)
+                .ok_or(())
+        } else {
+            s.parse::<i64>().map_err(|_| ())
+        }
     } else {
-        s.parse::<i64>()
+        // accept full 64-bit unsigned bit patterns (UInt64 globals/constants >= 2^63)
+        parse_unsigned(s).map(|v| v as i64).map_err(|_| ())
     };
     parsed.map_err(|_| {
         CompileError::ModuleError(format!(
@@ -6380,5 +6457,113 @@ mod tests {
 
         let param_shadow = vec!["int_to_string".to_string()];
         assert!(fuse_int_parts(&lines, &param_shadow, &HashMap::new(), &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn rcall_float_abi_with_non_float_payload_kind_compiles() {
+        // M-12: rcall on a result_reg_f callee when the IR's payload kind is non-float
+        // must bitcast F64 -> I64 instead of passing an F64 to integer consumers.
+        let ir = "\
+func make_f 0 result_reg_f
+fconst 1 1.5
+iconst 2 1
+ret2 2 1
+endfunc
+func main 0 int
+rcall 1 2 make_f int 0
+iconst 3 1
+add 4 2 3
+ret 4
+endfunc
+";
+        compile_ok_for_ir(ir);
+    }
+
+    #[test]
+    fn parse_i64_operand_accepts_full_u64_and_i64_min_literals() {
+        assert_eq!(
+            parse_i64_operand("0xFFFFFFFFFFFFFFFF", "constant", "iconst", "main").unwrap(),
+            -1i64
+        );
+        assert_eq!(
+            parse_i64_operand("18446744073709551615", "constant", "iconst", "main").unwrap(),
+            -1i64
+        );
+        assert_eq!(
+            parse_i64_operand("-0x8000000000000000", "constant", "iconst", "main").unwrap(),
+            i64::MIN
+        );
+        assert!(parse_i64_operand("-0x8000000000000001", "constant", "iconst", "main").is_err());
+    }
+
+    #[test]
+    fn malformed_offsets_and_tuple_stack_sizes_return_compile_error() {
+        let neg_tuple = "func main 0 int\ntuple_stack 1 -1\niconst 2 0\nret 2\nendfunc\n";
+        let huge_tuple = "func main 0 int\ntuple_stack 1 1000000000\niconst 2 0\nret 2\nendfunc\n";
+        let neg_sstore = "func main 0 int\niconst 1 0\niconst 2 0\nsstore 1 -1 2\nret 2\nendfunc\n";
+        let huge_sstore = "func main 0 int\niconst 1 0\niconst 2 0\nsstore 1 536870912 2\nret 2\nendfunc\n";
+        let neg_field = "func main 0 int\niconst 1 0\nfield 2 1 -8 int x\nret 2\nendfunc\n";
+        let huge_field = "func main 0 int\niconst 1 0\nfield 2 1 3000000000 int x\nret 2\nendfunc\n";
+        for ir in [neg_tuple, huge_tuple, neg_sstore, huge_sstore, neg_field, huge_field] {
+            let _ = compile_err_for_ir(ir);
+        }
+    }
+
+    #[test]
+    fn closure_call_respects_fast_paths_and_sanitizes_global_closure() {
+        let mut codegen = crate::create_codegen().expect("create codegen");
+        let runtime_funcs =
+            crate::runtime_imports::declare_runtime_functions(&mut codegen.module)
+                .expect("declare runtime functions");
+        let mut declare = |name: &str| {
+            let mut sig = codegen.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            codegen
+                .module
+                .declare_function(name, Linkage::Import, &sig)
+                .expect("declare sanitizer hook")
+        };
+        let tsan_read = declare("__tsan_read8");
+        let tsan_write = declare("__tsan_write8");
+        let hooks = Some(SanitizeHooks {
+            read: tsan_read,
+            write: tsan_write,
+        });
+        let g_id = codegen
+            .module
+            .declare_data("__g_cb", Linkage::Local, true, false)
+            .expect("declare global");
+        let mut globals = HashMap::new();
+        globals.insert("__g_cb".to_string(), g_id);
+        let lines = vec!["call 2 __g_cb int 0", "ret 2"];
+        let func = compile_ir_function(
+            &mut codegen,
+            "main",
+            "int",
+            &[],
+            &[],
+            &lines,
+            &runtime_funcs,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &globals,
+            &[],
+            &HashSet::new(),
+            None,
+            hooks,
+            &HashMap::new(),
+        )
+        .expect("compile");
+        let sanitized = func.display().to_string();
+        assert!(
+            sanitized.contains(&clif_call(&sanitized, &runtime_funcs, "pith_closure_get_fn")),
+            "expected runtime pith_closure_get_fn when fast_paths=false:\n{sanitized}"
+        );
+        let read_decl = format!(" = u0:{} ", tsan_read.as_u32());
+        assert!(
+            sanitized.contains(&read_decl),
+            "expected __tsan_read8 hook on global closure load:\n{sanitized}"
+        );
     }
 }

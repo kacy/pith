@@ -2257,6 +2257,12 @@ ir-contract-regressions-only:
 	else \
 		echo "FAIL map count-if fuses in result-returning fn (#1130)"; fail=$$((fail+1)); \
 	fi; \
+	upsert_ir=$$(timeout 15 ./self-host/ir_driver --combined tests/cases/test_map_upsert_result_fn.pith); \
+	if printf '%s\n' "$$upsert_ir" | grep -q 'map_try_upsert_add ' && printf '%s\n' "$$upsert_ir" | grep -q 'map_try_upsert_add_ikey ' && printf '%s\n' "$$upsert_ir" | grep -q 'map_try_upsert_add_bkey '; then \
+		pass=$$((pass+1)); echo "ok   map upsert fuses in result-returning fn (#1130)"; \
+	else \
+		echo "FAIL map upsert fuses in result-returning fn (#1130)"; fail=$$((fail+1)); \
+	fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all combined ir contract checks passed"

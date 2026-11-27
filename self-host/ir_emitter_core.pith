@@ -71,7 +71,7 @@ from ir_call_helpers import ir_join_arg_regs, ir_method_call_arg_regs, ir_call_a
 from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_param_name_at, ir_resolve_generic_module_call_name, ir_decode_type_list
 from ir_struct_layouts import ir_struct_layout_name_with_state
 from ir_control_helpers import IrIfBranch, IrForBindingNames, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
-from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_map_upsert_add_call_name, ir_map_add_or_insert_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name, ir_normalize_collection_target
+from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_map_upsert_add_call_name, ir_map_try_upsert_add_call_name, ir_map_add_or_insert_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name, ir_normalize_collection_target
 from ir_field_helpers import ir_emit_tuple_field_access
 from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary, ir_is_float_arithmetic, ir_emit_float_binary, ir_binary_simple_ir_op, ir_compound_assignment_ir_op
 from ir_list_helpers import ir_is_list_runtime_type, ir_emit_list_map_loop, ir_emit_list_filter_loop, ir_emit_list_reduce_loop, ir_emit_list_is_empty, ir_emit_list_missing_index_result, ir_emit_list_index_search_loop, ir_emit_list_contains_from_index
@@ -11096,9 +11096,12 @@ fn ir_index_get_opt_call_name(obj_type: String) -> String:
 #     with wrapping arithmetic, which is what the `add` instruction does, and
 #     an integer-valued map holds no reference counts, so no count changes
 #     hands on the fused path.
-#   * the enclosing function must not return a result. `m[k]` inside a `T!`
-#     function propagates a miss to the caller instead of aborting, and the
-#     fused entry point aborts, as the strict read it replaces does.
+#   * inside a `T!` function whose miss propagates (`ir_current_func_miss_fails`),
+#     the emitter calls `map_try_upsert_add*` and branches on a miss to
+#     `ir_emit_miss_return("index out of bounds")`, matching `m[k]`'s error
+#     propagation while keeping the hit path at one hash and one probe. in
+#     non-fallible functions (and `T!E` functions with a non-String error type),
+#     `map_upsert_add*` aborts on miss as the strict read does.
 #
 # an expression kind that can only read: nothing here calls anything, indexes
 # anything, or allocates. the list is deliberately short, because everything
@@ -11166,8 +11169,6 @@ fn ir_upsert_delta_idx(map_idx: Int, key_idx: Int, value_idx: Int) -> Int:
 # handed back is the discarded result of a void-shaped call, which is what
 # every other store here returns.
 fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int:
-    if ir_current_func_returns_result:
-        return 0 - 1
     obj_type := ir_infer_type(map_idx)
     if obj_type != "map" and obj_type != "map_int":
         return 0 - 1
@@ -11181,11 +11182,25 @@ fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int
     return ir_emit_map_upsert_call(map_idx, key_idx, delta_idx, obj_type)
 
 fn ir_emit_map_upsert_call(map_idx: Int, key_idx: Int, delta_idx: Int, obj_type: String) -> Int:
-    call_name := ir_map_upsert_add_call_name(ir_bytes_keyed_type(map_idx, obj_type))
+    keyed_type := ir_bytes_keyed_type(map_idx, obj_type)
     map_r := ir_expr(map_idx)
     key_r := ir_expr(key_idx)
     delta_r := ir_expr(delta_idx)
     r := ir_reg()
+    if ir_current_func_miss_fails:
+        call_name := ir_map_try_upsert_add_call_name(keyed_type)
+        ir_emit_call3(r, call_name, "bool", map_r, key_r, delta_r)
+        # release any owned key before branching so the early-return miss arm
+        # cannot leak it.
+        ir_release_owned_index_key(key_idx, key_r)
+        hit_l := ir_label()
+        miss_l := ir_label()
+        ir_emit("brif " + r.to_string() + " " + hit_l + " " + miss_l)
+        ir_emit_label(miss_l)
+        ir_emit_miss_return("index out of bounds")
+        ir_emit_label(hit_l)
+        return r
+    call_name := ir_map_upsert_add_call_name(keyed_type)
     ir_emit_call3(r, call_name, "void", map_r, key_r, delta_r)
     # the key is read and copied by the runtime, never kept, so a key built on
     # the spot would die here, the same release the plain store does. a pure
@@ -11197,8 +11212,6 @@ fn ir_emit_map_upsert_call(map_idx: Int, key_idx: Int, delta_idx: Int, obj_type:
 # `m[k] += d` on an int-valued map: the same fused update as `m[k] = m[k] + d`.
 # -1 for anything else.
 fn ir_try_emit_map_upsert_delta(target_idx: Int, delta_idx: Int) -> Int:
-    if ir_current_func_returns_result:
-        return 0 - 1
     target := get_node(target_idx)
     map_idx := target.children[0]
     key_idx := target.children[1]

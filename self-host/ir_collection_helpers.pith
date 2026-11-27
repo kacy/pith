@@ -98,6 +98,16 @@ pub fn ir_map_upsert_add_call_name(obj_type: String) -> String:
         return "map_upsert_add_bkey"
     return "map_upsert_add"
 
+# the propagating twin of `ir_map_upsert_add_call_name` for `-> T!` functions:
+# updates the slot in place and returns true on hit, or leaves the map untouched
+# and returns false on miss so the emitter can propagate the error.
+pub fn ir_map_try_upsert_add_call_name(obj_type: String) -> String:
+    if obj_type == "map_int":
+        return "map_try_upsert_add_ikey"
+    if obj_type == "map_bytes":
+        return "map_try_upsert_add_bkey"
+    return "map_try_upsert_add"
+
 # the runtime entry point behind the counting branch
 # `if m.contains_key(k): m[k] += d else: m[k] = e`: one hash and one probe
 # that adds to a held key or stores the initial value under a missing one,

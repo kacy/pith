@@ -1471,6 +1471,87 @@ pub unsafe extern "C" fn pith_map_upsert_add_bkey(map_handle: i64, key: i64, del
     }
 }
 
+/// Body of the propagating fused update: add `delta` to the value under a
+/// borrowed key and return 1 when the map held the key, or 0 without modifying
+/// the map when the key is absent. Used inside `-> T!` functions so an
+/// unguarded `m[k] = m[k] + d` / `m[k] += d` hashes and probes once on a hit
+/// and still propagates a miss as an error instead of aborting.
+#[inline(always)]
+fn try_upsert_add_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>, delta: i64) -> i64 {
+    if impl_ref.val_is_heap() {
+        eprintln!("pith runtime error: map update on a map whose values are reference-counted");
+        // panic-guard: the fused update is emitted only for an integer-valued map, so a counted value here is a compiler bug with no correct answer.
+        std::process::exit(1);
+    }
+    i64::from(impl_ref.upsert_add(map_key, delta).is_some())
+}
+
+/// Add `delta` to the value under a C-string key when present, returning 1 on
+/// hit and 0 on miss without modifying the map.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string (or null, which returns 0).
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_try_upsert_add_cstr(
+    map_handle: i64,
+    key: *const i8,
+    delta: i64,
+) -> i64 {
+    if key.is_null() {
+        return 0;
+    }
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_try_upsert_add");
+        crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        unsafe { with_cstr_key(key, |map_key| try_upsert_add_keyed(impl_ref, map_key, delta)) }
+            .unwrap_or(0)
+    };
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) }.unwrap_or(0)
+}
+
+/// Add `delta` to the value under an integer key when present, returning 1 on
+/// hit and 0 on miss without modifying the map.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_try_upsert_add_ikey(
+    map_handle: i64,
+    key: i64,
+    delta: i64,
+) -> i64 {
+    let run = |impl_ref: &mut MapImpl| {
+        crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
+        try_upsert_add_keyed(impl_ref, &KeyRef::Int(key), delta)
+    };
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) }.unwrap_or(0)
+}
+
+/// Add `delta` to the value under a bytes key when present, returning 1 on
+/// hit and 0 on miss without modifying the map.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_try_upsert_add_bkey(
+    map_handle: i64,
+    key: i64,
+    delta: i64,
+) -> i64 {
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_try_upsert_add_bkey");
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        unsafe { with_bytes_key(key, |map_key| try_upsert_add_keyed(impl_ref, map_key, delta)) }
+            .unwrap_or(0)
+    };
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) }.unwrap_or(0)
+}
+
 #[inline(always)]
 fn add_or_insert_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>, delta: i64, init: i64) -> i64 {
     if impl_ref.val_is_heap() {
@@ -3351,6 +3432,60 @@ mod tests {
             );
             pith_map_release_handle(bmap);
             crate::bytes::pith_bytes_release(bkey);
+        }
+    }
+
+    /// The propagating fused update updates existing keys with zero
+    /// allocations, and reports misses by returning 0 without mutating the map
+    /// or allocating.
+    #[test]
+    fn a_try_fused_update_updates_hits_and_reports_misses_without_mutating() {
+        unsafe {
+            let hit = b"user-1000-region\0".as_ptr() as *const i8;
+            let miss = b"user-9999-region\0".as_ptr() as *const i8;
+            let map = pith_map_new_default().ptr as i64;
+            pith_map_insert_cstr(map, hit, 10);
+            assert_eq!(
+                allocations_during(|| {
+                    assert_eq!(pith_map_try_upsert_add_cstr(map, hit, 5), 1);
+                    assert_eq!(pith_map_try_upsert_add_cstr(map, miss, 5), 0);
+                    assert_eq!(pith_map_try_upsert_add_cstr(map, std::ptr::null(), 5), 0);
+                }),
+                0
+            );
+            assert_eq!(pith_map_get_cstr_strict(map, hit), 15);
+            assert_eq!(pith_map_len_handle(map), 1);
+            pith_map_release_handle(map);
+
+            let imap = pith_map_new_int().ptr as i64;
+            pith_map_insert_ikey(imap, 7, 10);
+            assert_eq!(
+                allocations_during(|| {
+                    assert_eq!(pith_map_try_upsert_add_ikey(imap, 7, -3), 1);
+                    assert_eq!(pith_map_try_upsert_add_ikey(imap, 99, 5), 0);
+                }),
+                0
+            );
+            assert_eq!(pith_map_get_ikey_strict(imap, 7), 7);
+            assert_eq!(pith_map_len_handle(imap), 1);
+            pith_map_release_handle(imap);
+
+            let bhit = crate::bytes::pith_bytes_from_vec(b"user-1000-region".to_vec());
+            let bmiss = crate::bytes::pith_bytes_from_vec(b"user-9999-region".to_vec());
+            let bmap = pith_map_new_bytes().ptr as i64;
+            pith_map_insert_bkey(bmap, bhit, 20);
+            assert_eq!(
+                allocations_during(|| {
+                    assert_eq!(pith_map_try_upsert_add_bkey(bmap, bhit, 4), 1);
+                    assert_eq!(pith_map_try_upsert_add_bkey(bmap, bmiss, 4), 0);
+                }),
+                0
+            );
+            assert_eq!(pith_map_get_bkey_strict(bmap, bhit), 24);
+            assert_eq!(pith_map_len_handle(bmap), 1);
+            pith_map_release_handle(bmap);
+            crate::bytes::pith_bytes_release(bhit);
+            crate::bytes::pith_bytes_release(bmiss);
         }
     }
 

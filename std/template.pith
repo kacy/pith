@@ -67,11 +67,10 @@
 #     so a space or a `>` cannot end the attribute.
 #   - a url attribute (`href`, `src`, `action`, `formaction`, `xlink:href`,
 #     `poster`, `cite`, `background`, `data`, `codebase`, `longdesc`,
-#     `manifest`, `icon`): the url is checked with `html.safe_url` first, and a
-#     value it refuses is written as `about:blank`. the check covers the literal
-#     text in front of the value too, so `href="/<%= p %>"` with `p` set to
-#     `/evil.example` is refused as the `//evil.example` the browser would see.
-#     a second value in the same url is checked on its own.
+#     `manifest`, `icon`): the whole assembled attribute value — including any
+#     literal prefix, literal suffix, entity references, and multiple `<%= %>`
+#     slots — is checked with `html.safe_url`, and an attribute it refuses is
+#     replaced with `about:blank`.
 #
 # compile refuses `<%= %>` where no escaping makes a value safe: inside
 # `<script>` or `<style>`, in an event handler (`on...`), `style` or `srcdoc`
@@ -127,6 +126,8 @@ NODE_ELSE := 4
 NODE_FOR := 5
 NODE_END := 6
 NODE_MARKDOWN := 7
+NODE_URL_START := 8
+NODE_URL_END := 9
 
 # how a `<%= %>` value is written out
 MODE_TEXT := 0
@@ -424,21 +425,50 @@ fn after_tag(tag: String, closing: Bool) -> HtmlState:
         return html_state(H_RCDATA, tag, "", false)
     return html_state(H_TEXT, "", "", false)
 
+# true when `text` at `start` matches lowercase ascii string `lower` ignoring ascii case,
+# without slicing `text` (safe even when `start + lower.len()` falls inside multi-byte utf-8).
+fn ascii_matches_lower(text: String, start: Int, lower: String) -> Bool:
+    if start < 0 or start + lower.len() > text.len():
+        return false
+    mut k := 0
+    while k < lower.len():
+        mut b := ord(text[start + k])
+        if b >= 65 and b <= 90:
+            b = b + 32
+        if b != ord(lower[k]):
+            return false
+        k = k + 1
+    return true
+
+# appendable lowercase token for a tag or attribute name byte; non-ascii bytes map to
+# "?" so multi-byte utf-8 sequences never slice mid-character or match ascii tag/attr names.
+fn ascii_name_char(byte: Int) -> String:
+    if byte >= 65 and byte <= 90:
+        return chr(byte + 32)
+    if byte < 128:
+        return chr(byte)
+    return "?"
+
 # whether `text` at `at` holds `</` and then `tag` in any case, followed by
 # something that ends a tag name. that is what ends a raw text element.
 fn closes_raw(text: String, at: Int, tag: String) -> Bool:
     end := at + 2 + tag.len()
     if end > text.len() or ord(text[at + 1]) != 47:
         return false
-    if text.substring(at + 2, end).to_lower() != tag:
+    if not ascii_matches_lower(text, at + 2, tag):
         return false
     if end == text.len():
         return true
     next := ord(text[end])
     return is_space(next) or next == 47 or next == 62
 
-# the state after the literal `text`.
-fn advance(start: HtmlState, text: String) -> HtmlState:
+fn is_url_value_state(kind: Int, attr: String) -> Bool:
+    return (kind == H_DOUBLE or kind == H_SINGLE or kind == H_UNQUOTED) and is_url_attr(attr)
+
+# emit literal `text` into `nodes`, splitting at url attribute value boundaries so
+# the renderer can validate every assembled url attribute value as a whole, and
+# return the html state after `text`.
+fn emit_text_and_advance(nodes: List[Node], start: HtmlState, text: String, offset: Int) -> HtmlState:
     mut kind := start.kind
     mut tag := start.tag
     mut attr := start.attr
@@ -448,6 +478,8 @@ fn advance(start: HtmlState, text: String) -> HtmlState:
     # where the current attribute value began in `text`, so its literal part
     # is copied once rather than a byte at a time
     mut value_from := 0
+    # where the next literal chunk to emit starts in `text`
+    mut seg_start := 0
     mut ended := false
     mut i := 0
     while i < text.len():
@@ -458,13 +490,13 @@ fn advance(start: HtmlState, text: String) -> HtmlState:
         elif kind == H_LT:
             if is_letter(byte):
                 kind = H_TAG_NAME
-                tag = text[i].to_lower()
+                tag = ascii_name_char(byte)
                 closing = false
             elif byte == 47:
                 kind = H_LT_SLASH
             elif byte == 33:
                 kind = H_BOGUS
-                if i + 2 < text.len() and text.substring(i + 1, i + 3) == "--":
+                if i + 2 < text.len() and ord(text[i + 1]) == 45 and ord(text[i + 2]) == 45:
                     kind = H_COMMENT
                     i = i + 2
             elif byte == 63:
@@ -474,7 +506,7 @@ fn advance(start: HtmlState, text: String) -> HtmlState:
         elif kind == H_LT_SLASH:
             if is_letter(byte):
                 kind = H_TAG_NAME
-                tag = text[i].to_lower()
+                tag = ascii_name_char(byte)
                 closing = true
             elif byte == 62:
                 kind = H_TEXT
@@ -486,7 +518,7 @@ fn advance(start: HtmlState, text: String) -> HtmlState:
             elif byte == 62:
                 ended = true
             else:
-                tag = tag + text[i].to_lower()
+                tag = tag + ascii_name_char(byte)
         elif kind == H_IN_TAG or kind == H_AFTER_ATTR:
             if byte == 62:
                 ended = true
@@ -496,7 +528,7 @@ fn advance(start: HtmlState, text: String) -> HtmlState:
                 kind = H_BEFORE_VALUE
             elif not is_space(byte):
                 kind = H_ATTR_NAME
-                attr = text[i].to_lower()
+                attr = ascii_name_char(byte)
         elif kind == H_ATTR_NAME:
             if is_space(byte):
                 kind = H_AFTER_ATTR
@@ -507,7 +539,7 @@ fn advance(start: HtmlState, text: String) -> HtmlState:
             elif byte == 62:
                 ended = true
             else:
-                attr = attr + text[i].to_lower()
+                attr = attr + ascii_name_char(byte)
         elif kind == H_BEFORE_VALUE:
             if byte == 34 or byte == 39:
                 kind = H_DOUBLE
@@ -516,6 +548,11 @@ fn advance(start: HtmlState, text: String) -> HtmlState:
                 prefix = ""
                 known = true
                 value_from = i + 1
+                if is_url_attr(attr):
+                    if i + 1 > seg_start:
+                        nodes.push(node_text(text.substring(seg_start, i + 1), offset + seg_start))
+                    nodes.push(Node(NODE_URL_START, "", "", "", false, 0 - 1, 0 - 1, offset + i + 1, MODE_URL))
+                    seg_start = i + 1
             elif byte == 62:
                 ended = true
             elif not is_space(byte):
@@ -523,18 +560,38 @@ fn advance(start: HtmlState, text: String) -> HtmlState:
                 prefix = ""
                 known = true
                 value_from = i
+                if is_url_attr(attr):
+                    if i > seg_start:
+                        nodes.push(node_text(text.substring(seg_start, i), offset + seg_start))
+                    nodes.push(Node(NODE_URL_START, "", "", "", false, 0 - 1, 0 - 1, offset + i, MODE_UNQUOTED_URL))
+                    seg_start = i
         elif kind == H_DOUBLE or kind == H_SINGLE:
             if (byte == 34 and kind == H_DOUBLE) or (byte == 39 and kind == H_SINGLE):
+                if is_url_attr(attr):
+                    if i > seg_start:
+                        nodes.push(node_text(text.substring(seg_start, i), offset + seg_start))
+                    nodes.push(Node(NODE_URL_END, "", "", "", false, 0 - 1, 0 - 1, offset + i, MODE_TEXT))
+                    seg_start = i
                 kind = H_IN_TAG
                 prefix = ""
         elif kind == H_UNQUOTED:
             if is_space(byte):
+                if is_url_attr(attr):
+                    if i > seg_start:
+                        nodes.push(node_text(text.substring(seg_start, i), offset + seg_start))
+                    nodes.push(Node(NODE_URL_END, "", "", "", false, 0 - 1, 0 - 1, offset + i, MODE_TEXT))
+                    seg_start = i
                 kind = H_IN_TAG
                 prefix = ""
             elif byte == 62:
+                if is_url_attr(attr):
+                    if i > seg_start:
+                        nodes.push(node_text(text.substring(seg_start, i), offset + seg_start))
+                    nodes.push(Node(NODE_URL_END, "", "", "", false, 0 - 1, 0 - 1, offset + i, MODE_TEXT))
+                    seg_start = i
                 ended = true
         elif kind == H_COMMENT:
-            if byte == 62 and i >= 2 and text.substring(i - 2, i) == "--":
+            if byte == 62 and i >= 2 and ord(text[i - 2]) == 45 and ord(text[i - 1]) == 45:
                 kind = H_TEXT
         elif kind == H_BOGUS:
             if byte == 62:
@@ -554,6 +611,8 @@ fn advance(start: HtmlState, text: String) -> HtmlState:
             known = true
             ended = false
         i = i + 1
+    if seg_start < text.len():
+        nodes.push(node_text(text.substring(seg_start, text.len()), offset + seg_start))
     if kind == H_DOUBLE or kind == H_SINGLE or kind == H_UNQUOTED:
         prefix = prefix + text.substring(value_from, text.len())
     return HtmlState(kind, tag, attr, closing, prefix, known)
@@ -636,24 +695,106 @@ fn escape_unquoted(input: String) -> String:
         parts.push(input.substring(copied, input.len()))
     return parts.join("")
 
-# a value for a url attribute, appended to the literal `prefix`. the url the
-# browser will follow is checked whole with `html.safe_url`, and the value
-# becomes `about:blank` when that refuses it.
-fn url_value(prefix: String, value: String) -> String:
-    if value == "":
-        return value
-    whole := prefix + value
-    if html.safe_url(whole) != whole:
-        return "about:blank"
-    return value
+# decode html character references in literal template text inside a url attribute
+# so `html.safe_url` inspects the same url scheme and separators a browser sees
+# (e.g. `&#58;`, `&#x3a;`, `&colon;`, `&sol;`, `&bsol;`, `&tab;`, `&newline;`).
+fn decode_html_entities_for_url(input: String) -> String:
+    if not input.contains("&"):
+        return input
+    n := input.len()
+    mut parts: List[String] := []
+    mut copied := 0
+    mut i := 0
+    while i < n:
+        if ord(input[i]) != 38:
+            i = i + 1
+            continue
+        mut decoded := ""
+        mut next_i := 0 - 1
+        if i + 2 < n and ord(input[i + 1]) == 35:
+            mut j := i + 2
+            mut is_hex := false
+            if ord(input[j]) == 120 or ord(input[j]) == 88:
+                is_hex = true
+                j = j + 1
+            mut digits := 0
+            mut cp := 0
+            while j < n:
+                b := ord(input[j])
+                mut d := 0 - 1
+                if b >= 48 and b <= 57:
+                    d = b - 48
+                elif is_hex and b >= 65 and b <= 70:
+                    d = b - 55
+                elif is_hex and b >= 97 and b <= 102:
+                    d = b - 87
+                else:
+                    break
+                if cp <= 1114111:
+                    if is_hex:
+                        cp = cp * 16 + d
+                    else:
+                        cp = cp * 10 + d
+                digits = digits + 1
+                j = j + 1
+            if digits > 0:
+                if j < n and ord(input[j]) == 59:
+                    j = j + 1
+                if cp > 0 and cp < 128:
+                    decoded = chr(cp)
+                elif cp >= 128:
+                    decoded = "_"
+                next_i = j
+        elif ascii_matches_lower(input, i, "&colon;"):
+            decoded = ":"
+            next_i = i + 7
+        elif ascii_matches_lower(input, i, "&sol;"):
+            decoded = "/"
+            next_i = i + 5
+        elif ascii_matches_lower(input, i, "&bsol;"):
+            decoded = "\\"
+            next_i = i + 6
+        elif ascii_matches_lower(input, i, "&tab;"):
+            decoded = "\t"
+            next_i = i + 5
+        elif ascii_matches_lower(input, i, "&newline;"):
+            decoded = "\n"
+            next_i = i + 9
+        elif ascii_matches_lower(input, i, "&amp;"):
+            decoded = "&"
+            next_i = i + 5
+        elif ascii_matches_lower(input, i, "&lt;"):
+            decoded = "<"
+            next_i = i + 4
+        elif ascii_matches_lower(input, i, "&gt;"):
+            decoded = ">"
+            next_i = i + 4
+        elif ascii_matches_lower(input, i, "&quot;"):
+            decoded = "\""
+            next_i = i + 6
+        elif ascii_matches_lower(input, i, "&apos;"):
+            decoded = "'"
+            next_i = i + 6
+        if next_i >= 0:
+            if i > copied:
+                parts.push(input.substring(copied, i))
+            if decoded != "":
+                parts.push(decoded)
+            copied = next_i
+            i = next_i
+        else:
+            i = i + 1
+    if copied == 0:
+        return input
+    if copied < n:
+        parts.push(input.substring(copied, n))
+    return parts.join("")
 
-# a `<%= %>` value, escaped for where it sits.
-fn escape_for(mode: Int, prefix: String, value: String) -> String:
-    if mode == MODE_URL:
-        return html.escape(url_value(prefix, value))
-    if mode == MODE_UNQUOTED_URL:
-        return escape_unquoted(url_value(prefix, value))
-    if mode == MODE_UNQUOTED:
+# a `<%= %>` value, escaped for where it sits. url attributes are checked as a
+# whole when their attribute closes (NODE_URL_END), so MODE_URL and
+# MODE_UNQUOTED_URL only escape for their quoting here.
+fn escape_for(mode: Int, value: String) -> String:
+    if mode == MODE_UNQUOTED or mode == MODE_UNQUOTED_URL:
         return escape_unquoted(value)
     return html.escape(value)
 
@@ -679,14 +820,12 @@ pub fn compile(source: String) -> Template!TemplateError:
         open := find_pair(source, position, 60, 37)
         if open < 0:
             text := source.substring(position, source.len())
-            nodes.push(node_text(text, position))
-            state = advance(state, text)
+            state = emit_text_and_advance(nodes, state, text, position)
             position = source.len()
         else:
             if open > position:
                 text := source.substring(position, open)
-                nodes.push(node_text(text, position))
-                state = advance(state, text)
+                state = emit_text_and_advance(nodes, state, text, position)
             close := find_pair(source, open + 2, 37, 62)
             if close < 0:
                 fail TemplateError("unclosed '<%' tag", open)
@@ -729,12 +868,13 @@ pub fn compile(source: String) -> Template!TemplateError:
                 then_states.push(state)
             elif node.kind == NODE_ESCAPED:
                 mode := escape_mode(state, open)!
-                mut prefix := ""
-                if state.known:
-                    prefix = state.prefix
-                nodes.push(Node(NODE_ESCAPED, prefix, node.path, "", false, 0 - 1, 0 - 1, open, mode))
+                if state.kind == H_BEFORE_VALUE and is_url_attr(state.attr):
+                    nodes.push(Node(NODE_URL_START, "", "", "", false, 0 - 1, 0 - 1, open, MODE_UNQUOTED_URL))
+                nodes.push(Node(NODE_ESCAPED, "", node.path, "", false, 0 - 1, 0 - 1, open, mode))
                 state = after_value(state)
             elif node.kind == NODE_RAW:
+                if state.kind == H_BEFORE_VALUE and is_url_attr(state.attr):
+                    nodes.push(Node(NODE_URL_START, "", "", "", false, 0 - 1, 0 - 1, open, MODE_UNQUOTED_URL))
                 nodes.push(node)
                 state = after_value(state)
             elif node.kind == NODE_MARKDOWN:
@@ -748,6 +888,8 @@ pub fn compile(source: String) -> Template!TemplateError:
             position = close + 2
     if open_blocks.len() > 0:
         fail TemplateError("missing 'end'", nodes[open_blocks[open_blocks.len() - 1]].offset)
+    if is_url_value_state(state.kind, state.attr):
+        nodes.push(Node(NODE_URL_END, "", "", "", false, 0 - 1, 0 - 1, source.len(), MODE_TEXT))
     return Template(nodes)
 
 impl Template:
@@ -911,38 +1053,90 @@ fn extend_values(values: List[Int], value: Int) -> List[Int]:
     out.push(value)
     return out
 
-struct RenderBudget:
+struct RenderOut:
     mut total: Int
+    mut parts: List[String]
+    mut url_active: Bool
+    mut url_unquoted: Bool
+    mut url_has_escaped: Bool
+    mut url_rendered: List[String]
+    mut url_raw: List[String]
 
-fn add_rendered_bytes(budget: RenderBudget, piece_len: Int, offset: Int) -> Bool!TemplateError:
-    budget.total = budget.total + piece_len
-    if budget.total > MAX_OUTPUT_BYTES:
+fn add_rendered_bytes(out: RenderOut, piece_len: Int, offset: Int) -> Bool!TemplateError:
+    out.total = out.total + piece_len
+    if out.total > MAX_OUTPUT_BYTES:
         fail TemplateError("rendered output is larger than {MAX_OUTPUT_BYTES} bytes", offset)
     return true
 
-fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[String], values: List[Int], budget: RenderBudget) -> String!TemplateError:
-    # collect the rendered pieces and join once at the end: appending each
-    # piece to the result string recopied everything rendered so far, which
-    # made a `<% for %>` loop quadratic in the number of rows. the shared
-    # RenderBudget tracks cumulative bytes across nested `<% if %>` and
-    # `<% for %>` calls and enforces MAX_OUTPUT_BYTES on every step.
-    mut parts: List[String] := []
+fn flush_url_attr(out: RenderOut):
+    if not out.url_active:
+        return
+    mut keep := true
+    if out.url_has_escaped:
+        full_url := out.url_raw.join("")
+        if full_url != "" and html.safe_url(full_url) != full_url:
+            keep = false
+    if keep:
+        mut i := 0
+        while i < out.url_rendered.len():
+            out.parts.push(out.url_rendered[i])
+            i = i + 1
+    elif out.url_unquoted:
+        out.parts.push(escape_unquoted("about:blank"))
+    else:
+        out.parts.push("about:blank")
+    out.url_active = false
+    out.url_unquoted = false
+    out.url_has_escaped = false
+    out.url_rendered = []
+    out.url_raw = []
+
+fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[String], values: List[Int], out: RenderOut) -> Bool!TemplateError:
+    # collect rendered pieces in `out.parts` and join once at the end so nested
+    # `<% if %>` and `<% for %>` blocks stay linear and enforce MAX_OUTPUT_BYTES
+    # on every step. inside a url attribute (NODE_URL_START..NODE_URL_END), pieces
+    # are buffered in `out.url_rendered`/`out.url_raw` and validated as a whole
+    # against `html.safe_url` when the attribute closes.
     mut index := start
     while index < stop:
         node := t.nodes[index]
-        if node.kind == NODE_TEXT:
-            add_rendered_bytes(budget, node.text.len(), node.offset)!
-            parts.push(node.text)
+        if node.kind == NODE_URL_START:
+            out.url_active = true
+            out.url_unquoted = node.mode == MODE_UNQUOTED_URL
+            out.url_has_escaped = false
+            out.url_rendered = []
+            out.url_raw = []
+            index = index + 1
+        elif node.kind == NODE_URL_END:
+            flush_url_attr(out)
+            index = index + 1
+        elif node.kind == NODE_TEXT:
+            add_rendered_bytes(out, node.text.len(), node.offset)!
+            if out.url_active:
+                out.url_rendered.push(node.text)
+                out.url_raw.push(decode_html_entities_for_url(node.text))
+            else:
+                out.parts.push(node.text)
             index = index + 1
         elif node.kind == NODE_ESCAPED:
-            piece := escape_for(node.mode, node.text, stringify(resolve(root, names, values, node.path)))
-            add_rendered_bytes(budget, piece.len(), node.offset)!
-            parts.push(piece)
+            raw_val := stringify(resolve(root, names, values, node.path))
+            piece := escape_for(node.mode, raw_val)
+            add_rendered_bytes(out, piece.len(), node.offset)!
+            if out.url_active:
+                out.url_has_escaped = true
+                out.url_rendered.push(piece)
+                out.url_raw.push(raw_val)
+            else:
+                out.parts.push(piece)
             index = index + 1
         elif node.kind == NODE_RAW:
             piece := stringify(resolve(root, names, values, node.path))
-            add_rendered_bytes(budget, piece.len(), node.offset)!
-            parts.push(piece)
+            add_rendered_bytes(out, piece.len(), node.offset)!
+            if out.url_active:
+                out.url_rendered.push(piece)
+                out.url_raw.push(decode_html_entities_for_url(piece))
+            else:
+                out.parts.push(piece)
             index = index + 1
         elif node.kind == NODE_MARKDOWN:
             source := stringify(resolve(root, names, values, node.path))
@@ -951,8 +1145,8 @@ fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[Strin
             if source.len() > MAX_OUTPUT_BYTES:
                 fail TemplateError("markdown at '{node.path}' is larger than {MAX_OUTPUT_BYTES} bytes", node.offset)
             piece := markdown.render(source, t.markdown_opts)
-            add_rendered_bytes(budget, piece.len(), node.offset)!
-            parts.push(piece)
+            add_rendered_bytes(out, piece.len(), node.offset)!
+            out.parts.push(piece)
             index = index + 1
         elif node.kind == NODE_IF:
             mut taken := truthy(resolve(root, names, values, node.path))
@@ -962,11 +1156,9 @@ fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[Strin
                 mut body_end := node.close
                 if node.alt >= 0:
                     body_end = node.alt
-                piece := render_range(t, index + 1, body_end, root, names, values, budget)!
-                parts.push(piece)
+                render_range(t, index + 1, body_end, root, names, values, out)!
             elif node.alt >= 0:
-                piece := render_range(t, node.alt + 1, node.close, root, names, values, budget)!
-                parts.push(piece)
+                render_range(t, node.alt + 1, node.close, root, names, values, out)!
             index = node.close + 1
         elif node.kind == NODE_FOR:
             items := resolve(root, names, values, node.path)
@@ -975,13 +1167,12 @@ fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[Strin
             while item_index < count:
                 inner_names := extend_names(names, node.name)
                 inner_values := extend_values(values, json.array_get(items, item_index))
-                piece := render_range(t, index + 1, node.close, root, inner_names, inner_values, budget)!
-                parts.push(piece)
+                render_range(t, index + 1, node.close, root, inner_names, inner_values, out)!
                 item_index = item_index + 1
             index = node.close + 1
         else:
             index = index + 1
-    return parts.join("")
+    return true
 
 # Renders `t` with `data`, escaping every `<%= %>` value.
 #
@@ -992,8 +1183,10 @@ fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[Strin
 pub fn render(t: Template, data: Ctx) -> String!TemplateError:
     mut names: List[String] := []
     mut values: List[Int] := []
-    budget := RenderBudget(0)
-    return render_range(t, 0, t.nodes.len(), data.node, names, values, budget)!
+    out := RenderOut(0, [], false, false, false, [], [])
+    render_range(t, 0, t.nodes.len(), data.node, names, values, out)!
+    flush_url_attr(out)
+    return out.parts.join("")
 
 # Compiles `source` and renders it in one step.
 #
@@ -1252,14 +1445,41 @@ test "every url attribute is checked, in every quoting":
     assert_eq(render_string("<svg><a xlink:href=\"<%= u %>\"></a></svg>", ctx)!, "<svg><a xlink:href=\"about:blank\"></a></svg>")
     assert_eq(render_string("<a title=\"<%= u %>\">", ctx)!, "<a title=\"javascript:alert(1)\">")
 
-test "a url is checked with the literal text in front of it":
+test "a url is checked as a whole across prefixes, suffixes, entities, and multiple slots":
     ctx := context().set("p", "/evil.example").set("id", "javascript:alert(1)").set("q", "a b")
 
     # "/" and "/evil.example" make "//evil.example", which leaves the site
-    assert_eq(render_string("<a href=\"/<%= p %>\">", ctx)!, "<a href=\"/about:blank\">")
+    assert_eq(render_string("<a href=\"/<%= p %>\">", ctx)!, "<a href=\"about:blank\">")
     assert_eq(render_string("<a href=\"/users/<%= id %>\">", ctx)!, "<a href=\"/users/javascript:alert(1)\">")
     assert_eq(render_string("<a href=\"https://example.com/?q=<%= q %>\">", ctx)!, "<a href=\"https://example.com/?q=a b\">")
-    assert_eq(render_string("<a href=\"java<%= id %>\">", context().set("id", "script:alert(1)"))!, "<a href=\"javaabout:blank\">")
+    assert_eq(render_string("<a href=\"java<%= id %>\">", context().set("id", "script:alert(1)"))!, "<a href=\"about:blank\">")
+    assert_eq(render_string("<a href=\"javascript:<%= q %>\">", ctx)!, "<a href=\"about:blank\">")
+    # literal suffix and entity-encoded colon after a dynamic slot
+    assert_eq(render_string("<a href=\"<%= s %>:alert(1)\">", context().set("s", "javascript"))!, "<a href=\"about:blank\">")
+    assert_eq(render_string("<a href=\"<%= s %>&#58;alert(1)\">", context().set("s", "javascript"))!, "<a href=\"about:blank\">")
+    assert_eq(render_string("<a href=\"<%= s %>&#x3a;alert(1)\">", context().set("s", "javascript"))!, "<a href=\"about:blank\">")
+    assert_eq(render_string("<a href=\"<%= s %>&colon;alert(1)\">", context().set("s", "javascript"))!, "<a href=\"about:blank\">")
+    assert_eq(render_string("<a href=\"<%= s %>:alert(1)\">", context().set("s", "https"))!, "<a href=\"https:alert(1)\">")
+    # multiple slots composing a protocol-relative url or script scheme
+    assert_eq(render_string("<a href=\"<%= a %><%= b %>\">", context().set("a", "/").set("b", "/evil.example"))!, "<a href=\"about:blank\">")
+    assert_eq(render_string("<a href=\"<%= a %>/<%= b %>\">", context().set("a", "").set("b", "/evil.example"))!, "<a href=\"about:blank\">")
+    assert_eq(render_string("<a href=\"<%= a %><%= b %>\">", context().set("a", "java").set("b", "script:alert(1)"))!, "<a href=\"about:blank\">")
+    assert_eq(render_string("<a href=\"<%= a %><%= b %>\">", context().set("a", "/users/").set("b", "ada"))!, "<a href=\"/users/ada\">")
+    # unquoted multi-slot and suffix urls
+    assert_eq(render_string("<a href=<%= s %>:alert(1)>", context().set("s", "javascript"))!, "<a href=about&#58;blank>")
+    assert_eq(render_string("<a href=<%= a %><%= b %>>", context().set("a", "/").set("b", "/evil.example"))!, "<a href=about&#58;blank>")
+    # control flow inside a url attribute
+    assert_eq(render_string("<a href=\"<%= s %><% if c %>:alert(1)<% end %>\">", context().set("s", "javascript").set_bool("c", true))!, "<a href=\"about:blank\">")
+    assert_eq(render_string("<a href=\"<%= s %><% if c %>:alert(1)<% end %>\">", context().set("s", "javascript").set_bool("c", false))!, "<a href=\"javascript\">")
+    chars := list().push_text("java").push_text("script:").push_text("alert(1)")
+    assert_eq(render_string("<a href=\"<% for ch in chars %><%= ch %><% end %>\">", context().set_child("chars", chars))!, "<a href=\"about:blank\">")
+
+test "html tokenizer handles multibyte utf-8 without slicing mid-character":
+    ctx := context().set("x", "<b>")
+    assert_eq(render_string("<style></abcdé</style><p><%= x %></p>", ctx)!, "<style></abcdé</style><p>&lt;b&gt;</p>")
+    assert_eq(render_string("<!aé><p><%= x %></p>", ctx)!, "<!aé><p>&lt;b&gt;</p>")
+    assert_eq(render_string("<!-- éa> --><p><%= x %></p>", ctx)!, "<!-- éa> --><p>&lt;b&gt;</p>")
+    assert_eq(render_string("<divé café=\"1\"><%= x %></divé>", ctx)!, "<divé café=\"1\">&lt;b&gt;</divé>")
 
 test "an unquoted attribute value cannot end the attribute":
     ctx := context().set("v", "x onmouseover=alert(1)")

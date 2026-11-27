@@ -3097,6 +3097,13 @@ fn native_conn_unread_bytes(handle: Int, data: Bytes):
     locked cs.read_mu:
         cs.pending = bytes.concat(data, cs.pending)
 
+fn native_conn_pending_len(handle: Int) -> Int:
+    if not native_conn_has(handle):
+        return 0
+    cs := native_conn_get(handle)
+    locked cs.read_mu:
+        return cs.pending.len()
+
 fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     mut size := max_bytes
     if size <= 0:
@@ -3843,6 +3850,13 @@ impl Conn:
             return
         if is_native_conn(self.handle):
             native_conn_unread_bytes(self.handle, data)
+
+    # Number of already-decrypted application bytes buffered in the session
+    # waiting for the next read.
+    fn pending_len() -> Int:
+        if is_native_conn(self.handle):
+            return native_conn_pending_len(self.handle)
+        return 0
 
     fn read(max_bytes: Int) -> String!:
         return self.read_bytes(max_bytes)!.to_string_utf8()!

@@ -163,24 +163,31 @@ fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
     // this guard returned early on every build, leaving the staleness check
     // that is supposed to protect against linking old runtime code doing
     // nothing at all. the second candidate keeps a repo-root layout working.
-    let runtime_src = [
-        workspace_root.join("runtime/src"),
-        workspace_root.join("cranelift/runtime/src"),
+    let runtime_root = [
+        workspace_root.join("runtime"),
+        workspace_root.join("cranelift/runtime"),
     ]
     .into_iter()
-    .find(|p| p.exists());
-    let Some(runtime_src) = runtime_src else {
+    .find(|p| p.join("src").exists());
+    let Some(runtime_root) = runtime_root else {
         return Ok(());
     };
+    let runtime_src = runtime_root.join("src");
 
-    // Check if runtime lib is older than any source file
+    // Check if runtime lib is older than any source, build script, or manifest
     let lib_mtime = std::fs::metadata(runtime_lib)
         .and_then(|m| m.modified())
         .ok();
 
     let needs_rebuild = if let Some(lib_time) = lib_mtime {
-        // Check if any .rs file in runtime/src is newer
-        has_rust_source_newer_than(&runtime_src, lib_time)
+        let extra_newer = [runtime_root.join("build.rs"), runtime_root.join("Cargo.toml")]
+            .iter()
+            .any(|p| {
+                std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|mtime| mtime > lib_time)
+            });
+        extra_newer || has_rust_source_newer_than(&runtime_src, lib_time)
     } else {
         true // lib doesn't exist, rebuild
     };
@@ -194,17 +201,22 @@ fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
             args.push("--release");
         }
         args.extend(["-p", "pith-runtime"]);
-        let status = Command::new("cargo")
+        let output = Command::new("cargo")
             .args(&args)
             .current_dir(&workspace_root)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .output()
             .map_err(|e| CompileError::ModuleError(format!("Failed to rebuild runtime: {}", e)))?;
-        if !status.success() {
-            return Err(CompileError::ModuleError(
-                "Failed to rebuild runtime library".to_string(),
-            ));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                return Err(CompileError::ModuleError(
+                    "Failed to rebuild runtime library".to_string(),
+                ));
+            }
+            return Err(CompileError::ModuleError(format!(
+                "Failed to rebuild runtime library:\n{detail}"
+            )));
         }
     }
 

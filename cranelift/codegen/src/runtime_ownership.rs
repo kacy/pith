@@ -42,12 +42,27 @@ include!(concat!(env!("OUT_DIR"), "/runtime_ownership_table.rs"));
 
 /// the row for a runtime function, by the name the IR calls it
 pub fn runtime_ownership(key: &str) -> Option<&'static RuntimeOwnership> {
-    RUNTIME_OWNERSHIP.iter().find(|row| row.key == key)
+    RUNTIME_OWNERSHIP
+        .binary_search_by_key(&key, |row| row.key)
+        .ok()
+        .map(|idx| &RUNTIME_OWNERSHIP[idx])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_table_is_strictly_sorted_by_key() {
+        for pair in RUNTIME_OWNERSHIP.windows(2) {
+            assert!(
+                pair[0].key < pair[1].key,
+                "RUNTIME_OWNERSHIP not sorted: {} >= {}",
+                pair[0].key,
+                pair[1].key
+            );
+        }
+    }
 
     #[test]
     fn every_runtime_function_has_a_row() {

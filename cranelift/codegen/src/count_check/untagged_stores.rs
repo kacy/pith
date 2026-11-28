@@ -21,8 +21,10 @@
 //! that nothing calls, so only a function that some instruction names, or
 //! `main`, is reported.
 
+use super::cfg::build_block_ranges;
+use super::ir::ParsedIr;
 use super::{is_counted, kind_of_text};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// constructors of containers that take no count of what is stored in them
 const UNTAGGED_CTORS: &[&str] = &[
@@ -55,58 +57,33 @@ const TAG_DEPENDENT_STORES: &[(&str, usize, usize)] = &[
 
 /// "function: problem" for each counted value stored into an untagged container
 pub fn check_untagged_stores(lines: &[&str]) -> Vec<String> {
+    let parsed = ParsedIr::parse(lines);
+    check_untagged_stores_parsed(&parsed)
+}
+
+pub(super) fn check_untagged_stores_parsed(parsed: &ParsedIr<'_>) -> Vec<String> {
     let mut problems = Vec::new();
-    let mut name = "";
-    let mut globals: HashMap<&str, &str> = HashMap::new();
-    let mut kinds: HashMap<&str, &str> = HashMap::new();
-    let mut body: Vec<Vec<&str>> = Vec::new();
     let mut error_structs: Vec<(&str, String)> = Vec::new();
-    // every name an instruction mentions: a call, a funcref, a closure
-    let mut named: HashSet<&str> = HashSet::new();
-    for line in lines {
-        let mut words = line.split_whitespace();
-        if !matches!(words.next(), Some("func") | Some("mark") | None) {
-            named.extend(words);
+    for f in &parsed.funcs {
+        let mut kinds = parsed.globals.clone();
+        for (&k, &v) in &f.kinds {
+            kinds.insert(k, v);
         }
-    }
-    for line in lines {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        match parts.first() {
-            Some(&"func") if parts.len() >= 2 => {
-                name = parts[1];
-                kinds = globals.clone();
-                body.clear();
+        for p in check_function(&f.body, &kinds) {
+            problems.push(format!("{}: {p}", f.name));
+        }
+        for ins in &f.body {
+            if ins[0] == "call"
+                && ins.len() >= 4
+                && ins[2] == "pith_struct_alloc"
+                && ins[3].contains("<error>")
+            {
+                error_structs.push((f.name, ins.join(" ")));
             }
-            Some(&"mark") if parts.len() >= 4 && parts[1] == "global" => {
-                globals.insert(parts[2], kind_of_text(parts[3]));
-            }
-            // `owns` names only the family (`struct`); `kind` the type
-            Some(&"mark") if parts.len() >= 4 && parts[1] == "kind" => {
-                kinds.insert(parts[2], kind_of_text(parts[3]));
-            }
-            Some(&"mark") if parts.len() >= 4 && parts[1] == "owns" => {
-                kinds.entry(parts[2]).or_insert(kind_of_text(parts[3]));
-            }
-            Some(&"endfunc") => {
-                for p in check_function(&body, &kinds) {
-                    problems.push(format!("{name}: {p}"));
-                }
-                for ins in &body {
-                    if ins[0] == "call"
-                        && ins.len() >= 4
-                        && ins[2] == "pith_struct_alloc"
-                        && ins[3].contains("<error>")
-                    {
-                        error_structs.push((name, ins.join(" ")));
-                    }
-                }
-            }
-            Some(&"mark") | None => {}
-            Some(_) => body.push(parts),
         }
     }
     for (name, ins) in error_structs {
-        if name == "main" || named.contains(name) {
+        if name == "main" || parsed.named_tokens.contains(name) {
             problems.push(format!(
                 "{name}: `{ins}` builds a struct over an unresolved type parameter, whose container defaults take no count of what is stored into them"
             ));
@@ -160,65 +137,8 @@ fn check_function(body: &[Vec<&str>], kinds: &HashMap<&str, &str>) -> Vec<String
     // prior untagged store on the same path, while CFG joins use may-analysis
     // (union: a slot or field is untagged if ANY incoming path can store an
     // untagged container into it).
-    let mut block_starts: Vec<usize> = vec![0];
-    let mut label_to_pos: HashMap<&str, usize> = HashMap::new();
-    for (i, ins) in body.iter().enumerate() {
-        if ins[0] == "label" && ins.len() >= 2 {
-            label_to_pos.insert(ins[1], i);
-            if i > 0 {
-                block_starts.push(i);
-            }
-        } else if matches!(ins[0], "jmp" | "brif" | "ret" | "ret2") && i + 1 < body.len() {
-            block_starts.push(i + 1);
-        }
-    }
-    block_starts.sort_unstable();
-    block_starts.dedup();
-    let pos_to_block: HashMap<usize, usize> = block_starts
-        .iter()
-        .enumerate()
-        .map(|(b, &p)| (p, b))
-        .collect();
-    let label_to_block: HashMap<&str, usize> = label_to_pos
-        .iter()
-        .filter_map(|(&lbl, &pos)| pos_to_block.get(&pos).map(|&b| (lbl, b)))
-        .collect();
-    let nblocks = block_starts.len();
-    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(nblocks);
-    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
-    for b in 0..nblocks {
-        let start = block_starts[b];
-        let end = block_starts.get(b + 1).copied().unwrap_or(body.len());
-        ranges.push((start, end));
-        if start < end {
-            let last = &body[end - 1];
-            match last[0] {
-                "jmp" if last.len() >= 2 => {
-                    if let Some(&t) = label_to_block.get(last[1]) {
-                        succs[b].push(t);
-                    }
-                }
-                "brif" if last.len() >= 4 => {
-                    if let Some(&t1) = label_to_block.get(last[2]) {
-                        succs[b].push(t1);
-                    }
-                    if let Some(&t2) = label_to_block.get(last[3]) {
-                        if !succs[b].contains(&t2) {
-                            succs[b].push(t2);
-                        }
-                    }
-                }
-                "ret" | "ret2" => {}
-                _ => {
-                    if b + 1 < nblocks {
-                        succs[b].push(b + 1);
-                    }
-                }
-            }
-        } else if b + 1 < nblocks {
-            succs[b].push(b + 1);
-        }
-    }
+    let (ranges, succs) = build_block_ranges(body);
+    let nblocks = ranges.len();
 
     #[derive(Clone, Default)]
     struct FlowState {

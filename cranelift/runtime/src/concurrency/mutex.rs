@@ -133,8 +133,11 @@ fn lock_green(m: &PithMutex, id: usize) {
         if !waiters.contains(&id) {
             waiters.push(id);
         }
-        drop(waiters);
+        // Take the waiter hold while still holding `waiters` (matching
+        // `semaphore.rs` and `waitgroup.rs`) so an unlock + final release
+        // cannot free `PithMutex` between `drop(waiters)` and `block.take()`.
         block.take();
+        drop(waiters);
         green::park_current(id);
         // resumed by an unlock, or by a stray wake; loop and retry the acquire.
     }

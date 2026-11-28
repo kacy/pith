@@ -492,18 +492,16 @@ impl MapImpl {
     /// overwritten, or cleared. A heap-valued map holds exactly one count per
     /// stored value, so anyone still reading it after this point must be
     /// holding a count of their own (the emitter retains borrowed values into
-    /// locals, fields, and other containers).
-    ///
-    /// # Safety
-    /// `val` must be a value this map owned.
-    unsafe fn release_value(&self, val: &MapVal) {
+    /// Extract `(val_tag, raw_handle)` for a displaced/removed value if this
+    /// map owns heap values, so callers can drop `&mut MapImpl` before running
+    /// any destructor.
+    #[must_use]
+    #[inline(always)]
+    fn displaced_value_handle(&self, val: MapVal) -> Option<(ListTypeTag, i64)> {
         if !self.val_is_heap() {
-            return;
+            return None;
         }
-        if let Some(raw) = val.word() {
-            // SAFETY: Map owns one count per stored heap value of `self.val_tag`.
-            unsafe { release_element(self.val_tag, raw) };
-        }
+        val.word().map(|raw| (self.val_tag, raw))
     }
 
     /// Take the map's count on a value being stored.
@@ -518,18 +516,35 @@ impl MapImpl {
         unsafe { retain_element(self.val_tag, raw) };
     }
 
-    /// Drop the map's count on every stored value, for clear and free.
-    ///
-    /// # Safety
-    /// The caller must not use the values afterwards.
-    unsafe fn release_all_values(&self) {
+    /// Detach and clear every stored entry, returning `(val_tag, raw_handles)`
+    /// so callers drop `&mut MapImpl` (and, on final release, scrub magic and
+    /// free the shell) BEFORE releasing any child values. Primitive maps clear
+    /// with zero allocation.
+    #[must_use]
+    fn take_values_for_release(&mut self) -> (ListTypeTag, Vec<i64>) {
         if !self.val_is_heap() {
-            return;
+            self.clear();
+            return (ListTypeTag::Primitive, Vec::new());
         }
-        for val in self.data.values() {
-            // SAFETY: Each value in `self.data` is owned by this map.
-            unsafe { self.release_value(val) };
-        }
+        let tag = self.val_tag;
+        let data = std::mem::take(&mut self.data);
+        self.int_values8 = None;
+        let vals: Vec<i64> = data.into_values().filter_map(|v| v.word()).collect();
+        (tag, vals)
+    }
+}
+
+/// Release heap values detached by `MapImpl::take_values_for_release`.
+///
+/// # Safety
+/// Every handle in `vals` must hold one count of kind `tag`.
+unsafe fn release_taken_values(tag: ListTypeTag, vals: Vec<i64>) {
+    if tag == ListTypeTag::Primitive {
+        return;
+    }
+    for raw in vals {
+        // SAFETY: Map owned one count per detached heap value.
+        unsafe { release_element(tag, raw) };
     }
 }
 
@@ -767,10 +782,14 @@ pub(crate) unsafe fn insert_bytes_key(
     let run = |impl_ref: &mut MapImpl| {
         require_key_flavor(impl_ref.key_type, KeyType::String, "map_insert");
         // SAFETY: Caller guarantees `value` matches the map's value kind.
-        unsafe { insert_keyed(impl_ref, &KeyRef::Str(key), value, takes_caller_count) };
+        unsafe { insert_keyed(impl_ref, &KeyRef::Str(key), value, takes_caller_count) }
     };
-    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
-    unsafe { with_map_mut_handle(map_handle, run) };
+    // SAFETY: `with_map_mut_handle` validates `map_handle`; release displaced value after borrow ends.
+    let displaced = unsafe { with_map_mut_handle(map_handle, run) }.flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `map_handle` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 /// Get map length
@@ -780,20 +799,26 @@ pub extern "C" fn pith_map_len(map: PithMap) -> i64 {
     unsafe { with_map_ref(map, |impl_ref| impl_ref.len() as i64) }.unwrap_or(0)
 }
 
+#[must_use]
 #[inline(always)]
-unsafe fn map_insert_int_impl(impl_ref: &mut MapImpl, key: i64, value: *const u8, val_size: i64) {
+unsafe fn map_insert_int_impl(
+    impl_ref: &mut MapImpl,
+    key: i64,
+    value: *const u8,
+    val_size: i64,
+) -> Option<(ListTypeTag, i64)> {
     crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
 
     // Verify value size matches
     if impl_ref.val_size != val_size as usize {
         eprintln!("pith: map value size mismatch");
-        return;
+        return None;
     }
 
     // Verify key type
     if !matches!(impl_ref.key_type, KeyType::Int) {
         eprintln!("pith: map key type mismatch (expected int)");
-        return;
+        return None;
     }
 
     // Copy value data
@@ -803,7 +828,7 @@ unsafe fn map_insert_int_impl(impl_ref: &mut MapImpl, key: i64, value: *const u8
         crate::perf_count(&crate::PERF_MAP_INT_FAST_INSERTS, 1);
         let int_value = i64::from_le_bytes(val_slice[..8].try_into().unwrap_or([0u8; 8]));
         impl_ref.insert_int_value(key, int_value);
-        return;
+        return None;
     }
     crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
     // the only caller that can supply a value that is not one word, so the
@@ -821,12 +846,11 @@ unsafe fn map_insert_int_impl(impl_ref: &mut MapImpl, key: i64, value: *const u8
         unsafe { impl_ref.retain_value(raw) };
     }
 
-    // Retain before insert, release the displaced value after: `m[k] = m[k]`
-    // must not drop the last count before the new one is taken.
-    if let Some(old) = impl_ref.insert(&KeyRef::Int(key), stored) {
-        // SAFETY: `old` was owned by `impl_ref`.
-        unsafe { impl_ref.release_value(&old) };
-    }
+    // Retain before insert, release the displaced value after `&mut MapImpl`
+    // ends: `m[k] = m[k]` must not drop the last count before the new one is taken.
+    impl_ref
+        .insert(&KeyRef::Int(key), stored)
+        .and_then(|old| impl_ref.displaced_value_handle(old))
 }
 
 /// Insert key-value pair with integer key
@@ -848,18 +872,16 @@ pub unsafe extern "C" fn pith_map_insert_int(
     // SAFETY: `map` is non-null per caller contract.
     let map_val = unsafe { *map };
     // SAFETY: `with_map_mut` validates `map_val`; `value` is readable for `val_size` bytes.
-    unsafe {
+    let displaced = unsafe {
         with_map_mut(map_val, |impl_ref| {
             map_insert_int_impl(impl_ref, key, value, val_size)
         })
-    };
-}
-
-#[inline(always)]
-unsafe fn map_clear_impl(impl_ref: &mut MapImpl) {
-    // SAFETY: `impl_ref` owns one count per stored heap value.
-    unsafe { impl_ref.release_all_values() };
-    impl_ref.clear();
+    }
+    .flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `map_val` under `tag`; `&mut MapImpl` borrow has ended.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 /// Clear all entries from map
@@ -871,8 +893,12 @@ pub unsafe extern "C" fn pith_map_clear(map: *mut PithMap) {
 
     // SAFETY: `map` is non-null per caller contract.
     let map_val = unsafe { *map };
-    // SAFETY: `with_map_mut` validates `map_val` before clearing it.
-    unsafe { with_map_mut(map_val, |impl_ref| map_clear_impl(impl_ref)) };
+    // SAFETY: `with_map_mut` validates `map_val` before detaching its storage.
+    let taken = unsafe { with_map_mut(map_val, MapImpl::take_values_for_release) };
+    if let Some((tag, vals)) = taken {
+        // SAFETY: Detached handles were owned by `map_val` under `tag`.
+        unsafe { release_taken_values(tag, vals) };
+    }
 }
 
 /// Release map and free memory
@@ -906,29 +932,32 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     }
     acquire_last_count!(impl_ref.rc);
 
-    // SAFETY: Last strong count observed with acquire; exclusive access to release values.
-    unsafe { impl_ref.release_all_values() };
+    // Detach values, scrub magic, and retire/free the shell BEFORE releasing
+    // child values so a child's `Drop` hitting a GC safepoint can never observe
+    // this dying map as a live root (and an `isolate_call` longjmp cannot leak
+    // the shell).
     let buffered = crate::cycle::cycle_gc_enabled()
         && impl_ref
             .cycle_flags
             .load(std::sync::atomic::Ordering::Relaxed)
             & 1
             != 0;
-
-    // Free the map implementation. Scrub the magic first so any handle
-    // that outlives the map fails the fast validity check.
-    // SAFETY: `impl_ref` borrow ended above; exclusive ownership of `map.ptr`.
-    unsafe { (*(map.ptr as *mut MapImpl)).magic = 0 };
-    // a map that dies while the suspect buffer points at it keeps its shell:
-    // the values are already released and the handle no longer validates
-    // anywhere, so deferring the box drop to the graveyard leaks only the
-    // impl struct until the collector frees it.
+    // SAFETY: Last strong count observed with acquire; `&MapImpl` borrow above
+    // has ended so exclusive `&mut MapImpl` access cannot alias.
+    let (tag, vals) = unsafe {
+        let impl_mut = &mut *(map.ptr as *mut MapImpl);
+        let taken = impl_mut.take_values_for_release();
+        impl_mut.magic = 0;
+        taken
+    };
     if buffered {
         crate::cycle::graveyard_defer(map.ptr as usize, crate::cycle::CYCLE_KIND_MAP);
-        return;
+    } else {
+        // SAFETY: Last owner, magic scrubbed, not deferred to graveyard.
+        unsafe { drop_map_shell(map.ptr as *mut MapImpl) };
     }
-    // SAFETY: Last owner, magic scrubbed, not deferred to graveyard.
-    unsafe { drop_map_shell(map.ptr as *mut MapImpl) };
+    // SAFETY: Detached handles were owned by this map under `tag`.
+    unsafe { release_taken_values(tag, vals) };
 }
 
 /// Mark a map as a cycle suspect and hand it to the buffer. Cold and
@@ -1021,12 +1050,16 @@ pub(crate) unsafe fn cycle_map_children(handle: i64, f: &mut dyn FnMut(i64, u8))
     unsafe { with_map_ref_handle(handle, |impl_ref| visit_map_children(impl_ref, f)) };
 }
 
-/// The destruction body of a garbage map: drop the count it holds on every
-/// value, then empty the storage so the shell free below can never release
-/// them a second time.
+/// The destruction body of a garbage map: detach and clear storage while
+/// holding `&mut`, then release every value after the borrow ends so cyclic
+/// back-edges cannot alias `&mut MapImpl`.
 pub(crate) unsafe fn cycle_map_release_values(handle: i64) {
     // SAFETY: Collector holds the world stopped; `with_map_mut_handle` validates `handle`.
-    unsafe { with_map_mut_handle(handle, |impl_ref| map_clear_impl(impl_ref)) };
+    let taken = unsafe { with_map_mut_handle(handle, MapImpl::take_values_for_release) };
+    if let Some((tag, vals)) = taken {
+        // SAFETY: Detached handles were owned by `handle` under `tag`.
+        unsafe { release_taken_values(tag, vals) };
+    }
 }
 
 /// Free a garbage map's shell: the tail of `pith_map_release` minus the value
@@ -1192,13 +1225,14 @@ fn get_keyed(impl_ref: &MapImpl, map_key: &KeyRef<'_>) -> Option<i64> {
     impl_ref.get(map_key).and_then(|val| val.word())
 }
 
-/// Drop the entry under `map_key`, releasing the map's count on its value.
+/// Drop the entry under `map_key`, returning any displaced heap value handle
+/// for release after the `&mut MapImpl` borrow ends.
+#[must_use]
 #[inline(always)]
-unsafe fn remove_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) {
-    if let Some(old) = impl_ref.remove(map_key) {
-        // SAFETY: `old` was owned by `impl_ref`.
-        unsafe { impl_ref.release_value(&old) };
-    }
+fn remove_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) -> Option<(ListTypeTag, i64)> {
+    impl_ref
+        .remove(map_key)
+        .and_then(|old| impl_ref.displaced_value_handle(old))
 }
 
 /// Exit with the structured diagnostic for a strict miss: `m[k]` on a key
@@ -1330,13 +1364,17 @@ unsafe fn insert_cstr_inner(
         crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
         let do_insert = |map_key: &KeyRef<'_>| {
             // SAFETY: Caller passes a value matching the map's value kind.
-            unsafe { insert_keyed(impl_ref, map_key, value, takes_caller_count) };
+            unsafe { insert_keyed(impl_ref, map_key, value, takes_caller_count) }
         };
         // SAFETY: `key` is non-null and a valid C string per caller contract.
-        unsafe { with_cstr_key(key, do_insert) };
+        unsafe { with_cstr_key(key, do_insert) }.flatten()
     };
-    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
-    unsafe { with_map_mut_handle(map_handle, run) };
+    // SAFETY: `with_map_mut_handle` validates `map_handle`; release displaced value after borrow ends.
+    let displaced = unsafe { with_map_mut_handle(map_handle, run) }.flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `map_handle` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 #[inline(always)]
@@ -1345,25 +1383,31 @@ unsafe fn insert_bkey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
         require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_insert_bkey");
         let do_insert = |map_key: &KeyRef<'_>| {
             // SAFETY: Caller passes a value matching the map's value kind.
-            unsafe { insert_keyed(impl_ref, map_key, value, takes_caller_count) };
+            unsafe { insert_keyed(impl_ref, map_key, value, takes_caller_count) }
         };
         // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
-        unsafe { with_bytes_key(key, do_insert) };
+        unsafe { with_bytes_key(key, do_insert) }.flatten()
     };
-    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
-    unsafe { with_map_mut_handle(map_handle, run) };
+    // SAFETY: `with_map_mut_handle` validates `map_handle`; release displaced value after borrow ends.
+    let displaced = unsafe { with_map_mut_handle(map_handle, run) }.flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `map_handle` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 /// Store `value` under `map_key`. the map retains the incoming value when it
-/// owns heap values, and drops its count on whatever that displaces. an owned
-/// value arrives with the caller's count, which the map keeps as its own.
+/// owns heap values, and returns whatever that displaces for release after the
+/// `&mut MapImpl` borrow ends. an owned value arrives with the caller's count,
+/// which the map keeps as its own.
+#[must_use]
 #[inline(always)]
 unsafe fn insert_keyed(
     impl_ref: &mut MapImpl,
     map_key: &KeyRef<'_>,
     value: i64,
     takes_caller_count: bool,
-) {
+) -> Option<(ListTypeTag, i64)> {
     if impl_ref.val_is_heap() {
         if !takes_caller_count {
             // SAFETY: Caller passes a handle matching `impl_ref.val_tag`.
@@ -1373,10 +1417,9 @@ unsafe fn insert_keyed(
             eprintln!("map_ins {} -> {:p}", map_key.display(), value as *const i8);
         }
     }
-    if let Some(old) = impl_ref.insert(map_key, MapVal::Word(value)) {
-        // SAFETY: `old` was owned by `impl_ref`.
-        unsafe { impl_ref.release_value(&old) };
-    }
+    impl_ref
+        .insert(map_key, MapVal::Word(value))
+        .and_then(|old| impl_ref.displaced_value_handle(old))
 }
 
 /// Body of the fused update: add `delta` to the value under a borrowed key and
@@ -1834,15 +1877,16 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
     let run = |impl_ref: &mut MapImpl| {
         require_key_flavor(impl_ref.key_type, KeyType::String, "map_remove");
         crate::perf_stats!(PERF_MAP_STRING_REMOVES += 1);
-        let do_remove = |map_key: &KeyRef<'_>| {
-            // SAFETY: Displaced entry is owned by `impl_ref`.
-            unsafe { remove_keyed(impl_ref, map_key) };
-        };
+        let do_remove = |map_key: &KeyRef<'_>| remove_keyed(impl_ref, map_key);
         // SAFETY: `key` is non-null and a valid C string per caller contract.
-        unsafe { with_cstr_key(key, do_remove) };
+        unsafe { with_cstr_key(key, do_remove) }.flatten()
     };
-    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
-    unsafe { with_map_mut_handle(map_handle, run) };
+    // SAFETY: `with_map_mut_handle` validates `map_handle`; release displaced value after borrow ends.
+    let displaced = unsafe { with_map_mut_handle(map_handle, run) }.flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `map_handle` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,15 +2076,16 @@ pub unsafe extern "C" fn pith_map_get_default_bkey(map_handle: i64, key: i64, de
 pub unsafe extern "C" fn pith_map_remove_bkey(map_handle: i64, key: i64) {
     let run = |impl_ref: &mut MapImpl| {
         require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_remove_bkey");
-        let do_remove = |map_key: &KeyRef<'_>| {
-            // SAFETY: Displaced entry is owned by `impl_ref`.
-            unsafe { remove_keyed(impl_ref, map_key) };
-        };
+        let do_remove = |map_key: &KeyRef<'_>| remove_keyed(impl_ref, map_key);
         // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
-        unsafe { with_bytes_key(key, do_remove) };
+        unsafe { with_bytes_key(key, do_remove) }.flatten()
     };
-    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
-    unsafe { with_map_mut_handle(map_handle, run) };
+    // SAFETY: `with_map_mut_handle` validates `map_handle`; release displaced value after borrow ends.
+    let displaced = unsafe { with_map_mut_handle(map_handle, run) }.flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `map_handle` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 fn map_keys_bkey_impl(impl_ref: &MapImpl) -> i64 {
@@ -2138,38 +2183,44 @@ pub unsafe extern "C" fn pith_map_insert_ikey_owned_kind(
     }
 }
 
+#[must_use]
 #[inline(always)]
 unsafe fn insert_ikey_impl(
     impl_ref: &mut MapImpl,
     key: i64,
     value: i64,
     takes_caller_count: bool,
-) {
+) -> Option<(ListTypeTag, i64)> {
     crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
     if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_INSERTS, 1);
         impl_ref.insert_int_value(key, value);
+        None
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
         if !takes_caller_count {
             // SAFETY: Caller passes a handle matching `impl_ref.val_tag`.
             unsafe { impl_ref.retain_value(value) };
         }
-        if let Some(old) = impl_ref.insert(&KeyRef::Int(key), MapVal::Word(value)) {
-            // SAFETY: `old` was owned by `impl_ref`.
-            unsafe { impl_ref.release_value(&old) };
-        }
+        impl_ref
+            .insert(&KeyRef::Int(key), MapVal::Word(value))
+            .and_then(|old| impl_ref.displaced_value_handle(old))
     }
 }
 
 #[inline(always)]
 unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_count: bool) {
-    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
-    unsafe {
+    // SAFETY: `with_map_mut_handle` validates `map_handle`; release displaced value after borrow ends.
+    let displaced = unsafe {
         with_map_mut_handle(map_handle, |impl_ref| {
             insert_ikey_impl(impl_ref, key, value, takes_caller_count)
         })
-    };
+    }
+    .flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `map_handle` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 /// Get an i64 value by integer key. Returns 0 if the key is not found.
@@ -2253,18 +2304,19 @@ pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i6
         .unwrap_or(0)
 }
 
+#[must_use]
 #[inline(always)]
-unsafe fn map_remove_ikey_impl(impl_ref: &mut MapImpl, key: i64) {
+fn map_remove_ikey_impl(impl_ref: &mut MapImpl, key: i64) -> Option<(ListTypeTag, i64)> {
     crate::perf_stats!(PERF_MAP_INT_REMOVES += 1);
     if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_REMOVES, 1);
         impl_ref.remove_int_value(key);
+        None
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_REMOVES, 1);
-        if let Some(old) = impl_ref.remove(&KeyRef::Int(key)) {
-            // SAFETY: `old` was owned by `impl_ref`.
-            unsafe { impl_ref.release_value(&old) };
-        }
+        impl_ref
+            .remove(&KeyRef::Int(key))
+            .and_then(|old| impl_ref.displaced_value_handle(old))
     }
 }
 
@@ -2274,8 +2326,13 @@ unsafe fn map_remove_ikey_impl(impl_ref: &mut MapImpl, key: i64) {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
-    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
-    unsafe { with_map_mut_handle(map_handle, |impl_ref| map_remove_ikey_impl(impl_ref, key)) };
+    // SAFETY: `with_map_mut_handle` validates `map_handle`; release displaced value after borrow ends.
+    let displaced = unsafe { with_map_mut_handle(map_handle, |impl_ref| map_remove_ikey_impl(impl_ref, key)) }
+        .flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `map_handle` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 unsafe fn display_map_impl(impl_ref: &MapImpl, key_kind: i64, val_kind: i64, out: &mut String) {
@@ -2413,8 +2470,12 @@ pub unsafe extern "C" fn pith_map_keys_ikey(map_handle: i64) -> i64 {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_clear_handle(map_handle: i64) {
-    // SAFETY: `with_map_mut_handle` validates `map_handle` before clearing it.
-    unsafe { with_map_mut_handle(map_handle, |impl_ref| map_clear_impl(impl_ref)) };
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before detaching its storage.
+    let taken = unsafe { with_map_mut_handle(map_handle, MapImpl::take_values_for_release) };
+    if let Some((tag, vals)) = taken {
+        // SAFETY: Detached handles were owned by `map_handle` under `tag`.
+        unsafe { release_taken_values(tag, vals) };
+    }
 }
 
 /// Check if map is empty (handle-based API). Returns 1 if empty, 0 otherwise.
@@ -3653,6 +3714,43 @@ mod tests {
 
             pith_map_release(a);
             pith_map_release(b);
+        }
+    }
+
+    #[test]
+    fn map_clear_empties_storage_before_releasing_values() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static OBSERVED_MAP: AtomicI64 = AtomicI64::new(0);
+        static OBSERVED_LEN: AtomicI64 = AtomicI64::new(-1);
+
+        extern "C" fn observe_map_dtor(_ptr: i64) {
+            let h = OBSERVED_MAP.load(Ordering::Relaxed);
+            let len = unsafe { pith_map_len_handle(h) };
+            OBSERVED_LEN.store(len, Ordering::Relaxed);
+        }
+
+        unsafe {
+            let map = pith_map_new_default().ptr as i64;
+            OBSERVED_MAP.store(map, Ordering::Relaxed);
+            OBSERVED_LEN.store(-1, Ordering::Relaxed);
+
+            let s = crate::runtime_core::pith_struct_alloc(1);
+            crate::runtime_core::pith_struct_set_dtor(
+                s,
+                observe_map_dtor as *const () as usize as i64,
+            );
+            let key = b"k\0".as_ptr() as *const i8;
+            pith_map_insert_cstr_owned_kind(map, key, s, 4); // Struct
+            assert_eq!(pith_map_len_handle(map), 1);
+
+            pith_map_clear_handle(map);
+            assert_eq!(
+                OBSERVED_LEN.load(Ordering::Relaxed),
+                0,
+                "map storage must be emptied before value destructors run"
+            );
+            assert_eq!(pith_map_len_handle(map), 0);
+            pith_map_release_handle(map);
         }
     }
 }

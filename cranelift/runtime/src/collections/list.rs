@@ -367,19 +367,45 @@ fn displaced_element(impl_ref: &ListImpl, index: usize) -> Option<i64> {
     impl_ref.get_value(index)
 }
 
-/// Drop the list's count on every element, for clear and free. The list
-/// holds exactly one count per heap element, so anyone still reading one
-/// after this point must hold a count of their own.
-unsafe fn release_all_elements(impl_ref: &ListImpl) {
-    if matches!(impl_ref.type_tag, ListTypeTag::Primitive) {
+/// Detach and clear every element the list owns, returning `(tag, raw_handles)`
+/// so the caller can drop its `&mut ListImpl` borrow (and, on final release,
+/// scrub magic and free the shell) BEFORE releasing any child handles.
+/// Primitive lists clear in place with zero allocation.
+#[must_use]
+fn take_elements_for_release(impl_ref: &mut ListImpl) -> (ListTypeTag, Vec<i64>) {
+    let tag = impl_ref.type_tag;
+    if matches!(tag, ListTypeTag::Primitive) {
+        impl_ref.clear();
+        return (tag, Vec::new());
+    }
+    if impl_ref.uses_value_storage() {
+        let vals = std::mem::take(&mut impl_ref.values8);
+        impl_ref.sync_value_view();
+        (tag, vals)
+    } else {
+        let mut vals = Vec::with_capacity(impl_ref.len());
+        for i in 0..impl_ref.len() {
+            if let Some(raw) = impl_ref.get_value(i) {
+                vals.push(raw);
+            }
+        }
+        impl_ref.clear();
+        (tag, vals)
+    }
+}
+
+/// Release elements previously detached by `take_elements_for_release`.
+///
+/// # Safety
+/// Every handle in `elems` must hold one count of kind `tag`.
+unsafe fn release_taken_elements(tag: ListTypeTag, elems: Vec<i64>) {
+    if matches!(tag, ListTypeTag::Primitive) {
         return;
     }
-    for i in 0..impl_ref.len() {
-        if let Some(raw) = impl_ref.get_value(i) {
-            crate::perf_count(&crate::PERF_LIST_CASCADE_RELEASES, 1);
-            // SAFETY: List owns one count per stored heap element.
-            unsafe { release_element(impl_ref.type_tag, raw) };
-        }
+    for raw in elems {
+        crate::perf_count(&crate::PERF_LIST_CASCADE_RELEASES, 1);
+        // SAFETY: List owned one count per detached heap element.
+        unsafe { release_element(tag, raw) };
     }
 }
 
@@ -899,12 +925,18 @@ pub unsafe extern "C" fn pith_list_insert_value_kind(
     };
 }
 
+#[must_use]
 #[inline(always)]
-unsafe fn set_value_kind_impl(impl_ref: &mut ListImpl, index: i64, value: i64, elem_tag: i64) {
+unsafe fn set_value_kind_impl(
+    impl_ref: &mut ListImpl,
+    index: i64,
+    value: i64,
+    elem_tag: i64,
+) -> Option<(ListTypeTag, i64)> {
     crate::perf_stats!(PERF_LIST_SETS += 1);
     let idx = index as usize;
     if idx >= impl_ref.len() {
-        return;
+        return None;
     }
     // retain before dropping the count on what this displaces, so `l[i] = l[i]`
     // cannot free the value mid-assignment.
@@ -912,10 +944,7 @@ unsafe fn set_value_kind_impl(impl_ref: &mut ListImpl, index: i64, value: i64, e
     unsafe { borrowed_store_retains(impl_ref, value, elem_tag) };
     let displaced = displaced_element(impl_ref, idx);
     impl_ref.set_value(idx, value);
-    if let Some(raw) = displaced {
-        // SAFETY: `displaced` was an element owned by `impl_ref`.
-        unsafe { release_element(impl_ref.type_tag, raw) };
-    }
+    displaced.map(|raw| (impl_ref.type_tag, raw))
 }
 
 /// Overwrite an element with a borrowed value of a named heap kind. An index
@@ -931,12 +960,17 @@ pub unsafe extern "C" fn pith_list_set_value_kind(
     value: i64,
     elem_tag: i64,
 ) {
-    // SAFETY: `with_list_mut` validates `list` before mutating it.
-    unsafe {
+    // SAFETY: `with_list_mut` validates `list`; release displaced element after borrow ends.
+    let displaced = unsafe {
         with_list_mut(list, |impl_ref| {
             set_value_kind_impl(impl_ref, index, value, elem_tag)
         })
-    };
+    }
+    .flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `list` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 /// The counts a borrowed value needs before it is stored under `elem_tag`.
@@ -1035,18 +1069,23 @@ pub unsafe extern "C" fn pith_list_set_value_owned(list: PithList, index: i64, v
     unsafe { set_value_inner(list, index, value, true) };
 }
 
+#[must_use]
 #[inline(always)]
-unsafe fn set_scalar_impl(impl_ref: &mut ListImpl, index: i64, value: i64) {
+unsafe fn set_scalar_impl(
+    impl_ref: &mut ListImpl,
+    index: i64,
+    value: i64,
+) -> Option<(ListTypeTag, i64)> {
     if impl_ref.type_tag != ListTypeTag::Primitive {
         // SAFETY: Preconditions forwarded from caller; reuse the active `&mut ListImpl`.
-        unsafe { set_value_impl(impl_ref, index, value, false) };
-        return;
+        return unsafe { set_value_impl(impl_ref, index, value, false) };
     }
     crate::perf_stats!(PERF_LIST_SETS += 1);
     let idx = index as usize;
     if idx < impl_ref.len() {
         impl_ref.set_value(idx, value);
     }
+    None
 }
 
 /// Set an element the compiler knows is a scalar (an Int, Float, Bool or a
@@ -1057,27 +1096,33 @@ unsafe fn set_scalar_impl(impl_ref: &mut ListImpl, index: i64, value: i64) {
 /// which a scalar never goes into, would still take the counting path.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_scalar(list: PithList, index: i64, value: i64) {
-    // SAFETY: `with_list_mut` validates `list` before mutating it.
-    unsafe { with_list_mut(list, |impl_ref| set_scalar_impl(impl_ref, index, value)) };
+    // SAFETY: `with_list_mut` validates `list`; release displaced element after borrow ends.
+    let displaced = unsafe { with_list_mut(list, |impl_ref| set_scalar_impl(impl_ref, index, value)) }
+        .flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `list` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
+#[must_use]
 #[inline(always)]
 unsafe fn set_value_impl(
     impl_ref: &mut ListImpl,
     index: i64,
     value: i64,
     takes_caller_count: bool,
-) {
+) -> Option<(ListTypeTag, i64)> {
     crate::perf_stats!(PERF_LIST_SETS += 1);
     let idx = index as usize;
     if idx >= impl_ref.len() {
         // an index outside the list stores nothing, so an owned value the
         // caller handed over has nobody else to release it.
-        if takes_caller_count {
-            // SAFETY: Caller transferred ownership of `value` matching `impl_ref.type_tag`.
-            unsafe { release_element(impl_ref.type_tag, value) };
-        }
-        return;
+        return if takes_caller_count {
+            Some((impl_ref.type_tag, value))
+        } else {
+            None
+        };
     }
     // retain the incoming element before dropping the count on what it
     // displaces, so `l[i] = l[i]` cannot free the value mid-assignment.
@@ -1089,19 +1134,21 @@ unsafe fn set_value_impl(
     }
     let displaced = displaced_element(impl_ref, idx);
     impl_ref.set_value(idx, value);
-    if let Some(raw) = displaced {
-        // SAFETY: `displaced` was an element owned by `impl_ref`.
-        unsafe { release_element(impl_ref.type_tag, raw) };
-    }
+    displaced.map(|raw| (impl_ref.type_tag, raw))
 }
 
 unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_count: bool) {
-    // SAFETY: `with_list_mut` validates `list` before mutating it.
-    unsafe {
+    // SAFETY: `with_list_mut` validates `list`; release displaced element after borrow ends.
+    let displaced = unsafe {
         with_list_mut(list, |impl_ref| {
             set_value_impl(impl_ref, index, value, takes_caller_count)
         })
-    };
+    }
+    .flatten();
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `list` (or transferred by caller on OOB) under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
 }
 
 // The strict stores behind `xs[i] = v`. The stores above ignore an index
@@ -1654,16 +1701,16 @@ unsafe fn list_set_bytes_impl(
     index: i64,
     elem: *const u8,
     elem_size: i64,
-) -> bool {
+) -> (bool, Option<(ListTypeTag, i64)>) {
     crate::perf_stats!(PERF_LIST_SETS += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
-        return false;
+        return (false, None);
     }
 
     if impl_ref.elem_size != elem_size as usize {
         eprintln!("pith: list element size mismatch");
-        return false;
+        return (false, None);
     }
 
     // Copy new element
@@ -1677,11 +1724,7 @@ unsafe fn list_set_bytes_impl(
 
     let displaced = displaced_element(impl_ref, index as usize);
     impl_ref.set(index as usize, elem_slice);
-    if let Some(raw) = displaced {
-        // SAFETY: `displaced` was an element owned by `impl_ref`.
-        unsafe { release_element(impl_ref.type_tag, raw) };
-    }
-    true
+    (true, displaced.map(|raw| (impl_ref.type_tag, raw)))
 }
 
 /// Set element at index (copies from elem buffer)
@@ -1699,34 +1742,41 @@ pub unsafe extern "C" fn pith_list_set(
     }
 
     // SAFETY: `with_list_mut` validates `list`; `elem` is readable for `elem_size` bytes.
-    unsafe {
+    let res = unsafe {
         with_list_mut(list, |impl_ref| {
             list_set_bytes_impl(impl_ref, index, elem, elem_size)
         })
+    };
+    let Some((ok, displaced)) = res else {
+        return false;
+    };
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `list` under `tag`; `&mut ListImpl` borrow has ended.
+        unsafe { release_element(tag, raw) };
     }
-    .unwrap_or(false)
+    ok
 }
 
 #[inline(always)]
-unsafe fn list_remove_bytes_impl(impl_ref: &mut ListImpl, index: i64, elem_size: i64) -> bool {
+unsafe fn list_remove_bytes_impl(
+    impl_ref: &mut ListImpl,
+    index: i64,
+    elem_size: i64,
+) -> (bool, Option<(ListTypeTag, i64)>) {
     crate::perf_stats!(PERF_LIST_REMOVES += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
-        return false;
+        return (false, None);
     }
 
     if impl_ref.elem_size != elem_size as usize {
         eprintln!("pith: list element size mismatch");
-        return false;
+        return (false, None);
     }
 
     let displaced = displaced_element(impl_ref, index as usize);
     impl_ref.remove(index as usize);
-    if let Some(raw) = displaced {
-        // SAFETY: `displaced` was an element owned by `impl_ref`.
-        unsafe { release_element(impl_ref.type_tag, raw) };
-    }
-    true
+    (true, displaced.map(|raw| (impl_ref.type_tag, raw)))
 }
 
 /// Remove element at index
@@ -1740,30 +1790,36 @@ pub unsafe extern "C" fn pith_list_remove(list: *mut PithList, index: i64, elem_
 
     // SAFETY: `list` is non-null per caller contract.
     let list_val = unsafe { *list };
-    // SAFETY: `with_list_mut` validates `list_val` before mutating it.
-    unsafe {
+    // SAFETY: `with_list_mut` validates `list_val`; release displaced element after borrow ends.
+    let res = unsafe {
         with_list_mut(list_val, |impl_ref| {
             list_remove_bytes_impl(impl_ref, index, elem_size)
         })
+    };
+    let Some((ok, displaced)) = res else {
+        return false;
+    };
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `list_val` under `tag`.
+        unsafe { release_element(tag, raw) };
     }
-    .unwrap_or(false)
+    ok
 }
 
 #[inline(always)]
-unsafe fn list_remove_value_impl(impl_ref: &mut ListImpl, index: i64) -> i64 {
+unsafe fn list_remove_value_impl(
+    impl_ref: &mut ListImpl,
+    index: i64,
+) -> (i64, Option<(ListTypeTag, i64)>) {
     crate::perf_stats!(PERF_LIST_REMOVES += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
-        return 0;
+        return (0, None);
     }
 
     let displaced = displaced_element(impl_ref, index as usize);
     impl_ref.remove(index as usize);
-    if let Some(raw) = displaced {
-        // SAFETY: `displaced` was an element owned by `impl_ref`.
-        unsafe { release_element(impl_ref.type_tag, raw) };
-    }
-    1
+    (1, displaced.map(|raw| (impl_ref.type_tag, raw)))
 }
 
 /// Remove the element at `index`, with the list handle passed by value
@@ -1771,22 +1827,30 @@ unsafe fn list_remove_value_impl(impl_ref: &mut ListImpl, index: i64) -> i64 {
 /// removed and 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i64 {
-    // SAFETY: `with_list_mut` validates `list` before mutating it.
-    unsafe { with_list_mut(list, |impl_ref| list_remove_value_impl(impl_ref, index)) }.unwrap_or(0)
-}
-
-#[inline(always)]
-unsafe fn list_clear_impl(impl_ref: &mut ListImpl) {
-    // SAFETY: `impl_ref` owns one count per stored heap element.
-    unsafe { release_all_elements(impl_ref) };
-    impl_ref.clear();
+    // SAFETY: `with_list_mut` validates `list`; release displaced element after borrow ends.
+    let res = unsafe { with_list_mut(list, |impl_ref| list_remove_value_impl(impl_ref, index)) };
+    let Some((ok, displaced)) = res else {
+        return 0;
+    };
+    if let Some((tag, raw)) = displaced {
+        // SAFETY: `raw` was owned by `list` under `tag`.
+        unsafe { release_element(tag, raw) };
+    }
+    ok
 }
 
 /// Clear all elements from list (by-value variant)
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_clear_value(list: PithList) {
-    // SAFETY: `with_list_mut` validates `list` before clearing it.
-    unsafe { with_list_mut(list, |impl_ref| list_clear_impl(impl_ref)) };
+    // Detach storage while holding `&mut`, then release elements after the
+    // borrow ends so re-entrant `Drop` methods or `isolate_call` aborts can
+    // never observe freed handles or alias `&mut ListImpl`.
+    // SAFETY: `with_list_mut` validates `list` before detaching its storage.
+    let taken = unsafe { with_list_mut(list, take_elements_for_release) };
+    if let Some((tag, elems)) = taken {
+        // SAFETY: Detached handles were owned by `list` under `tag`.
+        unsafe { release_taken_elements(tag, elems) };
+    }
 }
 
 fn list_reverse_value_impl(impl_ref: &mut ListImpl) {
@@ -1812,8 +1876,12 @@ pub unsafe extern "C" fn pith_list_clear(list: *mut PithList) {
 
     // SAFETY: `list` is non-null per caller contract.
     let list_val = unsafe { *list };
-    // SAFETY: `with_list_mut` validates `list_val` before clearing it.
-    unsafe { with_list_mut(list_val, |impl_ref| list_clear_impl(impl_ref)) };
+    // SAFETY: `with_list_mut` validates `list_val` before detaching its storage.
+    let taken = unsafe { with_list_mut(list_val, take_elements_for_release) };
+    if let Some((tag, elems)) = taken {
+        // SAFETY: Detached handles were owned by `list_val` under `tag`.
+        unsafe { release_taken_elements(tag, elems) };
+    }
 }
 
 fn list_reverse_impl(impl_ref: &mut ListImpl) {
@@ -1864,34 +1932,34 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     }
     acquire_last_count!(impl_ref.rc);
 
-    // Last count: release the elements this list owns, then free.
-    // SAFETY: Last strong count observed with acquire; exclusive access to release elements.
-    unsafe { release_all_elements(impl_ref) };
+    // Detach owned elements, scrub magic, and retire/free the shell BEFORE
+    // releasing child handles so a child's `Drop` hitting a GC safepoint can
+    // never observe this dying list as a live root (and an `isolate_call`
+    // longjmp cannot leak the shell).
     let buffered = crate::cycle::cycle_gc_enabled()
         && impl_ref
             .cycle_flags
             .load(std::sync::atomic::Ordering::Relaxed)
             & 1
             != 0;
-
-    // Scrub the magic first so any handle that outlives the list fails the
-    // fast validity check.
-    // SAFETY: `impl_ref` borrow ended above; exclusive ownership of `list.ptr`.
-    unsafe {
-        (*(list.ptr as *mut ListImpl)).magic = 0;
+    // SAFETY: Last strong count observed with acquire; `&ListImpl` borrow above
+    // has ended so exclusive `&mut ListImpl` access cannot alias.
+    let (tag, elems) = unsafe {
+        let impl_mut = &mut *(list.ptr as *mut ListImpl);
+        let taken = take_elements_for_release(impl_mut);
+        impl_mut.magic = 0;
         retire_identity(list.ptr);
-    }
+        taken
+    };
     crate::perf_count(&crate::PERF_LIST_FREES, 1);
-    // a list that dies while the suspect buffer points at it keeps its shell:
-    // the elements are already released and the handle no longer validates
-    // anywhere, so deferring the box drop to the graveyard leaks only the
-    // impl struct until the collector frees it.
     if buffered {
         crate::cycle::graveyard_defer(list.ptr as usize, crate::cycle::CYCLE_KIND_LIST);
-        return;
+    } else {
+        // SAFETY: Last owner, magic scrubbed, identity retired, not deferred to graveyard.
+        unsafe { drop_list_shell(list.ptr as *mut ListImpl) };
     }
-    // SAFETY: Last owner, magic scrubbed, identity retired, not deferred to graveyard.
-    unsafe { drop_list_shell(list.ptr as *mut ListImpl) };
+    // SAFETY: Detached handles were owned by this list under `tag`.
+    unsafe { release_taken_elements(tag, elems) };
 }
 
 /// Mark a list as a cycle suspect and hand it to the buffer. Cold and
@@ -1999,12 +2067,16 @@ pub(crate) unsafe fn cycle_list_children(handle: i64, f: &mut dyn FnMut(i64, u8)
     unsafe { with_list_ref_handle(handle, |impl_ref| visit_list_children(impl_ref, f)) };
 }
 
-/// The destruction body of a garbage list: drop the count it holds on every
-/// element, then empty the storage so the shell free below can never release
-/// them a second time.
+/// The destruction body of a garbage list: detach and clear storage while
+/// holding `&mut`, then release every element after the borrow ends so cyclic
+/// back-edges cannot alias `&mut ListImpl`.
 pub(crate) unsafe fn cycle_list_release_elements(handle: i64) {
     // SAFETY: Collector holds the world stopped; `with_list_mut_handle` validates `handle`.
-    unsafe { with_list_mut_handle(handle, |impl_ref| list_clear_impl(impl_ref)) };
+    let taken = unsafe { with_list_mut_handle(handle, take_elements_for_release) };
+    if let Some((tag, elems)) = taken {
+        // SAFETY: Detached handles were owned by `handle` under `tag`.
+        unsafe { release_taken_elements(tag, elems) };
+    }
 }
 
 /// Free a garbage list's shell: the tail of `pith_list_release` minus the
@@ -2633,6 +2705,42 @@ mod tests {
 
             pith_list_release(a);
             pith_list_release(b);
+        }
+    }
+
+    #[test]
+    fn list_clear_empties_storage_before_releasing_elements() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static OBSERVED_LIST: AtomicI64 = AtomicI64::new(0);
+        static OBSERVED_LEN: AtomicI64 = AtomicI64::new(-1);
+
+        extern "C" fn observe_list_dtor(_ptr: i64) {
+            let h = OBSERVED_LIST.load(Ordering::Relaxed);
+            let len = pith_list_len(PithList { ptr: h as *mut () });
+            OBSERVED_LEN.store(len, Ordering::Relaxed);
+        }
+
+        unsafe {
+            let list = pith_list_new(8, 4); // ListTypeTag::Struct
+            OBSERVED_LIST.store(list.ptr as i64, Ordering::Relaxed);
+            OBSERVED_LEN.store(-1, Ordering::Relaxed);
+
+            let s = crate::runtime_core::pith_struct_alloc(1);
+            crate::runtime_core::pith_struct_set_dtor(
+                s,
+                observe_list_dtor as *const () as usize as i64,
+            );
+            pith_list_push_value_owned(list, s);
+            assert_eq!(pith_list_len(list), 1);
+
+            pith_list_clear_value(list);
+            assert_eq!(
+                OBSERVED_LEN.load(Ordering::Relaxed),
+                0,
+                "list storage must be emptied before element destructors run"
+            );
+            assert_eq!(pith_list_len(list), 0);
+            pith_list_release(list);
         }
     }
 }

@@ -177,6 +177,7 @@ impl SyncBlock {
             *self.yielder.get() = ptr::null();
             *self.closure.get() = closure;
             *self.handoff.get() = None;
+            (*self.tls.get()).isolation = 0;
             debug_assert!((*self.tls.get()).is_empty(), "a retired task left threadlocals");
         }
         self.stack_bottom.store(stack.bottom, AtomicOrdering::Relaxed);

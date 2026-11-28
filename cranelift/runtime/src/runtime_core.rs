@@ -757,34 +757,6 @@ impl PithClosure {
             }))
     }
 
-    /// Drop the count each counted capture holds. This is the release walk
-    /// `captures` describes, written out for the hot path: a closure is
-    /// released once per construction, and walking all sixteen inline slots
-    /// through the chained iterator, with a call per slot, was most of the
-    /// cost of building and dropping a small closure. A slot whose tag is 0
-    /// holds a plain value, and the sixteen tags are read as one word, so a
-    /// closure that captured only plain values skips the walk.
-    fn release_captures(&self) {
-        if u128::from_ne_bytes(self.env_tags) != 0 {
-            for (value, tag) in self.env.iter().zip(self.env_tags.iter()) {
-                if *tag != 0 {
-                    // SAFETY: a nonzero tag marks a slot that holds one count
-                    // on a value of that kind, taken when it was captured, so
-                    // `value` was initialized alongside `*tag`.
-                    unsafe { release_captured_value(value.assume_init(), *tag) };
-                }
-            }
-        }
-        if let Some(overflow) = &self.overflow {
-            for capture in &overflow.captures {
-                if capture.tag != 0 {
-                    // SAFETY: as above, for a spilled slot.
-                    unsafe { release_captured_value(capture.value, capture.tag) };
-                }
-            }
-        }
-    }
-
     /// Copy every tagged capture out in walk order and blank the slots so a later
     /// shell free (or cyclic back-edge release) can never release them a
     /// second time.
@@ -987,7 +959,7 @@ pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
 
 enum ClosureReleaseAction {
     Keep,
-    Retire { buffered: bool },
+    Retire,
 }
 
 #[inline(always)]
@@ -1024,9 +996,7 @@ fn closure_release_step(closure: &PithClosure) -> ClosureReleaseAction {
         return ClosureReleaseAction::Keep;
     }
     acquire_last_count!(closure.ref_count);
-    closure.release_captures();
-    let buffered = closure.cycle_flags.load(Ordering::Relaxed) & CLOSURE_BUFFERED_FLAG != 0;
-    ClosureReleaseAction::Retire { buffered }
+    ClosureReleaseAction::Retire
 }
 
 /// Drop one owner; the last release drops the counts the closure took
@@ -1040,9 +1010,31 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RELEASE);
     // SAFETY: `handle` is validated by `with_closure_for` before decrementing its refcount.
     let action = unsafe { with_closure_for(handle, crate::quarantine::Op::Release, closure_release_step) };
-    if let Some(ClosureReleaseAction::Retire { buffered }) = action {
-        // SAFETY: Last release; `&PithClosure` borrow has ended so scrubbing and freeing cannot alias.
+    if let Some(ClosureReleaseAction::Retire) = action {
+        // Detach captures and retire the shell (scrubbing magic) BEFORE
+        // releasing any captured value: a captured `Drop` method hitting a GC
+        // safepoint must never observe this dying closure as a live root, and
+        // no `&PithClosure` / `&mut PithClosure` borrow may stay live across
+        // arbitrary user destructors.
+        let ptr = handle as *mut PithClosure;
+        // SAFETY: Sole owner after last release; no `&PithClosure` borrow is live.
+        let (buffered, taken) = unsafe {
+            let closure = &mut *ptr;
+            let buffered = closure.cycle_flags.load(Ordering::Relaxed) & CLOSURE_BUFFERED_FLAG != 0;
+            let has_tagged = u128::from_ne_bytes(closure.env_tags) != 0 || closure.overflow.is_some();
+            let taken = if has_tagged { Some(closure.take_captures()) } else { None };
+            (buffered, taken)
+        };
+        // SAFETY: Captures have been moved out; safe to scrub magic and recycle/free shell.
         unsafe { retire_closure_shell(handle, buffered) };
+        if let Some((inline, spill)) = taken {
+            for capture in inline.into_iter().chain(spill) {
+                if capture.tag != 0 {
+                    // SAFETY: Non-zero tag marks a captured value holding one refcount.
+                    unsafe { release_captured_value(capture.value, capture.tag) };
+                }
+            }
+        }
     }
 }
 
@@ -3684,6 +3676,7 @@ impl TlsMap {
     }
 
     pub(crate) fn take_values(&mut self) -> Vec<(i64, u8)> {
+        self.isolation = 0;
         std::mem::take(&mut self.values).into_iter().flatten().collect()
     }
 }
@@ -4426,7 +4419,13 @@ pub(crate) unsafe fn struct_is_shared(ptr: i64) -> bool {
 }
 
 fn mark_struct_shared_impl(h: &StructHeader) -> bool {
-    h.flags.fetch_or(STRUCT_SHARED_BIT, Ordering::Release) & STRUCT_SHARED_BIT == 0
+    let prev = h.flags.fetch_or(STRUCT_SHARED_BIT, Ordering::Release);
+    // Always set STRUCT_SHARED_BIT (even on a dead weak header so cross-thread
+    // weak ops stay atomic), but only return `true` to traverse children when
+    // the struct was newly marked AND is still alive (not dead/destroying), so
+    // `share.rs` never invokes a tracer on freed or poisoned field slots.
+    prev & (STRUCT_SHARED_BIT | STRUCT_DEAD_BIT) == 0
+        && h.strong.load(Ordering::Acquire) < STRUCT_DTOR_GUARD
 }
 
 /// Mark the struct at `ptr` shared; true when this call set the mark.
@@ -4710,11 +4709,17 @@ unsafe fn struct_release_step<const HOOKED: bool>(
     if HOOKED {
         h.quarantine_check_alive(crate::quarantine::Op::Release);
     }
-    // the sole owner of a struct that no weak reference holds is the only
-    // party that can reach it: no other thread can retain, release or
-    // upgrade it, so the last release skips the decrement. the acquire
-    // loads pair with the release decrements of the owners that went before.
-    let sole = h.strong.load(Ordering::Acquire) == 1 && h.weak.load(Ordering::Acquire) == 1;
+    // Only a thread-local struct can take the lock-free `sole` shortcut: for a
+    // shared struct, `strong` and `weak` are separate AtomicU32 words, so a
+    // concurrent `weak_upgrade` (strong 1->2) + `weak_release` (weak 2->1)
+    // between the two loads would let this thread free a live struct.
+    let local = h.is_local(switches);
+    if HOOKED && local {
+        crate::share::check_local(switches, ptr, "release");
+    }
+    let sole = local
+        && h.strong.load(Ordering::Relaxed) == 1
+        && h.weak.load(Ordering::Relaxed) == 1;
     if HOOKED && sole {
         crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_SOLE_RELEASE);
     }
@@ -4731,10 +4736,6 @@ unsafe fn struct_release_step<const HOOKED: bool>(
         if HOOKED && switches & crate::switches::CYCLE_GC != 0 && h.strong.load(Ordering::Relaxed) > 1 {
             // SAFETY: Caller still holds a strong count on `ptr`, matching `h`.
             unsafe { maybe_suspect_struct(ptr, h) };
-        }
-        let local = h.is_local(switches);
-        if HOOKED && local {
-            crate::share::check_local(switches, ptr, "release");
         }
         let prev = count_down(&h.strong, local);
         if prev > 1 {
@@ -4837,19 +4838,30 @@ pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
 // pointer degrades to None or a no-op.
 
 /// `Some(true)` for a live struct, `Some(false)` for one whose value died
-/// but whose header is still held (by a weak count, such as the suspect
-/// buffer's for a drained entry), `None` when the pointer is not a struct
-/// header at all.
+/// (or is mid-destructor under `STRUCT_DTOR_GUARD`) while its header is still
+/// held, `None` when the pointer is not a struct header at all.
 pub(crate) unsafe fn cycle_struct_alive(ptr: i64) -> Option<bool> {
     // SAFETY: Preconditions forwarded from cycle collector.
-    unsafe { with_struct_header(ptr, |h| h.flags.load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0) }
+    unsafe {
+        with_struct_header(ptr, |h| {
+            if h.flags.load(Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
+                return false;
+            }
+            let s = h.strong.load(Ordering::Relaxed);
+            s > 0 && s < STRUCT_DTOR_GUARD
+        })
+    }
 }
 
 fn live_struct_strong_count(h: &StructHeader) -> Option<u32> {
     if h.flags.load(Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
         return None;
     }
-    Some(h.strong.load(Ordering::Relaxed))
+    let s = h.strong.load(Ordering::Relaxed);
+    if s == 0 || s >= STRUCT_DTOR_GUARD {
+        return None;
+    }
+    Some(s)
 }
 
 /// The struct's current strong count, or `None` for a dead value or a

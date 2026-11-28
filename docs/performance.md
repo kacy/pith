@@ -10,28 +10,30 @@ different hardware.
 
 ## Where Pith stands
 
-The current numbers are the 2026-11-12 suite run in
+The current numbers are the 2026-11-28 suite run in
 [bench/README.md](../bench/README.md): every benchmark against Go 1.27 and
 Rust 1.99 ports on a Ryzen 9 9950X, pinned to one CCD, with every runner on
-one build (main after #1394). A few rows from it, as median wall time:
+one build (main at `fb38baae`). A few rows from it, as median wall time:
 
 | Workload | Pith | Go | Rust |
 |---|---:|---:|---:|
-| JSON decode, 20M small objects | 710 ms | 3523 ms | 1118 ms |
-| Event ledger, 200k events | 65 ms | 95 ms | 51 ms |
-| Channel fan-out, 1M messages | 40 ms | 49 ms | 465 ms |
-| Closure error handling, 2M calls | 289 ms | 182 ms | 163 ms |
-| Green fan-out, 2M tasks from main | 632 ms | 243 ms | 393 ms |
-| sha512, 256 MB | 432 ms | 190 ms | 210 ms |
-| HTTP server at 256 connections | 1.92M req/s, p99 217 µs | 1.00M (net/http), 2.23M (minimal) | 1.74M (hyper), p99 285 µs |
-| API gateway, plain forwarding at 64 connections | 473k req/s, p99 253 µs | 283k (net/http), p99 900 µs | No port |
+| JSON decode, 20M small objects | 671 ms | 3697 ms | 1111 ms |
+| Event ledger, 200k events | 64 ms | 97 ms | 51 ms |
+| Channel fan-out, 1M messages | 40 ms | 50 ms | 466 ms |
+| Closure error handling, 2M calls | 280 ms | 182 ms | 161 ms |
+| Green fan-out, 2M tasks from main | 645 ms | 241 ms | 392 ms |
+| sha512, 256 MB | 243 ms | 188 ms | 208 ms |
+| HTTP server at 256 connections | 2.02M req/s, p99 178 µs | 1.04M (net/http), 2.28M (minimal) | 1.82M (hyper), p99 262 µs |
+| API gateway, plain forwarding at 64 connections | 432k req/s, p99 356 µs | 289k (net/http), p99 880 µs | No port |
 
 Pith is ahead of Go on JSON decoding, substring search, the event ledger and
 catalog workloads, CSV encoding, map updates, channels, spawning inside
-tasks, HTTP latency and the API gateway. It is behind Go on closures,
-reference cycles, spawning from main, sha512 and concurrent gRPC calls, and
-behind Rust on most single-threaded compute. The list of the largest gaps,
-with their causes, is under "Where Pith stands" in bench/README.md.
+tasks, HTTP latency and the API gateway. #1511 moved sha512 onto a native
+block kernel, bringing it from 435 ms (2.30x Go) to 243 ms (1.29x Go, 1.17x
+Rust). Pith remains behind Go on closures, reference cycles, spawning from
+main and concurrent gRPC calls, and behind Rust on most single-threaded
+compute. The list of the largest gaps, with their causes, is under "Where
+Pith stands" in bench/README.md.
 
 The 2026-11-05 run before this one followed #1315 to #1319, which took the
 API gateway's plain forwarding at 64 connections from 118k to 472k req/s,

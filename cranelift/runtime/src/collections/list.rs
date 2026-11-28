@@ -176,7 +176,9 @@ impl ListImpl {
 
     fn push(&mut self, elem: &[u8]) {
         if self.uses_value_storage() {
-            self.values8.push(Self::read_i64_padded(elem));
+            let value = Self::read_i64_padded(elem);
+            self.share_stored(value);
+            self.values8.push(value);
             self.sync_value_view();
         } else {
             self.elements.push(elem.to_vec());
@@ -230,13 +232,13 @@ impl ListImpl {
         }
     }
 
-    fn pop(&mut self) -> Option<Vec<u8>> {
+    fn pop_value(&mut self) -> Option<i64> {
         if self.uses_value_storage() {
-            let popped = self.values8.pop().map(|value| value.to_ne_bytes().to_vec());
+            let popped = self.values8.pop();
             self.sync_value_view();
             popped
         } else {
-            self.elements.pop()
+            self.elements.pop().map(|elem| Self::read_i64_padded(&elem))
         }
     }
 
@@ -262,7 +264,9 @@ impl ListImpl {
     fn set(&mut self, index: usize, elem: &[u8]) {
         if self.uses_value_storage() {
             if index < self.values8.len() {
-                self.values8[index] = Self::read_i64_padded(elem);
+                let value = Self::read_i64_padded(elem);
+                self.share_stored(value);
+                self.values8[index] = value;
             }
         } else if index < self.elements.len() {
             self.elements[index] = elem.to_vec();
@@ -1377,40 +1381,25 @@ pub unsafe extern "C" fn pith_list_join_int(list: PithList, sep: *const i8) -> *
 }
 
 #[inline(always)]
-unsafe fn list_pop_impl(impl_ref: &mut ListImpl, elem_size: i64, out: *mut u8) -> bool {
-    if impl_ref.elem_size != elem_size as usize {
+fn list_pop_impl(impl_ref: &mut ListImpl) -> i64 {
+    if impl_ref.elem_size != 8 {
         eprintln!("pith: list element size mismatch");
-        return false;
+        return 0;
     }
 
-    match impl_ref.pop() {
-        Some(elem_data) => {
-            // Copy to output buffer
-            // SAFETY: Caller guarantees `out` is writable for `elem_size == elem_data.len()` bytes.
-            unsafe { std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len()) };
-
-            // The list's count transfers to the caller with the element,
-            // so there is no release here.
-            true
-        }
-        None => false,
-    }
+    // The list's count transfers to the caller with the element,
+    // so there is no release here.
+    impl_ref.pop_value().unwrap_or(0)
 }
 
-/// Pop element from end of list
+/// Pop the last 8-byte element from the list, transferring the list's
+/// ownership count to the caller.
 ///
-/// Returns true if successful, false if list is empty
+/// Returns the popped word, or `0` when the list is empty or invalid.
 #[no_mangle]
-pub unsafe extern "C" fn pith_list_pop(list: *mut PithList, elem_size: i64, out: *mut u8) -> bool {
-    if list.is_null() || out.is_null() {
-        return false;
-    }
-
-    // SAFETY: `list` is non-null per caller contract.
-    let list_val = unsafe { *list };
-    // SAFETY: `with_list_mut` validates `list_val`; `out` is writable for `elem_size` bytes.
-    unsafe { with_list_mut(list_val, |impl_ref| list_pop_impl(impl_ref, elem_size, out)) }
-        .unwrap_or(false)
+pub unsafe extern "C" fn pith_list_pop(list: PithList) -> i64 {
+    // SAFETY: `with_list_mut` validates `list` before mutating it.
+    unsafe { with_list_mut(list, list_pop_impl) }.unwrap_or(0)
 }
 
 #[inline(always)]
@@ -2418,14 +2407,55 @@ mod tests {
             pith_list_push_value(list, s as i64);
             crate::pith_cstring_release(s); // caller keeps nothing
 
-            let mut list_val = list;
-            let mut out = [0u8; 8];
-            assert!(pith_list_pop(&mut list_val, 8, out.as_mut_ptr()));
-            let popped = i64::from_ne_bytes(out) as *const i8;
+            let popped = pith_list_pop(list) as *const i8;
+            assert_eq!(popped, s);
             // the list's count moved out with the element
             assert_eq!(crate::cstring_refcount_for_tests(popped), Some(1));
+            // empty list and bogus handle return 0 safely
+            assert_eq!(pith_list_pop(list), 0);
+            assert_eq!(pith_list_pop(bogus_list()), 0);
             crate::pith_cstring_release(popped);
             pith_list_release(list);
+        }
+    }
+
+    #[test]
+    fn shared_list_push_and_set_propagate_shared_flag() {
+        unsafe {
+            let mut parent = pith_list_new(8, 2); // ListTypeTag::List
+            crate::share::share_value(parent.ptr as i64, ListTypeTag::List);
+
+            let child_pushed = pith_list_new(8, 0);
+            let pushed_word = (child_pushed.ptr as i64).to_ne_bytes();
+            pith_list_push(&mut parent, pushed_word.as_ptr(), 8);
+            let pushed_shared = with_list_ref(child_pushed, |r| {
+                r.cycle_flags.load(std::sync::atomic::Ordering::Relaxed)
+                    & crate::share::CONTAINER_SHARED_FLAG
+                    != 0
+            });
+            assert_eq!(
+                pushed_shared,
+                Some(true),
+                "ListImpl::push must trigger share_stored on shared lists"
+            );
+
+            let child_set = pith_list_new(8, 0);
+            let set_word = (child_set.ptr as i64).to_ne_bytes();
+            assert!(pith_list_set(parent, 0, set_word.as_ptr(), 8));
+            let set_shared = with_list_ref(child_set, |r| {
+                r.cycle_flags.load(std::sync::atomic::Ordering::Relaxed)
+                    & crate::share::CONTAINER_SHARED_FLAG
+                    != 0
+            });
+            assert_eq!(
+                set_shared,
+                Some(true),
+                "ListImpl::set must trigger share_stored on shared lists"
+            );
+
+            pith_list_release(child_pushed);
+            pith_list_release(child_set);
+            pith_list_release(parent);
         }
     }
 

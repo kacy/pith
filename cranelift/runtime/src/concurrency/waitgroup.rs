@@ -128,7 +128,22 @@ pub extern "C" fn pith_waitgroup_new() -> *mut PithWaitGroupHandle {
 #[inline(always)]
 fn add_waitgroup(wg: &PithWaitGroup, delta: i64) {
     let mut state = lock_state(&wg.lock);
-    state.count = (state.count as i64 + delta).max(0) as usize;
+    let next = if delta >= 0 {
+        match state.count.checked_add(delta as usize) {
+            Some(v) if v <= i64::MAX as usize => v,
+            _ => {
+                drop(state);
+                crate::failure::fail_static("waitgroup counter overflow");
+            }
+        }
+    } else {
+        state.count.saturating_sub(delta.unsigned_abs() as usize)
+    };
+    state.count = next;
+    if state.count == 0 {
+        wg.cvar.notify_all();
+        wake_green_waiters(&mut state);
+    }
 }
 
 #[inline(always)]
@@ -240,6 +255,29 @@ mod tests {
             pith_waitgroup_add(handle, 1);
             pith_waitgroup_done(handle);
             pith_waitgroup_wait(handle);
+        }
+    }
+
+    #[test]
+    fn negative_add_reaching_zero_wakes_waiters() {
+        unsafe {
+            let wg = pith_waitgroup_new();
+            pith_waitgroup_add(wg, 2);
+            let wg_addr = wg as usize;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                pith_waitgroup_wait(wg_addr as *mut PithWaitGroupHandle);
+                let _ = tx.send(());
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // Decrementing via negative delta must wake waiters just like `done`.
+            pith_waitgroup_add(wg, -2);
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok(),
+                "waitgroup waiter deadlocked after add(-2) reached zero"
+            );
+            waiter.join().unwrap();
+            crate::concurrency::sync_handle::pith_sync_release(wg as i64);
         }
     }
 }

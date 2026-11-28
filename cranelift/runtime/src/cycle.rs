@@ -550,6 +550,15 @@ pub(crate) fn adopt_mutator_slot(slot: Option<Arc<MutatorSlot>>) {
     });
 }
 
+/// Mark a pre-registered spawn slot as exited when thread creation fails
+/// before the child ever starts to adopt it. Without this, the slot would
+/// stay `MUTATOR_RUNNING` forever and block every future stop-the-world pass.
+pub(crate) fn abandon_mutator_slot(slot: Option<Arc<MutatorSlot>>) {
+    if let Some(slot) = slot {
+        slot.state.store(MUTATOR_EXITED, Ordering::SeqCst);
+    }
+}
+
 /// A stop-the-world check for a mutator at a point where parking it is safe:
 /// no runtime lock held, and either no pith frame at all (a worker between
 /// tasks) or a frame frozen at a compiled safe-point. With the flag off this
@@ -1074,13 +1083,12 @@ fn scan_black(nodes: &mut HashMap<usize, Node>, root: usize) {
     }
 }
 
-/// Blacken every white struct whose destructor runs a user `drop`, and
-/// everything it reaches. what stays white is then reachable only from other
-/// whites without user code, so no `drop` runs while a white is guarded and
-/// can reach one through a strong field: a cycle through a `Drop` struct
-/// leaks instead. a drop that runs from an ordinary release during teardown
-/// cannot reach a white strongly either, since a white has no owner outside
-/// the whites, and its weak reads refuse a white (see `guard_white`).
+/// Blacken every white struct whose destructor runs a user `drop`, every
+/// white ancestor that can reach one, and everything reachable from them.
+/// What stays white then has no path to any user `Drop` struct, so tearing
+/// down the white set during stop-the-world can neither execute a user `drop`
+/// directly nor drop the last strong reference to a `Drop` struct held by a
+/// non-`Drop` cycle: any cycle holding a `Drop` struct leaks instead.
 fn keep_user_drops(nodes: &mut HashMap<usize, Node>, mut dtor_slot: impl FnMut(usize) -> u64) {
     let user_drops = crate::sync::lock(&USER_DROPS);
     if user_drops.is_empty() {
@@ -1096,7 +1104,37 @@ fn keep_user_drops(nodes: &mut HashMap<usize, Node>, mut dtor_slot: impl FnMut(u
         .map(|(&ptr, _)| ptr)
         .collect();
     drop(user_drops);
-    for ptr in pinned {
+    if pinned.is_empty() {
+        return;
+    }
+
+    // Build reverse edges among white nodes so every white ancestor that can
+    // transitively reach a `Drop` struct is also blackened.
+    let mut parents: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (&parent, node) in nodes.iter() {
+        if node.color != Color::White {
+            continue;
+        }
+        for &(child, _) in &node.children {
+            if nodes.get(&child).is_some_and(|n| n.color == Color::White) {
+                parents.entry(child).or_default().push(parent);
+            }
+        }
+    }
+
+    let mut worklist = pinned;
+    let mut keep: HashSet<usize> = worklist.iter().copied().collect();
+    while let Some(node_ptr) = worklist.pop() {
+        if let Some(ps) = parents.get(&node_ptr) {
+            for &p in ps {
+                if keep.insert(p) {
+                    worklist.push(p);
+                }
+            }
+        }
+    }
+
+    for ptr in keep {
         scan_black(nodes, ptr);
     }
 }
@@ -2572,6 +2610,54 @@ mod tests {
         );
         whites.sort_unstable();
         assert_eq!(whites, vec![(1, CHILD_KIND_STRUCT), (2, CHILD_KIND_STRUCT)]);
+    }
+
+    #[test]
+    fn trial_deletion_keeps_non_drop_cycle_that_owns_a_user_drop_struct() {
+        let _guard = locked();
+        const FAKE_USER_DROP_DTOR: usize = 0xdead_beef_0001;
+        crate::sync::lock(&USER_DROPS).insert(FAKE_USER_DROP_DTOR);
+
+        // Non-Drop cycle 1 <-> 2 where 1 owns helper 3 which owns Drop struct 4;
+        // plus an unrelated non-Drop cycle 10 <-> 11 that must still be collected.
+        let graph: HashMap<usize, (i64, Vec<(usize, u8)>)> = HashMap::from([
+            (1, (1, vec![(2, CHILD_KIND_STRUCT), (3, CHILD_KIND_STRUCT)])),
+            (2, (1, vec![(1, CHILD_KIND_STRUCT)])),
+            (3, (1, vec![(4, CHILD_KIND_STRUCT)])),
+            (4, (1, vec![])),
+            (10, (1, vec![(11, CHILD_KIND_STRUCT)])),
+            (11, (1, vec![(10, CHILD_KIND_STRUCT)])),
+        ]);
+        let mut whites = run_trial_deletion(
+            &[(1, CHILD_KIND_STRUCT), (10, CHILD_KIND_STRUCT)],
+            |nodes, ptr, kind| {
+                if nodes.contains_key(&ptr) {
+                    return true;
+                }
+                let Some((count, children)) = graph.get(&ptr) else {
+                    return false;
+                };
+                nodes.insert(
+                    ptr,
+                    Node {
+                        kind,
+                        count: *count,
+                        color: Color::Fresh,
+                        children: children.clone(),
+                    },
+                );
+                true
+            },
+            |ptr| if ptr == 4 { FAKE_USER_DROP_DTOR as u64 } else { 0 },
+        );
+        crate::sync::lock(&USER_DROPS).remove(&FAKE_USER_DROP_DTOR);
+
+        whites.sort_unstable();
+        assert_eq!(
+            whites,
+            vec![(10, CHILD_KIND_STRUCT), (11, CHILD_KIND_STRUCT)],
+            "non-Drop ancestors of a Drop struct must stay black so STW never invokes user Drop"
+        );
     }
 
     #[test]

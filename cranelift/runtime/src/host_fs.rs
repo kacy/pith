@@ -326,6 +326,7 @@ fn create_new_file_at(path: &str, content: &[u8], mode: u32) -> i64 {
 fn fs_create_new_impl(path_str: &str, data: &[u8], mode: i64) -> i64 {
     let mode = (mode & 0o7777) as u32;
     if !blocking::offloads() {
+        let _native = crate::cycle::native_bracket();
         return create_new_file_at(path_str, data, mode);
     }
     let (path, content) = (path_str.to_string(), data.to_vec());
@@ -350,6 +351,7 @@ fn write_file_impl(path_str: &str, data: &[u8]) -> i64 {
     // sit through, but only when there is a worker to protect, so ask first
     // and write straight out of the caller's buffer when there is not.
     if !blocking::offloads() {
+        let _native = crate::cycle::native_bracket();
         return write_file_at(path_str, data) as i64;
     }
     // the copy is of the bytes, not of the handle: a `Bytes` object belongs to
@@ -361,6 +363,7 @@ fn write_file_impl(path_str: &str, data: &[u8]) -> i64 {
 
 fn append_file_impl(path_str: &str, data: &[u8]) -> i64 {
     if !blocking::offloads() {
+        let _native = crate::cycle::native_bracket();
         return append_file_at(path_str, data) as i64;
     }
     let (path, content) = (path_str.to_string(), data.to_vec());
@@ -475,6 +478,7 @@ fn read_handle_chunk(handle: i64, max_bytes: i64) -> Option<Vec<u8>> {
     let size = crate::fdio::chunk_size(max_bytes);
     let mut file = clone_file(handle)?;
     if !blocking::offloads() {
+        let _native = crate::cycle::native_bracket();
         return read_chunk(&mut file, size);
     }
     blocking::run(&POOL, move || read_chunk(&mut file, size))
@@ -494,6 +498,7 @@ fn write_handle_chunk(handle: i64, data: &[u8]) -> Result<usize, String> {
     };
     let mut file = cloned.map_err(|err| err.to_string())?;
     if !blocking::offloads() {
+        let _native = crate::cycle::native_bracket();
         return write_chunk(&mut file, data).0;
     }
     let data = data.to_vec();

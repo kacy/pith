@@ -341,7 +341,11 @@ fn tcp_connect_impl(host: &str, port: i64) -> i64 {
     }
 
     let connect_addr = format!("{}:{}", host, port);
-    match TcpStream::connect(&connect_addr) {
+    let connected = {
+        let _native = crate::cycle::native_bracket();
+        TcpStream::connect(&connect_addr)
+    };
+    match connected {
         Ok(stream) => {
             // no read deadline: a fresh connection waits indefinitely, exactly as
             // the green path leaves it. a client that wants bounded reads sets
@@ -404,7 +408,11 @@ pub extern "C" fn pith_tcp_accept(server: i64) -> i64 {
 
     // SAFETY: `listener` guard keeps `server_fd` open; `into_raw_fd` below prevents closing it.
     let listener_ref = unsafe { TcpListener::from_raw_fd(server_fd) };
-    let result = match listener_ref.accept() {
+    let accepted = {
+        let _native = crate::cycle::native_bracket();
+        listener_ref.accept()
+    };
+    let result = match accepted {
         Ok((stream, _addr)) => open_socket(stream.into_raw_fd()),
         Err(_) => 0,
     };
@@ -512,7 +520,11 @@ fn unix_connect_impl(path_str: &str) -> i64 {
     if is_green() {
         return green_unix_connect(path_str);
     }
-    match UnixStream::connect(path_str) {
+    let connected = {
+        let _native = crate::cycle::native_bracket();
+        UnixStream::connect(path_str)
+    };
+    match connected {
         Ok(stream) => open_socket(stream.into_raw_fd()),
         Err(_) => 0,
     }
@@ -569,7 +581,11 @@ pub extern "C" fn pith_unix_accept(server: i64) -> i64 {
 
         // SAFETY: `listener` guard keeps `server_fd` open; `into_raw_fd` below prevents closing it.
         let listener_ref = unsafe { UnixListener::from_raw_fd(server_fd) };
-        let result = match listener_ref.accept() {
+        let accepted = {
+            let _native = crate::cycle::native_bracket();
+            listener_ref.accept()
+        };
+        let result = match accepted {
             Ok((stream, _addr)) => open_socket(stream.into_raw_fd()),
             Err(_) => 0,
         };

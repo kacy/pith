@@ -80,7 +80,11 @@ pub unsafe extern "C" fn pith_input() -> *mut i8 {
 
     let stdin = io::stdin();
     let mut line = String::new();
-    if stdin.lock().read_line(&mut line).is_ok() {
+    let read_ok = {
+        let _native = crate::cycle::native_bracket();
+        stdin.lock().read_line(&mut line).is_ok()
+    };
+    if read_ok {
         if line.ends_with('\n') {
             line.pop();
         }

@@ -476,8 +476,11 @@ fn wait_off_green(handle: i64) -> i64 {
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                // SAFETY: one valid pollfd naming the pidfd opened above.
-                let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+                let ready = {
+                    let _native = crate::cycle::native_bracket();
+                    // SAFETY: one valid pollfd naming the pidfd opened above.
+                    unsafe { libc::poll(&mut pollfd, 1, -1) }
+                };
                 let interrupted = ready < 0
                     && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
                 // SAFETY: closing the pidfd we opened and have not shared.

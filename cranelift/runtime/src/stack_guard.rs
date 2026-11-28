@@ -148,24 +148,30 @@ fn install_handlers() {
     // SAFETY: `sysconf(_SC_PAGESIZE)` has no preconditions.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page > 0 {
-        PAGE_SIZE.store(page as usize, Ordering::Relaxed);
+        PAGE_SIZE.store(page as usize, Ordering::Release);
     }
     for (i, &sig) in FAULT_SIGNALS.iter().enumerate() {
+        // Query and publish the existing disposition BEFORE installing
+        // `on_fault`, so another thread faulting right after `sigaction`
+        // installs `on_fault` never observes an uninitialized `PREVIOUS[i]`.
+        // SAFETY: `libc::sigaction` is a C POD struct valid to zero-initialize.
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: Passing NULL `act` queries the current disposition without modifying it.
+        if unsafe { libc::sigaction(sig, std::ptr::null(), &mut previous) } == 0 {
+            // SAFETY: Written once inside `Once::call_once` before `on_fault` is
+            // installed for `sig`, and synchronized via the Release/Acquire fence pair.
+            unsafe { (*std::ptr::addr_of_mut!(PREVIOUS))[i] = Some(previous) };
+        }
+        std::sync::atomic::fence(Ordering::Release);
+
         // SAFETY: `libc::sigaction` is a C POD struct valid to zero-initialize.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = on_fault as *const () as usize;
         action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        // SAFETY: `libc::sigaction` is a C POD struct valid to zero-initialize.
-        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
         // SAFETY: plain libc calls on stack-local structs initialized with a valid handler.
-        let installed = unsafe {
+        unsafe {
             libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(sig, &action, &mut previous) == 0
-        };
-        if installed {
-            // SAFETY: `PREVIOUS` is written here once via `Once::call_once`, before any
-            // other thread is spawned from `pith_runtime_start`, and only read thereafter.
-            unsafe { (*std::ptr::addr_of_mut!(PREVIOUS))[i] = Some(previous) };
+            libc::sigaction(sig, &action, std::ptr::null_mut());
         }
     }
 }
@@ -203,15 +209,45 @@ fn install_alt_stack() -> Option<AltStack> {
 /// platform cannot say where the stack is.
 #[cfg(not(any(pith_asan, pith_tsan)))]
 fn thread_guard() -> (usize, usize) {
-    let page = PAGE_SIZE.load(Ordering::Relaxed);
+    let page = PAGE_SIZE.load(Ordering::Acquire);
     #[cfg(target_os = "linux")]
     if IS_MAIN.with(|m| m.get()) {
         return main_thread_guard(page);
     }
     match thread_stack_low() {
-        Some((low, guard)) if low > 0 => (low.saturating_sub(guard.max(GUARD_SLACK)), low + page),
+        Some((low, guard)) if low >= page && page > 0 => {
+            let guard_low = low.saturating_sub(guard.max(GUARD_SLACK)).max(page);
+            match low.checked_add(page) {
+                Some(guard_high) if guard_low < guard_high => (guard_low, guard_high),
+                _ => (0, 0),
+            }
+        }
         _ => (0, 0),
     }
+}
+
+/// Pure helper computing the main-thread guard range on Linux, rejecting
+/// limits that would underflow to zero and overlap the NULL page.
+#[cfg(all(target_os = "linux", not(any(pith_asan, pith_tsan))))]
+fn compute_main_thread_guard(here: usize, rlim_cur: libc::rlim_t, page: usize) -> (usize, usize) {
+    if rlim_cur == libc::RLIM_INFINITY || rlim_cur == 0 || page == 0 {
+        return (0, 0);
+    }
+    let Ok(size) = usize::try_from(rlim_cur) else {
+        return (0, 0);
+    };
+    if size >= here {
+        return (0, 0);
+    }
+    let low = here - size;
+    let guard_low = low.saturating_sub(GUARD_SLACK).max(page);
+    let Some(guard_high) = low.checked_add(size / 4).and_then(|v| v.checked_add(page)) else {
+        return (0, 0);
+    };
+    if guard_low >= guard_high || guard_high >= here {
+        return (0, 0);
+    }
+    (guard_low, guard_high)
 }
 
 /// the main thread's guard range on linux. `pthread_getattr_np` finds the
@@ -227,15 +263,11 @@ fn thread_guard() -> (usize, usize) {
 fn main_thread_guard(page: usize) -> (usize, usize) {
     // SAFETY: `getrlimit` fills a local.
     let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut limit) } != 0
-        || limit.rlim_cur == libc::RLIM_INFINITY
-    {
+    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut limit) } != 0 {
         return (0, 0);
     }
-    let size = limit.rlim_cur as usize;
     let here = &limit as *const libc::rlimit as usize;
-    let low = here.saturating_sub(size);
-    (low.saturating_sub(GUARD_SLACK), low + size / 4 + page)
+    compute_main_thread_guard(here, limit.rlim_cur, page)
 }
 
 /// the lowest usable address of this thread's stack and the size of the guard
@@ -287,10 +319,15 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, _context: *
     // positive si_code is a fault the kernel raised, the only kind whose
     // si_addr is an address.
     let (code, addr) = unsafe { ((*info).si_code, (*info).si_addr() as usize) };
-    if code > 0 {
-        let page = PAGE_SIZE.load(Ordering::Relaxed);
+    let page = PAGE_SIZE.load(Ordering::Acquire);
+    // Reject NULL-page dereferences (`addr < page`) so they are never
+    // misreported as a stack overflow.
+    if code > 0 && addr >= page {
         if let Some((id, bottom)) = crate::concurrency::green::running_task_stack() {
-            if bottom != 0 && addr >= bottom.saturating_sub(GUARD_SLACK) && addr < bottom + page {
+            if bottom >= page
+                && addr >= bottom.saturating_sub(GUARD_SLACK).max(page)
+                && addr < bottom.saturating_add(page)
+            {
                 report(&[
                     b"stack overflow in task ",
                     digits(id as u64).as_bytes(),
@@ -301,7 +338,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, _context: *
             }
         }
         let (low, high) = THREAD_GUARD.with(|g| g.get());
-        if addr >= low && addr < high {
+        if low < high && addr >= low && addr < high {
             if IS_MAIN.with(|m| m.get()) {
                 report(&[b"stack overflow in the main thread"]);
             }
@@ -310,7 +347,8 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, _context: *
     }
     // not an overflow: put back what was there and let the fault happen again.
     let index = if sig == libc::SIGSEGV { 0 } else { 1 };
-    // SAFETY: `PREVIOUS` was written once as this handler went in and is never written again.
+    std::sync::atomic::fence(Ordering::Acquire);
+    // SAFETY: `PREVIOUS` was written before `on_fault` was installed, synchronized by the fence.
     let previous = unsafe { (*std::ptr::addr_of!(PREVIOUS))[index] };
     match previous {
         Some(previous) => {
@@ -410,5 +448,23 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn main_thread_guard_rejects_huge_rlimit_and_null_page() {
+        let page = 4096usize;
+        let here = 0x7fff_0000_0000usize;
+        // Normal 8 MiB stack limit produces a bounded range well above page 0
+        // and strictly below `here`.
+        let (low, high) = compute_main_thread_guard(here, 8 * 1024 * 1024, page);
+        assert!(low >= page && low < high && high < here);
+
+        // Huge finite RLIMIT_STACK >= `here` must NOT saturate down to 0 and
+        // swallow NULL-pointer dereferences.
+        assert_eq!(compute_main_thread_guard(here, (here as libc::rlim_t) + 4096, page), (0, 0));
+        assert_eq!(compute_main_thread_guard(here, libc::RLIM_INFINITY - 1, page), (0, 0));
+        assert_eq!(compute_main_thread_guard(here, libc::RLIM_INFINITY, page), (0, 0));
+        assert_eq!(compute_main_thread_guard(here, 0, page), (0, 0));
     }
 }

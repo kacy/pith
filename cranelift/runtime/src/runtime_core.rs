@@ -1273,19 +1273,9 @@ pub unsafe extern "C" fn pith_closure_get_env(handle: i64, slot: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_print(s: string::PithString) {
-    if s.ptr.is_null() || s.len <= 0 {
-        println!();
-        return;
-    }
-
-    // SAFETY: Caller guarantees `s.ptr` is valid for `s.len` readable bytes.
-    let slice = unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) };
-    if let Ok(str_ref) = std::str::from_utf8(slice) {
-        println!("{}", str_ref);
-    } else {
-        println!();
-    }
+pub unsafe extern "C" fn pith_print(s: *const i8) {
+    // SAFETY: Caller guarantees `s` is null or a valid NUL-terminated C string.
+    unsafe { pith_print_cstr(s) };
 }
 
 #[cfg(test)]

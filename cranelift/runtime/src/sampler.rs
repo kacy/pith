@@ -64,7 +64,7 @@ fn set_timer(interval_us: libc::suseconds_t) {
 }
 
 extern "C" fn on_sample(_sig: libc::c_int, _info: *mut libc::siginfo_t, context: *mut libc::c_void) {
-    let samples = SAMPLES.load(Ordering::Relaxed);
+    let samples = SAMPLES.load(Ordering::Acquire);
     if samples.is_null() || context.is_null() {
         return;
     }
@@ -131,8 +131,9 @@ extern "C" fn write_samples() {
         .and_then(|line| line.split('-').next())
         .and_then(|start| u64::from_str_radix(start, 16).ok())
         .unwrap_or(0);
+    use std::fmt::Write as _;
     let mut text = String::with_capacity(count * 13 + maps.len() * 2);
-    text.push_str(&format!("base {base:x}\n"));
+    let _ = writeln!(text, "base {base:x}");
     for line in maps.lines() {
         text.push_str("map ");
         text.push_str(line);
@@ -141,7 +142,7 @@ extern "C" fn write_samples() {
     for i in 0..count {
         // SAFETY: `samples` is a leaked `MAX_SAMPLES` buffer and `i < count <= MAX_SAMPLES`.
         let pc = unsafe { samples.add(i).read() };
-        text.push_str(&format!("{pc:x}\n"));
+        let _ = writeln!(text, "{pc:x}");
     }
     if let Err(err) = std::fs::write(path, text) {
         eprintln!("pith: PITH_PROF could not write {}: {err}", path.to_string_lossy());

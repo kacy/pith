@@ -101,6 +101,26 @@ pub(super) fn split_handle(handle: i64) -> Option<(usize, u32)> {
     Some(((low - 1) as usize, (bits >> 32) as u32 & GEN_MASK))
 }
 
+/// Invoke a compiler-emitted Pith closure body through the closure ABI
+/// (`extern "C" fn(i64) -> i64`). Returns `0` if the handle is invalid.
+///
+/// Shared by both the OS-thread and green-thread task backends so the ABI
+/// transmute lives in exactly one place.
+///
+/// # Safety
+/// `closure_handle` must be a valid Pith closure handle kept alive for the call.
+pub(crate) unsafe fn invoke_closure(closure_handle: i64) -> i64 {
+    // SAFETY: `pith_closure_get_fn` validates `closure_handle` and returns 0 for anything invalid.
+    let func_ptr = unsafe { crate::pith_closure_get_fn(closure_handle) };
+    if func_ptr == 0 {
+        return 0;
+    }
+    // SAFETY: `func_ptr` came from a valid Pith closure header matching `extern "C" fn(i64) -> i64`.
+    // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
+    let func: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(func_ptr as *const ()) };
+    func(closure_handle)
+}
+
 /// Spawn a task running `closure_handle`, returning its task handle.
 ///
 /// # Safety

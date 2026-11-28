@@ -76,30 +76,36 @@ fn parse_float_impl(text: &str) -> ResultPair {
 fn b64_encode_impl(input: &[u8]) -> *mut i8 {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let len = input.len();
-    let mut out: Vec<u8> = Vec::with_capacity((len + 2) / 3 * 4);
+    let out_len = len.div_ceil(3) * 4;
+    // SAFETY: `pith_alloc_cstring(out_len)` returns a fresh writable buffer of
+    // `out_len` bytes (plus trailing NUL) that we exclusively own.
+    let ptr = unsafe { crate::pith_alloc_cstring(out_len) };
+    // SAFETY: `ptr` points to `out_len` writable (uninitialized) bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, out_len) };
     let mut i = 0;
+    let mut di = 0;
     while i < len {
         let b0 = input[i];
         let b1 = if i + 1 < len { input[i + 1] } else { 0 };
         let b2 = if i + 2 < len { input[i + 2] } else { 0 };
 
-        out.push(CHARS[(b0 >> 2) as usize]);
-        out.push(CHARS[((b0 & 3) << 4 | b1 >> 4) as usize]);
-        out.push(if i + 1 < len {
+        out[di].write(CHARS[(b0 >> 2) as usize]);
+        out[di + 1].write(CHARS[((b0 & 3) << 4 | b1 >> 4) as usize]);
+        out[di + 2].write(if i + 1 < len {
             CHARS[((b1 & 0xf) << 2 | b2 >> 6) as usize]
         } else {
             b'='
         });
-        out.push(if i + 2 < len {
+        out[di + 3].write(if i + 2 < len {
             CHARS[(b2 & 0x3f) as usize]
         } else {
             b'='
         });
 
         i += 3;
+        di += 4;
     }
-
-    crate::pith_copy_bytes_to_cstring(&out)
+    ptr
 }
 
 fn hex_encode_impl(input: &[u8]) -> *mut i8 {
@@ -237,6 +243,89 @@ pub unsafe extern "C" fn pith_int_to_bin(n: i64) -> *mut i8 {
     let s = format!("{:b}", n);
     crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
+
+fn b64_decode_impl(input: &[u8]) -> *mut i8 {
+    const DECODE: [u8; 256] = {
+        let mut t = [255u8; 256];
+        let mut i = 0u8;
+        while i < 26 {
+            t[(b'A' + i) as usize] = i;
+            i += 1;
+        }
+        i = 0;
+        while i < 26 {
+            t[(b'a' + i) as usize] = i + 26;
+            i += 1;
+        }
+        i = 0;
+        while i < 10 {
+            t[(b'0' + i) as usize] = i + 52;
+            i += 1;
+        }
+        t[b'+' as usize] = 62;
+        t[b'/' as usize] = 63;
+        t
+    };
+
+    let mut in_len = input.len();
+    while in_len > 0 && input[in_len - 1] == b'=' {
+        in_len -= 1;
+    }
+    let out_len = in_len * 3 / 4;
+    // SAFETY: `pith_alloc_cstring(out_len)` returns a fresh writable buffer of
+    // `out_len` bytes (plus trailing NUL) that we exclusively own.
+    let ptr = unsafe { crate::pith_alloc_cstring(out_len) };
+    // SAFETY: `ptr` points to `out_len` writable (uninitialized) bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, out_len) };
+
+    let mut si = 0;
+    let mut di = 0;
+    while si + 3 < in_len {
+        let a = DECODE[input[si] as usize] as u32;
+        let b = DECODE[input[si + 1] as usize] as u32;
+        let c = DECODE[input[si + 2] as usize] as u32;
+        let d = DECODE[input[si + 3] as usize] as u32;
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        if di < out_len {
+            out[di].write((n >> 16) as u8);
+            di += 1;
+        }
+        if di < out_len {
+            out[di].write((n >> 8) as u8);
+            di += 1;
+        }
+        if di < out_len {
+            out[di].write(n as u8);
+            di += 1;
+        }
+        si += 4;
+    }
+    if si + 1 < in_len {
+        let a = DECODE[input[si] as usize] as u32;
+        let b = DECODE[input[si + 1] as usize] as u32;
+        let n = (a << 18) | (b << 12);
+        if di < out_len {
+            out[di].write((n >> 16) as u8);
+            di += 1;
+        }
+        if si + 2 < in_len {
+            let c = DECODE[input[si + 2] as usize] as u32;
+            let n2 = (a << 18) | (b << 12) | (c << 6);
+            if di < out_len {
+                out[di].write(((n2 >> 8) & 0xff) as u8);
+            }
+        }
+    }
+
+    ptr
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, b64_decode_impl) }.unwrap_or(std::ptr::null_mut())
+}
+
 
 #[cfg(test)]
 mod tests {

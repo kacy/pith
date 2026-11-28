@@ -1,81 +1,16 @@
-use crate::ffi_util::{
-    with_cstr_bytes, with_cstr_bytes2, with_cstr_str, with_cstr_str2, with_cstr_str_or_empty,
+//! Lightweight utility builtins (`pith_log_*`, `pith_fnv1a`) and legacy alias
+//! shims (`pith_fs_write`, `pith_float_fixed`, `pith_is_dir`).
+
+use crate::ffi_util::{with_cstr_bytes, with_cstr_str_or_empty};
+
+pub use crate::encoding::pith_b64_decode;
+pub use crate::platform::pith_format_time_fmt;
+pub use crate::process::pith_exec_output;
+pub use crate::string_search::{
+    pith_cstring_contains, pith_cstring_ends_with, pith_cstring_index_of,
+    pith_cstring_index_of_any, pith_cstring_pad_left, pith_cstring_pad_right, pith_cstring_repeat,
+    pith_cstring_starts_with,
 };
-use std::mem::MaybeUninit;
-
-/// The `format_time` builtin. It formats a timestamp, given in milliseconds
-/// since the unix epoch, in UTC using a subset of strftime: `%Y` (year),
-/// `%m` `%d` `%H` `%M` `%S` (two digits each), `%F` (`%Y-%m-%d`), `%T`
-/// (`%H:%M:%S`), `%3f` (milliseconds, three digits) and `%%`. Any other
-/// `%` sequence is copied as written.
-///
-/// # Safety
-/// fmt must be null or a valid null-terminated C string.
-#[no_mangle]
-pub unsafe extern "C" fn pith_format_time_fmt(timestamp_ms: i64, fmt: *const i8) -> *mut i8 {
-    // SAFETY: `fmt` is null or a valid null-terminated C string for this call.
-    let s = unsafe { with_cstr_bytes(fmt, |bytes| format_time_utc(timestamp_ms, bytes)) }
-        .unwrap_or_default();
-    crate::pith_copy_bytes_to_cstring(s.as_bytes())
-}
-
-/// Converts days since 1970-01-01 to a (year, month, day) civil date in the
-/// proleptic gregorian calendar.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day)
-}
-
-fn format_time_utc(timestamp_ms: i64, fmt: &[u8]) -> String {
-    let secs = timestamp_ms.div_euclid(1000);
-    let millis = timestamp_ms.rem_euclid(1000);
-    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
-    let tod = secs.rem_euclid(86_400);
-    let (hour, minute, second) = (tod / 3600, tod / 60 % 60, tod % 60);
-    let mut out = String::with_capacity(fmt.len() + 16);
-    let mut i = 0;
-    while i < fmt.len() {
-        let rest = &fmt[i..];
-        let (text, used) = match rest {
-            [b'%', b'Y', ..] => (format!("{year:04}"), 2),
-            [b'%', b'm', ..] => (format!("{month:02}"), 2),
-            [b'%', b'd', ..] => (format!("{day:02}"), 2),
-            [b'%', b'H', ..] => (format!("{hour:02}"), 2),
-            [b'%', b'M', ..] => (format!("{minute:02}"), 2),
-            [b'%', b'S', ..] => (format!("{second:02}"), 2),
-            [b'%', b'F', ..] => (format!("{year:04}-{month:02}-{day:02}"), 2),
-            [b'%', b'T', ..] => (format!("{hour:02}:{minute:02}:{second:02}"), 2),
-            [b'%', b'3', b'f', ..] => (format!("{millis:03}"), 3),
-            [b'%', b'%', ..] => ("%".to_string(), 2),
-            _ => {
-                // copy plain text up to the next '%' (or one '%' that starts
-                // no known sequence) unchanged, keeping utf-8 intact.
-                let end = rest[1..]
-                    .iter()
-                    .position(|&b| b == b'%')
-                    .map_or(rest.len(), |p| p + 1);
-                out.push_str(&String::from_utf8_lossy(&rest[..end]));
-                i += end;
-                continue;
-            }
-        };
-        out.push_str(&text);
-        i += used;
-    }
-    out
-}
-
-fn fs_write_impl(path_str: &str, content_str: &str) -> i64 {
-    i64::from(std::fs::write(path_str, content_str).is_ok())
-}
 
 /// Write string to file path
 /// Returns 1 on success, 0 on failure
@@ -85,7 +20,7 @@ fn fs_write_impl(path_str: &str, content_str: &str) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_fs_write(path: *const i8, content: *const i8) -> i64 {
     // SAFETY: Both pointers are null or valid null-terminated C strings.
-    unsafe { with_cstr_str2(path, content, fs_write_impl) }.unwrap_or(0)
+    unsafe { crate::host_fs::pith_write_file(path, content) }
 }
 
 #[no_mangle]
@@ -106,124 +41,6 @@ pub unsafe extern "C" fn pith_log_error(msg: *const i8) {
     unsafe { with_cstr_str_or_empty(msg, |s| eprintln!("[ERROR] {s}")) };
 }
 
-fn exec_output_impl(cmd_str: &str) -> *mut i8 {
-    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-    if parts.is_empty() {
-        return std::ptr::null_mut();
-    }
-    let mut command = std::process::Command::new(parts[0]);
-    crate::env_overlay::apply(&mut command);
-    command.args(&parts[1..]);
-    // only stdout comes back, so there is no status to carry a signal death
-    // in. a child that a signal ended fails the call rather than handing back
-    // whatever it wrote before it died as if it had finished. an ordinary
-    // nonzero exit still returns its stdout, as it always has.
-    match crate::process::command_output(command) {
-        Some(output) if output.status.code().is_some() => {
-            crate::pith_copy_bytes_to_cstring(&output.stdout)
-        }
-        _ => std::ptr::null_mut(),
-    }
-}
-
-/// Run a command, split on whitespace with no shell, and return its stdout
-/// as a C string, or null when it could not run.
-///
-/// the child runs to completion via the process pool (see `process`), so a
-/// green worker is not held for however long the command takes.
-#[no_mangle]
-pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
-    // SAFETY: `cmd` is null or a valid null-terminated C string.
-    unsafe { with_cstr_str(cmd, exec_output_impl) }.unwrap_or(std::ptr::null_mut())
-}
-
-fn b64_decode_impl(input: &[u8]) -> *mut i8 {
-    const DECODE: [u8; 256] = {
-        let mut t = [255u8; 256];
-        let mut i = 0u8;
-        while i < 26 {
-            t[(b'A' + i) as usize] = i;
-            i += 1;
-        }
-        i = 0;
-        while i < 26 {
-            t[(b'a' + i) as usize] = i + 26;
-            i += 1;
-        }
-        i = 0;
-        while i < 10 {
-            t[(b'0' + i) as usize] = i + 52;
-            i += 1;
-        }
-        t[b'+' as usize] = 62;
-        t[b'/' as usize] = 63;
-        t
-    };
-
-    let mut in_len = input.len();
-    while in_len > 0 && input[in_len - 1] == b'=' {
-        in_len -= 1;
-    }
-    let out_len = in_len * 3 / 4;
-    // SAFETY: `pith_alloc_cstring(out_len)` returns a fresh writable buffer of
-    // `out_len` bytes (plus trailing NUL) that we exclusively own.
-    let ptr = unsafe { crate::pith_alloc_cstring(out_len) };
-    // SAFETY: `ptr` points to `out_len` writable (uninitialized) bytes.
-    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, out_len) };
-
-    let mut si = 0;
-    let mut di = 0;
-    while si + 3 < in_len {
-        let a = DECODE[input[si] as usize] as u32;
-        let b = DECODE[input[si + 1] as usize] as u32;
-        let c = DECODE[input[si + 2] as usize] as u32;
-        let d = DECODE[input[si + 3] as usize] as u32;
-        let n = (a << 18) | (b << 12) | (c << 6) | d;
-        if di < out_len {
-            out[di].write((n >> 16) as u8);
-            di += 1;
-        }
-        if di < out_len {
-            out[di].write((n >> 8) as u8);
-            di += 1;
-        }
-        if di < out_len {
-            out[di].write(n as u8);
-            di += 1;
-        }
-        si += 4;
-    }
-    if si + 1 < in_len {
-        let a = DECODE[input[si] as usize] as u32;
-        let b = DECODE[input[si + 1] as usize] as u32;
-        let n = (a << 18) | (b << 12);
-        if di < out_len {
-            out[di].write((n >> 16) as u8);
-            di += 1;
-        }
-        if si + 2 < in_len {
-            let c = DECODE[input[si + 2] as usize] as u32;
-            let n2 = (a << 18) | (b << 12) | (c << 6);
-            if di < out_len {
-                out[di].write(((n2 >> 8) & 0xff) as u8);
-                di += 1;
-            }
-        }
-    }
-    if di < out_len {
-        out[di].write(0);
-    }
-
-    ptr
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
-    // SAFETY: `s` is null or a valid null-terminated C string for this call.
-    unsafe { with_cstr_bytes(s, b64_decode_impl) }.unwrap_or(std::ptr::null_mut())
-}
-
-#[inline(always)]
 fn fnv1a_impl(bytes: &[u8]) -> i64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
@@ -239,318 +56,24 @@ pub unsafe extern "C" fn pith_fnv1a(s: *const i8) -> i64 {
     unsafe { with_cstr_bytes(s, fnv1a_impl) }.unwrap_or(0)
 }
 
-#[inline(always)]
-fn index_of_impl(h_bytes: &[u8], n_bytes: &[u8]) -> i64 {
-    match crate::substring::find(h_bytes, n_bytes) {
-        Some(at) => at as i64,
-        None => -1,
-    }
-}
-
-/// Byte offset of the first occurrence of needle in haystack, or -1. An
-/// empty needle is found at 0.
-///
-/// # Safety
-/// Both arguments must be null or valid null-terminated C strings
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_index_of(haystack: *const i8, needle: *const i8) -> i64 {
-    // SAFETY: Both arguments are null or valid null-terminated C strings.
-    unsafe { with_cstr_bytes2(haystack, needle, index_of_impl) }.unwrap_or(-1)
-}
-
-/// Offset of the first byte of `haystack` that equals any byte of `set`, or
-/// `None`. Eight bytes are tested per step: xor with a byte repeated across
-/// the word turns a match into a zero byte, and the usual zero-byte test
-/// finds it. That test can flag a byte above a real zero byte, never one
-/// below it, so the lowest flagged byte across all the set's bytes is a real
-/// match. On x86_64 a haystack of sixteen bytes or more takes the sse2
-/// version below. Sets longer than four bytes take a 256-bit table instead.
-pub(crate) fn find_any_byte(haystack: &[u8], set: &[u8]) -> Option<usize> {
-    const LOW: u64 = 0x0101_0101_0101_0101;
-    const HIGH: u64 = 0x8080_8080_8080_8080;
-    match set.len() {
-        0 => return None,
-        1 => return crate::substring::find(haystack, set),
-        2..=4 => {}
-        _ => {
-            let mut table = [0u64; 4];
-            for &b in set {
-                table[(b >> 6) as usize] |= 1 << (b & 63);
-            }
-            return haystack.iter().position(|&b| table[(b >> 6) as usize] >> (b & 63) & 1 != 0);
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    if haystack.len() >= 16 {
-        return find_any_byte_sse2(haystack, set);
-    }
-    // unused slots repeat the first byte, so every set runs the same four
-    // tests with no loop over its length.
-    let mut splat = [LOW * set[0] as u64; 4];
-    for (slot, &b) in splat.iter_mut().zip(set) {
-        *slot = LOW * b as u64;
-    }
-    let hits = |w: u64| {
-        let mut hit = 0;
-        for s in splat {
-            let x = w ^ s;
-            hit |= x.wrapping_sub(LOW) & !x & HIGH;
-        }
-        hit
-    };
-    let mut words = haystack.chunks_exact(8);
-    let mut at = 0;
-    for word in &mut words {
-        let hit = hits(u64::from_le_bytes(word.try_into().unwrap_or([0; 8])));
-        if hit != 0 {
-            return Some(at + (hit.trailing_zeros() / 8) as usize);
-        }
-        at += 8;
-    }
-    let tail = words.remainder();
-    if tail.is_empty() {
-        return None;
-    }
-    // the last one to seven bytes. a haystack of eight or more is tested
-    // through its final eight bytes: the ones that overlap the word before
-    // were just found clean, so the lowest flag is still a real match. a
-    // shorter one is assembled into a word a byte at a time (a copy into a
-    // buffer would be a call, and reading the buffer back as a word stalls),
-    // and flags in the unused bytes are masked off.
-    let (word, base, live) = match haystack.last_chunk::<8>() {
-        Some(last) => (u64::from_le_bytes(*last), haystack.len() - 8, u64::MAX),
-        None => {
-            let mut word = 0;
-            for (i, &b) in tail.iter().enumerate() {
-                word |= (b as u64) << (8 * i);
-            }
-            (word, 0, u64::MAX >> (64 - 8 * tail.len()))
-        }
-    };
-    let hit = hits(word) & live;
-    if hit != 0 {
-        return Some(base + (hit.trailing_zeros() / 8) as usize);
-    }
-    None
-}
-
-/// `find_any_byte` for a haystack of sixteen bytes or more and a set of two to
-/// four: sixteen bytes per step, one compare per set byte. The last partial
-/// block is tested through the haystack's final sixteen bytes, and the ones
-/// that overlap the block before were just found clean.
-#[cfg(target_arch = "x86_64")]
-fn find_any_byte_sse2(haystack: &[u8], set: &[u8]) -> Option<usize> {
-    // SAFETY: SSE2 is part of the x86_64 baseline.
-    unsafe { find_any_byte_sse2_impl(haystack, set) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-fn find_any_byte_sse2_impl(haystack: &[u8], set: &[u8]) -> Option<usize> {
-    use std::arch::x86_64::{
-        __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi8,
-    };
-    let mut needles = [_mm_set1_epi8(set[0] as i8); 4];
-    for (slot, &b) in needles.iter_mut().zip(set) {
-        *slot = _mm_set1_epi8(b as i8);
-    }
-    let hits = |at: usize| {
-        // SAFETY: Caller only passes `at <= haystack.len() - 16`, so 16 bytes lie inside `haystack`.
-        let block = unsafe { _mm_loadu_si128(haystack.as_ptr().add(at) as *const __m128i) };
-        let any = _mm_or_si128(
-            _mm_or_si128(_mm_cmpeq_epi8(block, needles[0]), _mm_cmpeq_epi8(block, needles[1])),
-            _mm_or_si128(_mm_cmpeq_epi8(block, needles[2]), _mm_cmpeq_epi8(block, needles[3])),
-        );
-        _mm_movemask_epi8(any) as u32
-    };
-    let last = haystack.len() - 16;
-    let mut at = 0;
-    while at < last {
-        let hit = hits(at);
-        if hit != 0 {
-            return Some(at + hit.trailing_zeros() as usize);
-        }
-        at += 16;
-    }
-    let hit = hits(last);
-    if hit != 0 {
-        return Some(last + hit.trailing_zeros() as usize);
-    }
-    None
-}
-
-#[inline(always)]
-fn index_of_any_impl(h_bytes: &[u8], set_bytes: &[u8]) -> i64 {
-    match find_any_byte(h_bytes, set_bytes) {
-        Some(at) => at as i64,
-        None => -1,
-    }
-}
-
-/// Byte offset of the first byte of `haystack` that is any of the bytes of
-/// `set`, or -1. One pass, where a `contains` per byte walks the string once
-/// for each. The set is read as bytes, so it is meant for ascii delimiters.
-///
-/// # Safety
-/// Both arguments must be null or valid null-terminated C strings
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_index_of_any(haystack: *const i8, set: *const i8) -> i64 {
-    // SAFETY: Both arguments are null or valid null-terminated C strings.
-    unsafe { with_cstr_bytes2(haystack, set, index_of_any_impl) }.unwrap_or(-1)
-}
-
-#[inline(always)]
-fn contains_impl(h_bytes: &[u8], n_bytes: &[u8]) -> i64 {
-    i64::from(crate::substring::find(h_bytes, n_bytes).is_some())
-}
-
-/// 1 when needle occurs in haystack, else 0. An empty needle is contained
-/// in every string.
-///
-/// # Safety
-/// Both arguments must be null or valid null-terminated C strings
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_contains(haystack: *const i8, needle: *const i8) -> i64 {
-    // SAFETY: Both arguments are null or valid null-terminated C strings.
-    unsafe { with_cstr_bytes2(haystack, needle, contains_impl) }.unwrap_or(0)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_starts_with(s: *const i8, prefix: *const i8) -> i64 {
-    // SAFETY: Both arguments are null or valid null-terminated C strings.
-    let res = unsafe { with_cstr_bytes2(s, prefix, |bytes, p| bytes.starts_with(p)) }.unwrap_or(false);
-    i64::from(res)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_ends_with(s: *const i8, suffix: *const i8) -> i64 {
-    // SAFETY: Both arguments are null or valid null-terminated C strings.
-    let res = unsafe { with_cstr_bytes2(s, suffix, |bytes, suf| bytes.ends_with(suf)) }.unwrap_or(false);
-    i64::from(res)
-}
-
-#[inline(always)]
-unsafe fn fill_byte_or_space(fill: *const i8) -> u8 {
-    if fill.is_null() {
-        return b' ';
-    }
-    // SAFETY: Caller guarantees non-null `fill` points to a readable NUL-terminated C string.
-    let first = unsafe { *fill } as u8;
-    if first != 0 { first } else { b' ' }
-}
-
-fn pad_left_impl(bytes: &[u8], width: i64, fill_byte: u8) -> *mut i8 {
-    if width <= 0 || bytes.len() >= width as usize {
-        return crate::pith_copy_bytes_to_cstring(bytes);
-    }
-    let w = width as usize;
-    let pad = w - bytes.len();
-    // SAFETY: `pith_alloc_cstring(w)` returns a fresh writable buffer of `w` bytes plus NUL.
-    let ptr = unsafe { crate::pith_alloc_cstring(w) };
-    // SAFETY: `ptr` points to `w` writable (uninitialized) bytes.
-    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, w) };
-    out[..pad].fill(MaybeUninit::new(fill_byte));
-    for (dst, &b) in out[pad..].iter_mut().zip(bytes) {
-        dst.write(b);
-    }
-    ptr
-}
-
-fn pad_right_impl(bytes: &[u8], width: i64, fill_byte: u8) -> *mut i8 {
-    if width <= 0 || bytes.len() >= width as usize {
-        return crate::pith_copy_bytes_to_cstring(bytes);
-    }
-    let w = width as usize;
-    // SAFETY: `pith_alloc_cstring(w)` returns a fresh writable buffer of `w` bytes plus NUL.
-    let ptr = unsafe { crate::pith_alloc_cstring(w) };
-    // SAFETY: `ptr` points to `w` writable (uninitialized) bytes.
-    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, w) };
-    for (dst, &b) in out[..bytes.len()].iter_mut().zip(bytes) {
-        dst.write(b);
-    }
-    out[bytes.len()..].fill(MaybeUninit::new(fill_byte));
-    ptr
-}
-
-fn repeat_impl(bytes: &[u8], n: i64) -> *mut i8 {
-    let len = bytes.len();
-    // an empty string repeats to the empty string at any count. the copy
-    // loop below runs once per repetition, so a huge count of nothing used
-    // to spin for as long as the count said.
-    if n <= 0 || len == 0 {
-        return crate::pith_cstring_empty();
-    }
-    let Some(total_len) = len
-        .checked_mul(n as usize)
-        .filter(|&t| crate::runtime_core::cstring_len_valid(t))
-    else {
-        return crate::pith_cstring_empty();
-    };
-    // SAFETY: `pith_alloc_cstring(total_len)` returns a fresh writable buffer of
-    // `total_len` bytes plus NUL.
-    let ptr = unsafe { crate::pith_alloc_cstring(total_len) };
-    for i in 0..n as usize {
-        // SAFETY: `i * len + len <= total_len`; source and fresh dest do not alias.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const i8, ptr.add(i * len), len);
-        }
-    }
-    ptr
-}
-
-fn is_dir_impl(path_str: &str) -> i64 {
-    i64::from(std::path::Path::new(path_str).is_dir())
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_pad_left(
-    s: *const i8,
-    width: i64,
-    fill: *const i8,
-) -> *mut i8 {
-    // SAFETY: `fill` is null or a valid null-terminated C string.
-    let fill_byte = if width > 0 { unsafe { fill_byte_or_space(fill) } } else { b' ' };
-    // SAFETY: `s` is null or a valid null-terminated C string for this call.
-    unsafe { with_cstr_bytes(s, |bytes| pad_left_impl(bytes, width, fill_byte)) }
-        .unwrap_or(std::ptr::null_mut())
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_pad_right(
-    s: *const i8,
-    width: i64,
-    fill: *const i8,
-) -> *mut i8 {
-    // SAFETY: `fill` is null or a valid null-terminated C string.
-    let fill_byte = if width > 0 { unsafe { fill_byte_or_space(fill) } } else { b' ' };
-    // SAFETY: `s` is null or a valid null-terminated C string for this call.
-    unsafe { with_cstr_bytes(s, |bytes| pad_right_impl(bytes, width, fill_byte)) }
-        .unwrap_or(std::ptr::null_mut())
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
-    // SAFETY: `s` is null or a valid null-terminated C string for this call.
-    unsafe { with_cstr_bytes(s, |bytes| repeat_impl(bytes, n)) }
-        .unwrap_or_else(crate::pith_cstring_empty)
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn pith_float_fixed(value: f64, decimals: i64) -> *mut i8 {
-    let precision = decimals.max(0) as usize;
-    let s = format!("{:.prec$}", value, prec = precision);
-    crate::pith_copy_bytes_to_cstring(s.as_bytes())
+    // SAFETY: Delegates directly to `pith_fmt_float`.
+    unsafe { crate::platform::pith_fmt_float(value, decimals) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_is_dir(path: i64) -> i64 {
     // SAFETY: `path` is null or a valid null-terminated C string.
-    unsafe { with_cstr_str(path as *const i8, is_dir_impl) }.unwrap_or(0)
+    unsafe { crate::host_fs::pith_dir_exists(path as *const i8) }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::format_time_utc;
+    use crate::string_search::find_any_byte;
 
     #[test]
     fn format_time_handles_the_strftime_subset() {

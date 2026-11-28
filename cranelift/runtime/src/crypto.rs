@@ -588,7 +588,11 @@ pub extern "C" fn pith_os_cert_roots_pem() -> *mut i8 {
     ]);
 
     for path in candidates {
-        if let Ok(data) = fs::read(&path) {
+        let read_res = {
+            let _native = crate::cycle::native_bracket();
+            fs::read(&path)
+        };
+        if let Ok(data) = read_res {
             if data
                 .windows(27)
                 .any(|window| window == b"-----BEGIN CERTIFICATE-----")

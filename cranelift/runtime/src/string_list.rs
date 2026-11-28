@@ -3,18 +3,6 @@ use crate::ffi_util::{with_cstr_bytes, with_cstr_bytes2, with_cstr_str2};
 use crate::runtime_core::optional_tuple;
 use std::mem::MaybeUninit;
 
-/// Borrow bytes from a C string pointer for the duration of `f`, passing `&[]` if null.
-#[inline(always)]
-unsafe fn with_cstr_bytes_or_empty<R>(ptr: *const i8, f: impl FnOnce(&[u8]) -> R) -> R {
-    if ptr.is_null() {
-        return f(&[]);
-    }
-    let len = crate::string::pith_cstring_len(ptr) as usize;
-    // SAFETY: Caller guarantees `ptr` points to a readable, null-terminated C string.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-    f(bytes)
-}
-
 /// Get command line arguments as a Pith list of C string pointers.
 #[no_mangle]
 pub unsafe extern "C" fn pith_args() -> PithList {
@@ -358,7 +346,7 @@ fn format_pad_impl(bytes: &[u8], width: i64, align: i64, fill: i64) -> i64 {
 pub unsafe extern "C" fn pith_format_pad(handle: i64, width: i64, align: i64, fill: i64) -> i64 {
     // SAFETY: `handle` is 0 or a valid null-terminated C string for this call.
     unsafe {
-        with_cstr_bytes_or_empty(handle as *const i8, |bytes| {
+        crate::ffi_util::with_cstr_bytes_or_empty(handle as *const i8, |bytes| {
             format_pad_impl(bytes, width, align, fill)
         })
     }
@@ -667,8 +655,8 @@ pub unsafe extern "C" fn pith_cstring_replace(
     // SAFETY: All non-null pointers are valid null-terminated C strings for this call.
     unsafe {
         with_cstr_bytes(s, |s_bytes| {
-            with_cstr_bytes_or_empty(from, |from_bytes| {
-                with_cstr_bytes_or_empty(to, |to_bytes| replace_impl(s_bytes, from_bytes, to_bytes))
+            crate::ffi_util::with_cstr_bytes_or_empty(from, |from_bytes| {
+                crate::ffi_util::with_cstr_bytes_or_empty(to, |to_bytes| replace_impl(s_bytes, from_bytes, to_bytes))
             })
         })
     }

@@ -55,6 +55,26 @@ pub(crate) fn offloads() -> bool {
     offload_target().is_some()
 }
 
+/// Run `inline` directly inside a cycle-collector `native_bracket()` when the
+/// caller is not on a green worker that needs offloading, or build an owned job
+/// with `make_job` and dispatch it onto `pool` otherwise.
+///
+/// Keeps the zero-copy fast path for OS-thread callers while guaranteeing that
+/// the inline blocking syscall cannot forget its `native_bracket()`.
+pub(crate) fn run_or_inline<T, FI, FJ, F>(pool: &'static Pool, inline: FI, make_job: FJ) -> T
+where
+    T: Default + Send + 'static,
+    FI: FnOnce() -> T,
+    FJ: FnOnce() -> F,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if !offloads() {
+        let _native = crate::cycle::native_bracket();
+        return inline();
+    }
+    run(pool, make_job())
+}
+
 /// run `work` on a pool thread and park until it finishes, or run it right here
 /// when there is no worker to protect.
 ///

@@ -1,7 +1,7 @@
 //! process-level builtins: exit, sleep, clocks, reading a stdin line, `exec`,
 //! the shared random number generator, and float formatting.
 
-use crate::ffi_util::with_cstr_str;
+use crate::ffi_util::{with_cstr_bytes, with_cstr_str};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -147,10 +147,19 @@ pub extern "C" fn pith_random_float() -> f64 {
     // step of the sequence, not both advance from the same seed and return the
     // identical "random" value. relaxed ordering is enough: the value itself
     // is the only payload, nothing else is published through it.
-    let prev = RANDOM_SEED
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| Some(lcg_step(s)))
-        .unwrap_or(0); // unreachable: the closure never returns None
-    let new_s = lcg_step(prev);
+    let mut prev = RANDOM_SEED.load(Ordering::Relaxed);
+    let new_s = loop {
+        let next = lcg_step(prev);
+        match RANDOM_SEED.compare_exchange_weak(
+            prev,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break next,
+            Err(actual) => prev = actual,
+        }
+    };
     (new_s >> 11) as f64 / (1u64 << 53) as f64
 }
 
@@ -166,16 +175,20 @@ pub extern "C" fn pith_random_int(min: i64, max: i64) -> i64 {
     if min >= max {
         return min;
     }
-    let range = (max - min + 1) as u64;
-    let r = (pith_random_float() * range as f64) as i64;
-    min + r
+    let span = max.abs_diff(min);
+    let range = span.saturating_add(1);
+    let offset = ((pith_random_float() * range as f64) as u64).min(span);
+    min.wrapping_add(offset as i64)
 }
+
+/// Maximum decimal precision accepted by `pith_fmt_float` / `pith_float_fixed`.
+const MAX_FLOAT_PRECISION: i64 = 1024;
 
 /// Format float with given precision
 /// Returns C string. Caller must free.
 #[no_mangle]
 pub unsafe extern "C" fn pith_fmt_float(n: f64, precision: i64) -> *mut i8 {
-    let precision = precision.max(0) as usize;
+    let precision = precision.clamp(0, MAX_FLOAT_PRECISION) as usize;
     let s = format!("{:.1$}", n, precision);
     crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
@@ -185,7 +198,13 @@ pub unsafe extern "C" fn pith_fmt_float(n: f64, precision: i64) -> *mut i8 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let n = len.max(0) as usize;
+    if len <= 0 {
+        return crate::pith_cstring_empty();
+    }
+    let n = len as usize;
+    if !crate::runtime_core::cstring_len_valid(n) {
+        return crate::pith_cstring_empty();
+    }
 
     // SAFETY: Allocates a non-null cstring buffer of `n` writable bytes plus trailing NUL.
     let ptr = unsafe { crate::pith_alloc_cstring(n) };
@@ -197,6 +216,77 @@ pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
     }
     ptr
 }
+
+/// The `format_time` builtin. It formats a timestamp, given in milliseconds
+/// since the unix epoch, in UTC using a subset of strftime: `%Y` (year),
+/// `%m` `%d` `%H` `%M` `%S` (two digits each), `%F` (`%Y-%m-%d`), `%T`
+/// (`%H:%M:%S`), `%3f` (milliseconds, three digits) and `%%`. Any other
+/// `%` sequence is copied as written.
+///
+/// # Safety
+/// fmt must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_format_time_fmt(timestamp_ms: i64, fmt: *const i8) -> *mut i8 {
+    // SAFETY: `fmt` is null or a valid null-terminated C string for this call.
+    let s = unsafe { with_cstr_bytes(fmt, |bytes| format_time_utc(timestamp_ms, bytes)) }
+        .unwrap_or_default();
+    crate::pith_copy_bytes_to_cstring(s.as_bytes())
+}
+
+/// Converts days since 1970-01-01 to a (year, month, day) civil date in the
+/// proleptic gregorian calendar.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+pub(crate) fn format_time_utc(timestamp_ms: i64, fmt: &[u8]) -> String {
+    let secs = timestamp_ms.div_euclid(1000);
+    let millis = timestamp_ms.rem_euclid(1000);
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let tod = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (tod / 3600, tod / 60 % 60, tod % 60);
+    let mut out = String::with_capacity(fmt.len() + 16);
+    let mut i = 0;
+    while i < fmt.len() {
+        let rest = &fmt[i..];
+        let (text, used) = match rest {
+            [b'%', b'Y', ..] => (format!("{year:04}"), 2),
+            [b'%', b'm', ..] => (format!("{month:02}"), 2),
+            [b'%', b'd', ..] => (format!("{day:02}"), 2),
+            [b'%', b'H', ..] => (format!("{hour:02}"), 2),
+            [b'%', b'M', ..] => (format!("{minute:02}"), 2),
+            [b'%', b'S', ..] => (format!("{second:02}"), 2),
+            [b'%', b'F', ..] => (format!("{year:04}-{month:02}-{day:02}"), 2),
+            [b'%', b'T', ..] => (format!("{hour:02}:{minute:02}:{second:02}"), 2),
+            [b'%', b'3', b'f', ..] => (format!("{millis:03}"), 3),
+            [b'%', b'%', ..] => ("%".to_string(), 2),
+            _ => {
+                // copy plain text up to the next '%' (or one '%' that starts
+                // no known sequence) unchanged, keeping utf-8 intact.
+                let end = rest[1..]
+                    .iter()
+                    .position(|&b| b == b'%')
+                    .map_or(rest.len(), |p| p + 1);
+                out.push_str(&String::from_utf8_lossy(&rest[..end]));
+                i += end;
+                continue;
+            }
+        };
+        out.push_str(&text);
+        i += used;
+    }
+    out
+}
+
 
 #[cfg(test)]
 mod tests {

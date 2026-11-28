@@ -46,7 +46,7 @@ fn park_spot(index: usize) -> &'static Park {
 /// wake worker `index` out of `idle_wait`.
 pub(crate) fn notify(index: usize) {
     let park = park_spot(index);
-    *park.notified.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    *crate::sync::lock(park.notified) = true;
     park.cv.notify_one();
 }
 
@@ -60,7 +60,7 @@ pub(crate) fn poll_ready(_index: usize) -> bool {
 /// ran out without a notify.
 pub(crate) fn idle_wait(index: usize, timeout: Duration) -> bool {
     let park = park_spot(index);
-    let guard = park.notified.lock().unwrap_or_else(|p| p.into_inner());
+    let guard = crate::sync::lock(park.notified);
     let (mut notified, _) = park
         .cv
         .wait_timeout_while(guard, timeout, |n| !*n)

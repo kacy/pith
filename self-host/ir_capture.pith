@@ -52,7 +52,10 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
         for child in node.children:
             cn := get_node(child)
             if cn.kind == "param":
-                inner_bound.push(cn.value)
+                mut pname := cn.value
+                if pname.ends_with(" mut"):
+                    pname = pname.substring(0, pname.len() - 4)
+                inner_bound.push(pname)
         mut updated_free := ir_copy_names(free)
         for child in node.children:
             cn := get_node(child)

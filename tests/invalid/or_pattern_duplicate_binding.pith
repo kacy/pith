@@ -1,0 +1,12 @@
+# duplicate binding in one or-pattern alternative must be rejected so the
+# other alternative cannot introduce an uninitialized binding.
+enum Pair:
+    A(String, String)
+    B(String, String)
+
+fn pick(p: Pair) -> String:
+    match p:
+        Pair.A(x, x) | Pair.B(x, y) => return x + y
+
+fn main():
+    print(pick(Pair.A("a", "b")))

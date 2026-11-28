@@ -1,0 +1,23 @@
+# a generic struct implementing an interface (`impl Work for Box`) with a
+# reassigned counted field must be inspected by interface_implementer_tids.
+interface Work:
+    fn run() -> Int
+
+struct Box[T]:
+    mut item: T
+
+impl Work for Box:
+    fn run() -> Int:
+        return 1
+
+fn use_work(w: Work):
+    print(w.run().to_string())
+
+fn main():
+    b := Box[String]("a")
+    b.item = "b"
+    w: Work := b
+    a := spawn use_work(w)
+    c := spawn use_work(w)
+    await a
+    await c

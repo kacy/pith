@@ -1,0 +1,19 @@
+# An early `!` propagation between reading `s.items[0]` and replacing it
+# means the replacement does not run unconditionally, so E276 must fire.
+struct Store:
+    mu: Mutex
+    guard mu:
+        items: List[Int]
+
+fn may_fail(flag: Bool) -> Int!:
+    if flag:
+        fail "boom"
+    return 1
+
+fn leak(s: Store, flag: Bool) -> List[Int]!:
+    mut out: List[Int] := []
+    locked s.mu:
+        out = s.items
+        may_fail(flag)!
+        s.items = []
+    return out

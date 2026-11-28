@@ -258,6 +258,9 @@ fn analyze_one(uri: String) -> List[String]:
     path := uri_to_path(uri)
     mut bodies: List[String] := []
     analyzed_parse_ok = false
+    analyzed_checked = false
+    analyzed_root = 0 - 1
+    analyzed_import_roots = []
     outcome := run_check_pipeline(path) catch:
         return bodies
     pipeline_done := time.mono_millis()
@@ -478,7 +481,13 @@ pub fn hover_result(uri: String, line0: Int, character: Int) -> Int:
     mut best_col := 0 - 1
     file_range := node_range_for_file(path)
     mut i := file_range.0
-    while i < file_range.1:
+    if i < 0:
+        i = 0
+    mut end := file_range.1
+    total_nodes := node_count()
+    if end > total_nodes:
+        end = total_nodes
+    while i < end:
         node := get_node(i)
         if node.line == pos.line and node.col <= pos.col:
             tid := c_get_expr_type(i)

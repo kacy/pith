@@ -104,6 +104,11 @@ mut generic_drop_walked: Map[Int, Bool] := {}
 # no further: `f[T]` calling `f[List[T]]` would otherwise never stop.
 mut generic_body_spec_counts: Map[Int, Int] := {}
 generic_body_spec_limit := 64
+# nesting depth of active generic struct/enum instantiations so recursive
+# type expansion (`struct Boom[T]: next: Boom[List[T]]?`) reports E267
+# instead of overflowing the compiler/LSP stack.
+mut generic_type_inst_depth := 0
+generic_type_inst_max_depth := 32
 # each generic struct instance's declaration node, so a method walked
 # against the instance reads the type parameters off the declaration the
 # instance was built from — never a same-named declaration in another
@@ -367,6 +372,7 @@ pub fn initialize_checker(file_path: String):
     generic_body_queued = {}
     generic_body_checked = {}
     generic_body_spec_counts = {}
+    generic_type_inst_depth = 0
     generic_drop_decls = {}
     generic_drop_walked = {}
     struct_instance_decl_idx = {}
@@ -2113,6 +2119,9 @@ fn interface_value_accepts(value_idx: Int, actual_tid: Int, expected_tid: Int) -
     return true
 
 # the types with an impl of the interface named `iface_name`, by type id.
+# concrete struct impls resolve directly via `lookup_type_id`; generic struct
+# impls (`impl Work for Box[T]`) register under the base name `"Box"`, so we
+# include every concrete instantiation recorded in `struct_instance_tids`.
 fn interface_implementer_tids(iface_name: String) -> List[Int]:
     mut tids: List[Int] := []
     base := extract_base_type_name(iface_name)
@@ -2123,9 +2132,21 @@ fn interface_implementer_tids(iface_name: String) -> List[Int]:
         named := parts[1]
         if named != base and not named.ends_with("." + base):
             continue
-        tid := lookup_type_id(parts[0])
-        if tid >= 0 and not tids.contains(tid):
-            tids.push(tid)
+        impl_target := parts[0]
+        tid := lookup_type_id(impl_target)
+        if tid >= 0:
+            if not tids.contains(tid):
+                tids.push(tid)
+        else:
+            target_has_dot := impl_target.contains(".")
+            for inst_tid in struct_instance_tids:
+                if struct_instance_base_name.contains_key(inst_tid):
+                    inst_base := struct_instance_base_name[inst_tid]
+                    mut matches := inst_base == impl_target
+                    if not matches and not target_has_dot:
+                        matches = extract_base_type_name(inst_base) == impl_target
+                    if matches and not tids.contains(inst_tid):
+                        tids.push(inst_tid)
     return tids
 
 # whether a type implements an interface named by its bare name. an impl
@@ -8689,11 +8710,19 @@ fn check_or_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
         return
     mut first: List[Int] := []
     collect_pattern_bindings(pat.children[0], first)
+    dup_first := first_duplicate_pattern_binding(first)
+    if dup_first != "":
+        report_error_at(pat.children[0], "E228", "duplicate binding '" + dup_first + "' in or-pattern alternative")
+        return
     for alt, ai in pat.children:
         if ai == 0:
             continue
         mut these: List[Int] := []
         collect_pattern_bindings(alt, these)
+        dup_alt := first_duplicate_pattern_binding(these)
+        if dup_alt != "":
+            report_error_at(alt, "E228", "duplicate binding '" + dup_alt + "' in or-pattern alternative")
+            return
         mut differs := these.len() != first.len()
         for b in first:
             mut matched := false
@@ -8702,9 +8731,26 @@ fn check_or_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
                     matched = true
             if not matched:
                 differs = true
+        for other in these:
+            mut matched := false
+            for b in first:
+                if node_value(other) == node_value(b) and c_pattern_type(other) == c_pattern_type(b):
+                    matched = true
+            if not matched:
+                differs = true
         if differs:
             report_error_at(alt, "E228", "or-pattern alternatives must bind the same names with the same types")
             return
+
+# return the first binding name that appears more than once in `bindings`, or "".
+fn first_duplicate_pattern_binding(bindings: List[Int]) -> String:
+    mut seen: Map[String, Bool] := {}
+    for b in bindings:
+        name := node_value(b)
+        if seen.contains_key(name):
+            return name
+        seen.insert(name, true)
+    return ""
 
 # the binding nodes a pattern introduces, at any depth
 fn collect_pattern_bindings(pat_idx: Int, out: List[Int]):
@@ -9106,7 +9152,8 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
                 ptid := resolve_type_implementation(cn.children[0])
                 params.push(ptid)
                 pname := extract_binding_name(cn.value)
-                define_binding_at(lambda_scope, pname, ptid, false, child)
+                is_mut := cn.value.contains(" mut")
+                define_binding_at(lambda_scope, pname, ptid, is_mut, child)
             else:
                 report_error("E230", "lambda parameter requires a type annotation")
                 params.push(TID_ERR)
@@ -9779,11 +9826,14 @@ fn reassigned_counted_field(tid: Int, seen: Map[Int, Bool]) -> (String, String):
         return none_found
     for fname, i in info.fields:
         fkey := tid.to_string() + "." + fname
-        if struct_field_guards.contains_key(fkey) or struct_field_frozen.contains_key(fkey) or struct_field_weak.contains_key(fkey):
+        if struct_field_guards.contains_key(fkey) or struct_field_frozen.contains_key(fkey):
             continue
         ftid := info.field_types[i]
         key := field_write_key(tid, fname)
-        if struct_field_writes.contains_key(key) and is_counted_type(ftid):
+        # weak fields themselves are protected by the runtime's field lock when
+        # reassigned across tasks, but upgrading a weak field yields its target
+        # struct whose own unguarded counted fields must still be checked.
+        if not struct_field_weak.contains_key(fkey) and struct_field_writes.contains_key(key) and is_counted_type(ftid):
             return (fname, key)
         found := reassigned_counted_field(ftid, seen)
         if found.0 != "":
@@ -9895,6 +9945,10 @@ fn instantiate_generic_struct_type(decl_idx: Int, type_args: List[Int]) -> Int:
     existing := lookup_type_id(inst_name)
     if existing != -1:
         return existing
+    if generic_type_inst_depth >= generic_type_inst_max_depth:
+        report_error_at(decl_idx, "E267", "generic type '" + base_name + "' exceeds maximum instantiation depth (" + generic_type_inst_max_depth.to_string() + "); a generic type that expands recursively never stops")
+        return TID_ERR
+    generic_type_inst_depth = generic_type_inst_depth + 1
     generic_params := collect_generic_parameter_names(decl)
     # register the instance under an empty shell before resolving its fields,
     # so a self-referential field (next: Node[T]?) finds this tid by name
@@ -9935,6 +9989,7 @@ fn instantiate_generic_struct_type(decl_idx: Int, type_args: List[Int]) -> Int:
             else:
                 field_types.push(TID_ERR)
     set_type_info(tid, ti_struct(inst_name, field_names, field_types, field_pub, field_mut))
+    generic_type_inst_depth = generic_type_inst_depth - 1
     return tid
 
 fn instantiate_generic_enum_type(decl_idx: Int, type_args: List[Int]) -> Int:
@@ -9946,6 +10001,10 @@ fn instantiate_generic_enum_type(decl_idx: Int, type_args: List[Int]) -> Int:
     existing := lookup_type_id(inst_name)
     if existing != -1:
         return existing
+    if generic_type_inst_depth >= generic_type_inst_max_depth:
+        report_error_at(decl_idx, "E267", "generic type '" + base_name + "' exceeds maximum instantiation depth (" + generic_type_inst_max_depth.to_string() + "); a generic type that expands recursively never stops")
+        return TID_ERR
+    generic_type_inst_depth = generic_type_inst_depth + 1
     generic_params := collect_generic_parameter_names(decl)
     # same shell-first registration as the struct path: a variant payload can
     # name its own enum (Cons(T, Chain[T]?)), and resolving it before the
@@ -9968,6 +10027,7 @@ fn instantiate_generic_enum_type(decl_idx: Int, type_args: List[Int]) -> Int:
                 vtypes.push(resolve_type_with_substitution_map(vc, generic_params, type_args))
             variant_types.push(vtypes)
     set_type_info(tid, ti_enum(inst_name, variant_names, variant_types))
+    generic_type_inst_depth = generic_type_inst_depth - 1
     return tid
 
 # ---------------------------------------------------------------
@@ -10331,6 +10391,15 @@ fn queue_method_specialization(method_idx: Int, inst_tid: Int):
     entry := "M" + chr(9) + method_idx.to_string() + chr(9) + inst_tid.to_string()
     if generic_body_checked.contains_key(entry) or generic_body_queued.contains_key(entry):
         return
+    mut count := 0
+    if generic_body_spec_counts.contains_key(method_idx):
+        count = generic_body_spec_counts[method_idx]
+    if count >= generic_body_spec_limit:
+        if count == generic_body_spec_limit:
+            report_error_at(method_idx, "E267", "'" + get_node(method_idx).value + "' is instantiated at more than " + generic_body_spec_limit.to_string() + " distinct type sets; a generic that calls itself at a larger type never stops")
+            generic_body_spec_counts.insert(method_idx, count + 1)
+        return
+    generic_body_spec_counts.insert(method_idx, count + 1)
     generic_body_queued.insert(entry, true)
     generic_body_worklist.push(entry)
 
@@ -10602,6 +10671,7 @@ pub struct CheckerSnapshot:
     pub generic_body_queued: Map[String, Bool]
     pub generic_body_checked: Map[String, Bool]
     pub generic_body_spec_counts: Map[Int, Int]
+    pub generic_type_inst_depth: Int
     pub generic_drop_decls: Map[Int, Int]
     pub generic_drop_walked: Map[Int, Bool]
     pub struct_instance_decl_idx: Map[Int, Int]
@@ -10698,6 +10768,7 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         generic_body_queued: copy_map(generic_body_queued),
         generic_body_checked: copy_map(generic_body_checked),
         generic_body_spec_counts: copy_map(generic_body_spec_counts),
+        generic_type_inst_depth: generic_type_inst_depth,
         generic_drop_decls: copy_map(generic_drop_decls),
         generic_drop_walked: copy_map(generic_drop_walked),
         struct_instance_decl_idx: copy_map(struct_instance_decl_idx),
@@ -10794,6 +10865,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     generic_body_queued = copy_map(s.generic_body_queued)
     generic_body_checked = copy_map(s.generic_body_checked)
     generic_body_spec_counts = copy_map(s.generic_body_spec_counts)
+    generic_type_inst_depth = s.generic_type_inst_depth
     generic_drop_decls = copy_map(s.generic_drop_decls)
     generic_drop_walked = copy_map(s.generic_drop_walked)
     struct_instance_decl_idx = copy_map(s.struct_instance_decl_idx)
@@ -11124,11 +11196,18 @@ pub fn block_replaces(block: Int, read_idx: Int) -> Bool:
         return false
     mut remove_base := ""
     mut remove_key := ""
+    mut remove_key_is_ident := false
     node := get_node(read_idx)
     if node.kind == "index" and node.children.len() == 2:
-        remove_base = locked_path_text(node.children[0])
-        remove_key = get_node(node.children[1]).value
-    return block_replaces_after_read(block, path, read_idx, remove_base, remove_key)
+        key_node := get_node(node.children[1])
+        if key_node.kind == "ident":
+            remove_base = locked_path_text(node.children[0])
+            remove_key = key_node.value
+            remove_key_is_ident = true
+        elif key_node.kind == "int_lit" or key_node.kind == "str_lit":
+            remove_base = locked_path_text(node.children[0])
+            remove_key = key_node.kind + ":" + key_node.value
+    return block_replaces_after_read(block, path, read_idx, remove_base, remove_key, remove_key_is_ident)
 
 fn ast_subtree_contains(idx: Int, target: Int) -> Bool:
     if idx == target:
@@ -11140,7 +11219,7 @@ fn ast_subtree_contains(idx: Int, target: Int) -> Bool:
 
 fn stmt_may_exit_early(idx: Int) -> Bool:
     node := get_node(idx)
-    if node.kind == "return" or node.kind == "fail" or node.kind == "break" or node.kind == "continue":
+    if node.kind == "return" or node.kind == "fail" or node.kind == "break" or node.kind == "continue" or node.kind == "try" or node.kind == "try_expr":
         return true
     if node.kind == "lambda":
         return false
@@ -11149,7 +11228,24 @@ fn stmt_may_exit_early(idx: Int) -> Bool:
             return true
     return false
 
-fn stmt_is_remove_call(idx: Int, base: String, key: String) -> Bool:
+fn stmt_mutates_ident(idx: Int, name: String) -> Bool:
+    if name == "":
+        return false
+    node := get_node(idx)
+    if node.kind == "lambda":
+        return false
+    if node.kind == "assignment" and node.children.len() >= 1:
+        lhs := get_node(node.children[0])
+        if lhs.kind == "ident" and lhs.value == name:
+            return true
+    elif node.kind == "assign" and node.value == name:
+        return true
+    for child in node.children:
+        if stmt_mutates_ident(child, name):
+            return true
+    return false
+
+fn stmt_is_remove_call(idx: Int, base: String, key: String, key_is_ident: Bool) -> Bool:
     if base == "":
         return false
     mut cur := idx
@@ -11161,25 +11257,36 @@ fn stmt_is_remove_call(idx: Int, base: String, key: String) -> Bool:
         mut arg := get_node(arg_idx)
         if arg.kind == "arg" and arg.children.len() > 0:
             arg = get_node(arg.children[0])
-        if (arg.kind == "ident" or arg.kind == "int_lit") and arg.value == key:
+        if key_is_ident:
+            if arg.kind == "ident" and arg.value == key:
+                return true
+        elif (arg.kind == "int_lit" or arg.kind == "str_lit") and (arg.kind + ":" + arg.value) == key:
             return true
     return false
 
-fn stmt_replaces_unconditionally(idx: Int, path: String, read_idx: Int, remove_base: String, remove_key: String) -> Bool:
+fn stmt_replaces_unconditionally(idx: Int, path: String, read_idx: Int, remove_base: String, remove_key: String, remove_key_is_ident: Bool) -> Bool:
     node := get_node(idx)
     if node.kind == "assignment" and node.children.len() >= 2 and node.children[1] != read_idx:
         if locked_path_text(node.children[0]) == path and locked_path_text(node.children[1]) != path:
             return true
-    if stmt_is_remove_call(idx, remove_base, remove_key):
+    if stmt_is_remove_call(idx, remove_base, remove_key, remove_key_is_ident):
         return true
     if node.kind == "block" or node.kind == "body" or node.kind == "then" or node.kind == "else":
+        mut cur_base := remove_base
         for child in node.children:
-            if stmt_replaces_unconditionally(child, path, read_idx, remove_base, remove_key):
+            if stmt_replaces_unconditionally(child, path, read_idx, cur_base, remove_key, remove_key_is_ident):
                 return true
             if stmt_may_exit_early(child):
                 return false
+            if cur_base != "" and remove_key_is_ident and stmt_mutates_ident(child, remove_key):
+                cur_base = ""
         return false
     if node.kind == "if_stmt" and node.children.len() >= 3:
+        if stmt_may_exit_early(node.children[0]):
+            return false
+        mut branch_base := remove_base
+        if branch_base != "" and remove_key_is_ident and stmt_mutates_ident(node.children[0], remove_key):
+            branch_base = ""
         last_child := get_node(node.children[node.children.len() - 1])
         if last_child.kind != "else":
             return false
@@ -11187,10 +11294,12 @@ fn stmt_replaces_unconditionally(idx: Int, path: String, read_idx: Int, remove_b
         while ci < node.children.len():
             branch := get_node(node.children[ci])
             if branch.kind == "then" or branch.kind == "else":
-                if not stmt_replaces_unconditionally(node.children[ci], path, read_idx, remove_base, remove_key):
+                if not stmt_replaces_unconditionally(node.children[ci], path, read_idx, branch_base, remove_key, remove_key_is_ident):
                     return false
             elif branch.kind == "elif" and branch.children.len() >= 2:
-                if not stmt_replaces_unconditionally(branch.children[1], path, read_idx, remove_base, remove_key):
+                if stmt_may_exit_early(branch.children[0]):
+                    return false
+                if not stmt_replaces_unconditionally(branch.children[1], path, read_idx, branch_base, remove_key, remove_key_is_ident):
                     return false
             else:
                 return false
@@ -11198,7 +11307,7 @@ fn stmt_replaces_unconditionally(idx: Int, path: String, read_idx: Int, remove_b
         return true
     return false
 
-fn block_replaces_after_read(idx: Int, path: String, read_idx: Int, remove_base: String, remove_key: String) -> Bool:
+fn block_replaces_after_read(idx: Int, path: String, read_idx: Int, remove_base: String, remove_key: String, remove_key_is_ident: Bool) -> Bool:
     node := get_node(idx)
     if node.kind == "block" or node.kind == "body":
         mut found := 0 - 1
@@ -11208,23 +11317,28 @@ fn block_replaces_after_read(idx: Int, path: String, read_idx: Int, remove_base:
                 break
         if found < 0:
             return false
-        if block_replaces_after_read(node.children[found], path, read_idx, remove_base, remove_key):
+        if block_replaces_after_read(node.children[found], path, read_idx, remove_base, remove_key, remove_key_is_ident):
             return true
         if stmt_may_exit_early(node.children[found]):
             return false
+        mut cur_base := remove_base
+        if cur_base != "" and remove_key_is_ident and stmt_mutates_ident(node.children[found], remove_key):
+            cur_base = ""
         mut j := found + 1
         while j < node.children.len():
             stmt := node.children[j]
-            if stmt_replaces_unconditionally(stmt, path, read_idx, remove_base, remove_key):
+            if stmt_replaces_unconditionally(stmt, path, read_idx, cur_base, remove_key, remove_key_is_ident):
                 return true
             if stmt_may_exit_early(stmt):
                 return false
+            if cur_base != "" and remove_key_is_ident and stmt_mutates_ident(stmt, remove_key):
+                cur_base = ""
             j = j + 1
         return false
     if node.kind == "if_stmt" or node.kind == "then" or node.kind == "elif" or node.kind == "else" or node.kind == "if_let" or node.kind == "while_stmt" or node.kind == "while_let" or node.kind == "for_stmt" or node.kind == "locked_stmt" or node.kind == "match_expr" or node.kind == "arm":
         for child in node.children:
             if ast_subtree_contains(child, read_idx):
-                return block_replaces_after_read(child, path, read_idx, remove_base, remove_key)
+                return block_replaces_after_read(child, path, read_idx, remove_base, remove_key, remove_key_is_ident)
     return false
 
 # a guarded read leaving its block whose value holds no collection may still

@@ -1,0 +1,20 @@
+# a weak field targeting a struct with a reassigned counted field must still
+# report E248 when shared with a spawned task.
+struct Target:
+    mut label: String
+
+struct Holder:
+    weak target: Target?
+
+fn read_holder(h: Holder):
+    if let t = h.target:
+        print(t.label)
+
+fn main():
+    t := Target("a")
+    t.label = "b"
+    h := Holder(t)
+    a := spawn read_holder(h)
+    b := spawn read_holder(h)
+    await a
+    await b

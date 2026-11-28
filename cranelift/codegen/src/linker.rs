@@ -141,12 +141,14 @@ pub fn get_runtime_lib_path() -> String {
 /// Rebuild the runtime static library if sources are newer than the .a file.
 /// This ensures `pith run` always links against an up-to-date runtime.
 fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
-    // Find the pith executable to determine the workspace root
+    // Find the pith executable to determine the workspace root; canonicalize so
+    // a symlinked binary still locates its checkout cleanly.
     let exe = std::env::current_exe().map_err(|e| {
         CompileError::ModuleError(format!("Failed to locate current executable: {}", e))
     })?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let Some(workspace_root) = exe
-        .parent() // target/release
+        .parent() // target/release or target/debug
         .and_then(|p| p.parent()) // target
         .and_then(|p| p.parent()) // workspace root
         .map(|p| p.to_path_buf())
@@ -184,8 +186,16 @@ fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
     };
 
     if needs_rebuild {
+        let is_debug = std::path::Path::new(runtime_lib)
+            .components()
+            .any(|c| c.as_os_str() == "debug");
+        let mut args = vec!["build"];
+        if !is_debug {
+            args.push("--release");
+        }
+        args.extend(["-p", "pith-runtime"]);
         let status = Command::new("cargo")
-            .args(["build", "--release", "-p", "pith-runtime"])
+            .args(&args)
             .current_dir(&workspace_root)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

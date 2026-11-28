@@ -389,7 +389,10 @@ fn driver_abi_path(driver: &str) -> String {
 /// Any other executable is left alone.
 fn stamp_if_ir_driver(exe_path: &str) {
     if Path::new(exe_path).file_name().and_then(|n| n.to_str()) == Some("ir_driver") {
-        if let Err(e) = fs::write(driver_abi_path(exe_path), RUNTIME_ABI) {
+        let abi_path = driver_abi_path(exe_path);
+        let tmp_path = format!("{}.{}.tmp", abi_path, std::process::id());
+        if let Err(e) = fs::write(&tmp_path, RUNTIME_ABI).and_then(|_| fs::rename(&tmp_path, &abi_path)) {
+            let _ = fs::remove_file(&tmp_path);
             eprintln!("warning: could not record the runtime ABI of {}: {}", exe_path, e);
         }
     }
@@ -614,8 +617,9 @@ fn get_ir_from_compiler(path: &str, emit_tests: bool) -> Result<String, String> 
 }
 
 fn validate_combined_ir_contract(ir_text: &str) -> Result<(), String> {
-    for (index, line) in ir_text.lines().enumerate() {
+    for (index, raw_line) in ir_text.lines().enumerate() {
         let line_no = index + 1;
+        let line = raw_line.trim();
         if line.starts_with("call ") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 5 {
@@ -793,6 +797,7 @@ fn build_ir_file(ir_path: &str, exe_path: &str) {
 
     eprintln!("Compiled {} functions", func_count);
     write_and_link(&bytes, &format!("{}.o", exe_path), exe_path);
+    stamp_if_ir_driver(exe_path);
 }
 
 fn run_file(path: &str) {
@@ -801,6 +806,48 @@ fn run_file(path: &str) {
 
 fn test_file(path: &str) {
     compile_and_run(path, true);
+}
+
+#[cfg(unix)]
+mod unix_sig {
+    const SIGINT: i32 = 2;
+    const SIG_IGN: usize = 1;
+    const SIG_ERR: usize = usize::MAX;
+
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+
+    pub struct IgnoreSigint(usize);
+
+    impl IgnoreSigint {
+        pub fn enter() -> Self {
+            // Ignore SIGINT in the parent while waiting on the child so Ctrl-C
+            // interrupts the child (which inherited SIG_DFL at spawn) and lets
+            // `compile_and_run` remove its temporary directory before exiting.
+            let prev = unsafe { signal(SIGINT, SIG_IGN) };
+            Self(prev)
+        }
+    }
+
+    impl Drop for IgnoreSigint {
+        fn drop(&mut self) {
+            if self.0 != SIG_ERR {
+                unsafe {
+                    signal(SIGINT, self.0);
+                }
+            }
+        }
+    }
+}
+
+fn run_temp_paths(dir: &Path, source_path: &str) -> (PathBuf, PathBuf) {
+    let stem = Path::new(source_path).file_stem().unwrap_or("main".as_ref());
+    let exe_path = dir.join(stem);
+    // Append `.o` instead of replacing extension so `<name>.o.pith` never
+    // collides with `exe_path == obj_path`.
+    let obj_path = dir.join(format!("{}.o", stem.to_string_lossy()));
+    (exe_path, obj_path)
 }
 
 /// Compile `path` (with its tests when `emit_tests`) to a temporary binary,
@@ -828,9 +875,7 @@ fn compile_and_run(path: &str, emit_tests: bool) {
             let _ = fs::remove_dir_all(&dir);
         }
     };
-    let stem = Path::new(path).file_stem().unwrap_or("main".as_ref());
-    let exe_path = dir.join(stem);
-    let obj_path = exe_path.with_extension("o");
+    let (exe_path, obj_path) = run_temp_paths(&dir, path);
     if let Err(e) = fs::write(&obj_path, &bytes) {
         eprintln!("Error writing object: {}", e);
         clean_up();
@@ -838,7 +883,14 @@ fn compile_and_run(path: &str, emit_tests: bool) {
     }
     match build_executable(&obj_path.to_string_lossy(), &exe_path.to_string_lossy()) {
         Ok(_) => {
-            let status = Command::new(&exe_path).status();
+            let status = match Command::new(&exe_path).spawn() {
+                Ok(mut child) => {
+                    #[cfg(unix)]
+                    let _sig_guard = unix_sig::IgnoreSigint::enter();
+                    child.wait()
+                }
+                Err(e) => Err(e),
+            };
             clean_up();
             match status {
                 Ok(s) => {
@@ -894,9 +946,18 @@ fn delegate_to_frontend(args: &[String]) {
     if let Ok(current_exe) = env::current_exe() {
         if env::var("PITH_IR_DRIVER").is_err() {
             if let Some(root) = checkout_root() {
-                let ir_driver = root.join("self-host").join("ir_driver");
+                let dir = root.join("self-host");
+                let ir_driver = dir.join("ir_driver");
                 if ir_driver.exists() {
-                    command.env("PITH_IR_DRIVER", ir_driver);
+                    let dir_str = dir.to_string_lossy();
+                    let driver_str = ir_driver.to_string_lossy();
+                    if ir_driver_staleness(&dir_str, &driver_str).is_none() {
+                        command.env("PITH_IR_DRIVER", &ir_driver);
+                    } else if seed_runtime_abi(&dir_str).as_deref() == Some(RUNTIME_ABI) {
+                        if let Ok(rebuilt) = bootstrap_ir_driver_from_seed() {
+                            command.env("PITH_IR_DRIVER", rebuilt);
+                        }
+                    }
                 }
             }
         }
@@ -1064,5 +1125,33 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(fs::metadata(&a).unwrap().permissions().mode() & 0o077, 0);
         fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn indented_legacy_call_and_field_are_rejected() {
+        assert!(validate_combined_ir_contract("    call 1 greet 1 0\n").is_err());
+        assert!(validate_combined_ir_contract("\tfield 2 1 Point name\n").is_err());
+        assert!(validate_combined_ir_contract("  call 1 greet string 1 0\n").is_ok());
+    }
+
+    #[test]
+    fn dot_o_pith_source_keeps_distinct_object_and_exe_paths() {
+        let dir = std::path::Path::new("/tmp/pith-run-test");
+        let (exe, obj) = super::run_temp_paths(dir, "sample.o.pith");
+        assert_ne!(exe, obj);
+        assert_eq!(exe, dir.join("sample.o"));
+        assert_eq!(obj, dir.join("sample.o.o"));
+    }
+
+    #[test]
+    fn stamp_if_ir_driver_writes_abi_atomically() {
+        let dir = std::env::temp_dir().join(format!("pith-stamp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let driver = dir.join("ir_driver");
+        fs::write(&driver, "").unwrap();
+        let driver_str = driver.to_str().unwrap();
+        super::stamp_if_ir_driver(driver_str);
+        assert_eq!(fs::read_to_string(driver_abi_path(driver_str)).unwrap(), RUNTIME_ABI);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

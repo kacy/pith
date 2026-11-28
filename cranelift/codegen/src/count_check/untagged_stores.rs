@@ -38,11 +38,19 @@ const TAG_DEPENDENT_STORES: &[(&str, usize, usize)] = &[
     ("map_insert", 0, 2),
     ("map_insert_ikey", 0, 2),
     ("map_insert_bkey", 0, 2),
+    ("pith_map_insert_cstr_owned", 0, 2),
+    ("pith_map_insert_ikey_owned", 0, 2),
+    ("pith_map_insert_bkey_owned", 0, 2),
     ("pith_list_push_value", 0, 1),
+    ("pith_list_push_value_owned", 0, 1),
     ("pith_list_set_value", 0, 2),
+    ("pith_list_set_value_owned", 0, 2),
     ("pith_list_set_value_strict", 0, 2),
+    ("pith_list_set_value_owned_strict", 0, 2),
     ("pith_list_set_value_checked", 0, 2),
+    ("pith_list_set_value_owned_checked", 0, 2),
     ("list_insert", 0, 2),
+    ("pith_list_insert_value_owned", 0, 2),
 ];
 
 /// "function: problem" for each counted value stored into an untagged container
@@ -115,6 +123,21 @@ fn check_function(body: &[Vec<&str>], kinds: &HashMap<&str, &str>) -> Vec<String
             "call" if ins.len() >= 4 => {
                 reg_kind.insert(ins[1], kind_of_text(ins[3]));
             }
+            "calli" if ins.len() >= 4 => {
+                reg_kind.insert(ins[1], kind_of_text(ins[3]));
+            }
+            "rcall" if ins.len() >= 5 => {
+                reg_kind.insert(ins[2], kind_of_text(ins[4]));
+            }
+            "optval" if ins.len() >= 4 => {
+                reg_kind.insert(ins[1], kind_of_text(ins[3]));
+            }
+            "concat" | "concatn" | "appendn" if ins.len() >= 2 => {
+                reg_kind.insert(ins[1], "string");
+            }
+            "closure_ref" if ins.len() >= 2 => {
+                reg_kind.insert(ins[1], "closure");
+            }
             "field" if ins.len() >= 5 => {
                 reg_kind.insert(ins[1], kind_of_text(ins[4]));
             }
@@ -133,74 +156,202 @@ fn check_function(body: &[Vec<&str>], kinds: &HashMap<&str, &str>) -> Vec<String
             .get(base)
             .map(|k| format!("{}:{index}", k.trim_start_matches("struct:")))
     };
-    // registers holding an untagged container, grown to a fixed point: a slot
-    // or field is untagged when every store into it in this function is
-    let mut untagged: HashSet<&str> = HashSet::new();
-    let mut origin: HashMap<&str, String> = HashMap::new();
-    for ins in body {
-        if ins[0] == "call" && ins.len() >= 3 && UNTAGGED_CTORS.contains(&ins[2]) {
-            untagged.insert(ins[1]);
-            origin.insert(ins[1], ins.join(" "));
+    // Build basic blocks so local slot overwrites (`store xs tagged`) kill a
+    // prior untagged store on the same path, while CFG joins use may-analysis
+    // (union: a slot or field is untagged if ANY incoming path can store an
+    // untagged container into it).
+    let mut block_starts: Vec<usize> = vec![0];
+    let mut label_to_pos: HashMap<&str, usize> = HashMap::new();
+    for (i, ins) in body.iter().enumerate() {
+        if ins[0] == "label" && ins.len() >= 2 {
+            label_to_pos.insert(ins[1], i);
+            if i > 0 {
+                block_starts.push(i);
+            }
+        } else if matches!(ins[0], "jmp" | "brif" | "ret" | "ret2") && i + 1 < body.len() {
+            block_starts.push(i + 1);
         }
     }
-    loop {
-        // slot names and "struct:Name:index" share one map: a slot name has
-        // no colon in it
-        let mut stores: HashMap<String, (bool, String)> = HashMap::new();
-        for ins in body {
-            let (target, value) = match ins[0] {
-                "store" if ins.len() >= 3 => (Some(ins[1].to_string()), ins[2]),
-                "sstore" if ins.len() >= 4 => (
-                    ins[2].parse().ok().and_then(|i| field_key(ins[1], i)),
-                    ins[3],
-                ),
-                _ => continue,
-            };
-            let Some(target) = target else { continue };
-            let from = origin.get(value).cloned().unwrap_or_default();
-            let e = stores.entry(target).or_insert((true, from));
-            e.0 &= untagged.contains(value);
+    block_starts.sort_unstable();
+    block_starts.dedup();
+    let pos_to_block: HashMap<usize, usize> = block_starts
+        .iter()
+        .enumerate()
+        .map(|(b, &p)| (p, b))
+        .collect();
+    let label_to_block: HashMap<&str, usize> = label_to_pos
+        .iter()
+        .filter_map(|(&lbl, &pos)| pos_to_block.get(&pos).map(|&b| (lbl, b)))
+        .collect();
+    let nblocks = block_starts.len();
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(nblocks);
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
+    for b in 0..nblocks {
+        let start = block_starts[b];
+        let end = block_starts.get(b + 1).copied().unwrap_or(body.len());
+        ranges.push((start, end));
+        if start < end {
+            let last = &body[end - 1];
+            match last[0] {
+                "jmp" if last.len() >= 2 => {
+                    if let Some(&t) = label_to_block.get(last[1]) {
+                        succs[b].push(t);
+                    }
+                }
+                "brif" if last.len() >= 4 => {
+                    if let Some(&t1) = label_to_block.get(last[2]) {
+                        succs[b].push(t1);
+                    }
+                    if let Some(&t2) = label_to_block.get(last[3]) {
+                        if !succs[b].contains(&t2) {
+                            succs[b].push(t2);
+                        }
+                    }
+                }
+                "ret" | "ret2" => {}
+                _ => {
+                    if b + 1 < nblocks {
+                        succs[b].push(b + 1);
+                    }
+                }
+            }
+        } else if b + 1 < nblocks {
+            succs[b].push(b + 1);
         }
-        let mut grew = false;
-        for ins in body {
-            let from = match ins[0] {
-                "load" if ins.len() >= 3 => stores.get(ins[2]),
-                "field" if ins.len() >= 5 => ins[3]
+    }
+
+    #[derive(Clone, Default)]
+    struct FlowState {
+        // register -> origin instruction string when it may hold an untagged container
+        regs: HashMap<String, String>,
+        // slot name or "StructName:index" -> origin instruction string
+        slots: HashMap<String, String>,
+    }
+
+    let transfer = |ins: &[&str], st: &mut FlowState| {
+        match ins[0] {
+            "call" if ins.len() >= 3 && UNTAGGED_CTORS.contains(&ins[2]) => {
+                st.regs.insert(ins[1].to_string(), ins.join(" "));
+            }
+            "load" if ins.len() >= 3 => {
+                if let Some(from) = st.slots.get(ins[2]).cloned() {
+                    st.regs.insert(ins[1].to_string(), from);
+                } else {
+                    st.regs.remove(ins[1]);
+                }
+            }
+            "field" if ins.len() >= 5 => {
+                let from = ins[3]
                     .parse::<i64>()
                     .ok()
                     .and_then(|b| field_key(ins[2], b / 8))
-                    .and_then(|k| stores.get(&k)),
-                _ => None,
-            };
-            if let Some((true, from)) = from {
-                if untagged.insert(ins[1]) {
-                    origin.insert(ins[1], from.clone());
-                    grew = true;
+                    .and_then(|k| st.slots.get(&k))
+                    .cloned();
+                if let Some(from) = from {
+                    st.regs.insert(ins[1].to_string(), from);
+                } else {
+                    st.regs.remove(ins[1]);
                 }
             }
+            "store" if ins.len() >= 3 => {
+                if let Some(from) = st.regs.get(ins[2]).cloned() {
+                    st.slots.insert(ins[1].to_string(), from);
+                } else {
+                    // overwriting a local slot with a tagged/other value kills
+                    // the previous untagged container on this path
+                    st.slots.remove(ins[1]);
+                }
+            }
+            "sstore" if ins.len() >= 4 => {
+                if let Some(target) = ins[2].parse().ok().and_then(|i| field_key(ins[1], i)) {
+                    if let Some(from) = st.regs.get(ins[3]).cloned() {
+                        st.slots.insert(target, from);
+                    }
+                    // struct fields are keyed by type+index (multiple instances may
+                    // coexist), so keep weak-update semantics on tagged sstore
+                }
+            }
+            // Any other instruction that defines a register clears untagged status
+            "call" | "calli" | "optval" | "concat" | "concatn" | "appendn" | "closure_ref"
+            | "iconst" | "fconst" | "strref" | "funcref" | "tuple_stack" | "closure_stack"
+            | "optflag"
+                if ins.len() >= 2 =>
+            {
+                st.regs.remove(ins[1]);
+            }
+            "rcall" if ins.len() >= 3 => {
+                st.regs.remove(ins[1]);
+                st.regs.remove(ins[2]);
+            }
+            _ => {}
         }
-        if !grew {
-            break;
+    };
+
+    let mut in_states: Vec<Option<FlowState>> = vec![None; nblocks];
+    let mut worklist: Vec<usize> = Vec::new();
+    if nblocks > 0 {
+        in_states[0] = Some(FlowState::default());
+        worklist.push(0);
+    }
+    while let Some(b) = worklist.pop() {
+        let mut st = in_states[b].clone().unwrap_or_default();
+        let (start, end) = ranges[b];
+        for ins in &body[start..end] {
+            transfer(ins, &mut st);
+        }
+        for &s in &succs[b] {
+            let changed = match &mut in_states[s] {
+                None => {
+                    in_states[s] = Some(st.clone());
+                    true
+                }
+                Some(dst) => {
+                    let mut grew = false;
+                    for (k, v) in &st.regs {
+                        if !dst.regs.contains_key(k) {
+                            dst.regs.insert(k.clone(), v.clone());
+                            grew = true;
+                        }
+                    }
+                    for (k, v) in &st.slots {
+                        if !dst.slots.contains_key(k) {
+                            dst.slots.insert(k.clone(), v.clone());
+                            grew = true;
+                        }
+                    }
+                    grew
+                }
+            };
+            if changed && !worklist.contains(&s) {
+                worklist.push(s);
+            }
         }
     }
+
     let mut problems = Vec::new();
-    for ins in body {
-        if ins[0] != "call" || ins.len() < 5 {
-            continue;
-        }
-        let Some(&(_, c, v)) = TAG_DEPENDENT_STORES.iter().find(|(n, _, _)| *n == ins[2]) else {
+    for b in 0..nblocks {
+        let Some(mut st) = in_states[b].clone() else {
             continue;
         };
-        let (Some(container), Some(value)) = (ins.get(5 + c), ins.get(5 + v)) else {
-            continue;
-        };
-        let value_kind = reg_kind.get(value).copied().unwrap_or("unknown");
-        if untagged.contains(container) && is_counted(value_kind) {
-            problems.push(format!(
-                "`{}` stores a borrowed {value_kind} into a container built untagged by `{}`, which takes no count of it",
-                ins.join(" "),
-                origin.get(container).map(String::as_str).unwrap_or("?")
-            ));
+        let (start, end) = ranges[b];
+        for ins in &body[start..end] {
+            if ins[0] == "call" && ins.len() >= 5 {
+                if let Some(&(_, c, v)) = TAG_DEPENDENT_STORES.iter().find(|(n, _, _)| *n == ins[2])
+                {
+                    if let (Some(container), Some(value)) = (ins.get(5 + c), ins.get(5 + v)) {
+                        let value_kind = reg_kind.get(value).copied().unwrap_or("unknown");
+                        if let Some(from) = st.regs.get(*container) {
+                            if is_counted(value_kind) {
+                                problems.push(format!(
+                                    "`{}` stores a borrowed {value_kind} into a container built untagged by `{from}`, which takes no count of it",
+                                    ins.join(" "),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            transfer(ins, &mut st);
         }
     }
     problems
@@ -332,5 +483,56 @@ mod tests {
             endfunc
         ";
         assert!(check(ir).is_empty());
+    }
+
+    #[test]
+    fn a_branch_holding_an_untagged_list_on_one_path_is_reported() {
+        let ir = "
+            func f 2 void
+            param cond
+            param s
+            mark kind s string
+            load 1 cond
+            brif 1 L1 L2
+            label L1
+            call 2 pith_list_new_default list 0
+            store xs 2
+            jmp L3
+            label L2
+            call 3 pith_list_new_cstr list 0
+            store xs 3
+            jmp L3
+            label L3
+            load 4 xs
+            load 5 s
+            call 6 pith_list_push_value_owned void 2 4 5
+            ret
+            endfunc
+        ";
+        let problems = check(ir);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("pith_list_push_value_owned"), "{problems:?}");
+        assert!(problems[0].contains("pith_list_new_default"), "{problems:?}");
+    }
+
+    #[test]
+    fn concat_rcall_and_closure_kinds_stored_into_untagged_containers_are_reported() {
+        let ir = "
+            func f 1 void
+            param s
+            mark kind s string
+            call 1 pith_list_new_default list 0
+            load 2 s
+            concat 3 2 2
+            call 4 pith_list_push_value void 2 1 3
+            rcall 5 6 make_str string 0
+            call 7 pith_list_set_value_owned void 3 1 5 6
+            closure_ref 8 f
+            call 9 list_insert void 3 1 5 8
+            ret
+            endfunc
+        ";
+        let problems = check(ir);
+        assert_eq!(problems.len(), 3, "{problems:?}");
     }
 }

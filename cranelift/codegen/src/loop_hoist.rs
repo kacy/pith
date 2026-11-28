@@ -66,7 +66,7 @@ pub(crate) fn hoist_list_headers(func: &mut Function, keep_calls: &[u32]) {
         let Some(at) = func.layout.last_inst(entry) else {
             continue;
         };
-        let copies = loop_copies(func, &blocks);
+        let copies = loop_copies(func, &cfg, &blocks);
         let mut hoist = Hoist {
             func: &mut *func,
             loops: &loops,
@@ -93,7 +93,11 @@ pub(crate) fn hoist_list_headers(func: &mut Function, keep_calls: &[u32]) {
 /// list an outer loop reassigns. Only the instructions the pass moves are
 /// rewritten: rewriting every use stretches live ranges in loops it cannot
 /// help, and costs registers there.
-fn loop_copies(func: &Function, blocks: &[Block]) -> HashMap<Value, Value> {
+fn loop_copies(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    blocks: &[Block],
+) -> HashMap<Value, Value> {
     #[derive(Clone, Copy, PartialEq)]
     enum Seen {
         One(Value),
@@ -105,22 +109,28 @@ fn loop_copies(func: &Function, blocks: &[Block]) -> HashMap<Value, Value> {
         .flat_map(|&b| func.dfg.block_params(b).iter().copied())
         .collect();
 
-    // every edge into a block of the loop, as (parameter, argument) pairs
+    // every edge into a block of the loop, as (parameter, argument) pairs.
+    // Walk only predecessor instructions of loop blocks rather than every
+    // block in the function.
     let mut edges: Vec<(Value, Option<Value>)> = Vec::new();
-    for block in func.layout.blocks() {
-        let Some(inst) = func.layout.last_inst(block) else {
-            continue;
-        };
-        let dests = func.dfg.insts[inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
-        for dest in dests {
-            let target = dest.block(&func.dfg.value_lists);
-            if !in_loop.contains(&target) {
+    let mut visited_preds: HashSet<Inst> = HashSet::new();
+    for &loop_block in blocks {
+        for pred in cfg.pred_iter(loop_block) {
+            if !visited_preds.insert(pred.inst) {
                 continue;
             }
-            let formals = func.dfg.block_params(target);
-            for (formal, arg) in formals.iter().zip(dest.args(&func.dfg.value_lists)) {
-                let arg = arg.as_value().map(|v| func.dfg.resolve_aliases(v));
-                edges.push((*formal, arg));
+            let dests = func.dfg.insts[pred.inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            for dest in dests {
+                let target = dest.block(&func.dfg.value_lists);
+                if !in_loop.contains(&target) {
+                    continue;
+                }
+                let formals = func.dfg.block_params(target);
+                for (formal, arg) in formals.iter().zip(dest.args(&func.dfg.value_lists)) {
+                    let arg = arg.as_value().map(|v| func.dfg.resolve_aliases(v));
+                    edges.push((*formal, arg));
+                }
             }
         }
     }
@@ -275,5 +285,110 @@ impl Hoist<'_> {
             Some(inst) if is_pure(self.func, inst) => self.try_inst(inst),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift::codegen::ir::instructions::BlockArg;
+    use cranelift::prelude::*;
+
+    fn build_loop_fn(include_disallowed_call: bool, keep_call_index: Option<u32>) -> (Function, Block, Block) {
+        let mut func = Function::new();
+        func.signature.params.push(AbiParam::new(types::I64));
+        func.signature.params.push(AbiParam::new(types::I64));
+        func.signature.returns.push(AbiParam::new(types::I64));
+
+        let callee_sig = func.import_signature(Signature::new(cranelift::codegen::isa::CallConv::SystemV));
+        let ext = keep_call_index.map(|idx| {
+            let uref = func.declare_imported_user_function(UserExternalName::new(0, idx));
+            func.import_function(cranelift::codegen::ir::ExtFuncData {
+                name: ExternalName::User(uref),
+                signature: callee_sig,
+                colocated: false,
+                patchable: false,
+            })
+        });
+
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+
+        let entry = builder.create_block();
+        let header = builder.create_block();
+        let exit = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.append_block_param(header, types::I64); // invariant list handle
+        builder.append_block_param(header, types::I64); // loop counter
+
+        builder.switch_to_block(entry);
+        let list_in = builder.block_params(entry)[0];
+        let n_in = builder.block_params(entry)[1];
+        builder
+            .ins()
+            .jump(header, &[BlockArg::Value(list_in), BlockArg::Value(n_in)]);
+
+        builder.switch_to_block(header);
+        let list_phi = builder.block_params(header)[0];
+        let count_phi = builder.block_params(header)[1];
+        // Header load marked with HEADER_FLAGS reading from the invariant phi
+        let _len = builder.ins().load(types::I64, HEADER_FLAGS, list_phi, 16);
+        if include_disallowed_call {
+            if let Some(fref) = ext {
+                builder.ins().call(fref, &[]);
+            }
+        }
+        let next = builder.ins().iadd_imm(count_phi, -1);
+        let cond = builder.ins().icmp_imm(IntCC::SignedGreaterThan, next, 0);
+        builder.ins().brif(
+            cond,
+            header,
+            &[BlockArg::Value(list_phi), BlockArg::Value(next)],
+            exit,
+            &[],
+        );
+
+        builder.switch_to_block(exit);
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.ins().return_(&[zero]);
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        (func, entry, header)
+    }
+
+    fn count_header_loads(func: &Function, block: Block) -> usize {
+        func.layout
+            .block_insts(block)
+            .filter(|&inst| is_header_read(func, inst))
+            .count()
+    }
+
+    #[test]
+    fn hoists_header_load_of_invariant_phi_to_preheader() {
+        let (mut func, entry, header) = build_loop_fn(false, None);
+        assert_eq!(count_header_loads(&func, entry), 0);
+        assert_eq!(count_header_loads(&func, header), 1);
+
+        hoist_list_headers(&mut func, &[]);
+
+        assert_eq!(count_header_loads(&func, entry), 1);
+        assert_eq!(count_header_loads(&func, header), 0);
+    }
+
+    #[test]
+    fn refuses_hoist_when_loop_calls_unlisted_function() {
+        let (mut func, entry, header) = build_loop_fn(true, Some(42));
+        hoist_list_headers(&mut func, &[7]);
+        assert_eq!(count_header_loads(&func, entry), 0);
+        assert_eq!(count_header_loads(&func, header), 1);
+    }
+
+    #[test]
+    fn allows_hoist_when_loop_calls_only_keep_calls() {
+        let (mut func, entry, header) = build_loop_fn(true, Some(42));
+        hoist_list_headers(&mut func, &[42]);
+        assert_eq!(count_header_loads(&func, entry), 1);
+        assert_eq!(count_header_loads(&func, header), 0);
     }
 }

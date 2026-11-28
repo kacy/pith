@@ -19,6 +19,7 @@ fn generate_runtime_table() -> Result<(), String> {
 
     let mut table = String::from("const ABI_RUNTIME_FUNCTIONS: &[RuntimeDecl] = &[\n");
     let mut param_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut symbol_sigs: BTreeMap<&str, (Vec<&str>, Vec<&str>)> = BTreeMap::new();
     // FNV-1a over the entry lines, comments and blank lines left out. the
     // bootstrap seed and a built ir_driver carry it, so the cli can tell
     // when they were made against another table.
@@ -50,7 +51,18 @@ fn generate_runtime_table() -> Result<(), String> {
                 "a runtime function returns nothing, one value, or the pair I64,I64",
             ));
         }
-        param_counts.insert(key, params.len());
+        if param_counts.insert(key, params.len()).is_some() {
+            return Err(at(&format!("duplicate runtime key '{key}'")));
+        }
+        if let Some((prev_params, prev_returns)) = symbol_sigs.get(symbol) {
+            if prev_params != &params || prev_returns != &returns {
+                return Err(at(&format!(
+                    "alias key '{key}' for symbol '{symbol}' disagrees with earlier signature"
+                )));
+            }
+        } else {
+            symbol_sigs.insert(symbol, (params.clone(), returns.clone()));
+        }
         table.push_str(&format!(
             "    RuntimeDecl {{ key: \"{key}\", symbol: \"{symbol}\", params: {}, returns: {} }},\n",
             format_type_slice(&params),
@@ -82,8 +94,10 @@ fn generate_ownership_table(
     println!("cargo:rerun-if-changed={}", path.display());
     let contents = fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
 
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut table = String::from("const RUNTIME_OWNERSHIP: &[RuntimeOwnership] = &[\n");
+    // Collect rows in a BTreeMap keyed by `key` so the generated table is
+    // strictly sorted and `runtime_ownership::runtime_ownership` can use
+    // binary search.
+    let mut rows: BTreeMap<&str, String> = BTreeMap::new();
     for (line_no, raw_line) in contents.lines().enumerate() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -100,7 +114,7 @@ fn generate_ownership_table(
         let Some(&expected) = param_counts.get(key) else {
             return Err(at(format!("'{key}' is not a key in runtime_functions.txt")));
         };
-        if !seen.insert(key.to_string()) {
+        if rows.contains_key(key) {
             return Err(at(format!("'{key}' has more than one row")));
         }
         let params_text = parts[1].trim();
@@ -129,16 +143,23 @@ fn generate_ownership_table(
             });
         }
         let result = parse_result_token(parts[2].trim(), params.len()).map_err(at)?;
-        table.push_str(&format!(
-            "    RuntimeOwnership {{ key: \"{key}\", args: &[{}], result: {result} }},\n",
-            arg_items.join(", ")
-        ));
+        rows.insert(
+            key,
+            format!(
+                "    RuntimeOwnership {{ key: \"{key}\", args: &[{}], result: {result} }},\n",
+                arg_items.join(", ")
+            ),
+        );
+    }
+    let mut table = String::from("const RUNTIME_OWNERSHIP: &[RuntimeOwnership] = &[\n");
+    for row in rows.values() {
+        table.push_str(row);
     }
     table.push_str("];\n");
     let missing: Vec<&str> = param_counts
         .keys()
         .copied()
-        .filter(|k| !seen.contains(*k))
+        .filter(|k| !rows.contains_key(*k))
         .collect();
     if !missing.is_empty() {
         return Err(format!(

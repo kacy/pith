@@ -29,8 +29,10 @@ use std::collections::{HashMap, HashSet};
 /// Runtime calls whose result is a length or a count, never below zero.
 pub(crate) const LENGTH_CALLS: &[&str] = &[
     "pith_cstring_len",
+    "string_len",
     "pith_list_len",
     "pith_auto_len",
+    "bytes_len",
     "pith_bytes_len",
 ];
 
@@ -122,14 +124,17 @@ pub(crate) fn nonneg_vars(
         .filter(|name| !param_names.iter().any(|p| p == name) && !is_global(name))
         .map(str::to_string)
         .collect();
+    let mut memo: HashMap<usize, bool> = HashMap::new();
+    let mut visiting: HashSet<usize> = HashSet::new();
     loop {
-        let mut memo: HashMap<usize, bool> = HashMap::new();
+        memo.clear();
         let dropped: Vec<&str> = stores
             .iter()
             .filter(|(name, reg)| {
                 vars.contains(*name)
                     && !reg.is_some_and(|r| {
-                        reg_nonneg(r, &defs, &vars, &mut memo, &mut HashSet::new())
+                        visiting.clear();
+                        reg_nonneg(r, &defs, &vars, &mut memo, &mut visiting)
                     })
             })
             .map(|(name, _)| *name)
@@ -331,5 +336,18 @@ mod tests {
         assert_eq!(vars(body, &[]), ["a", "b"]);
         let poisoned = format!("{body}\niconst 8 -1\nstore b 8");
         assert!(vars(&poisoned, &[]).is_empty());
+    }
+
+    /// `bytes_len` and `string_len` are the short runtime keys emitted for
+    /// `Bytes.len()` and `String.len()` and must be recognized as non-negative
+    #[test]
+    fn short_bytes_and_string_len_keys_are_nonneg() {
+        let body = "
+            call 1 bytes_len int 1 0
+            store blen 1
+            call 2 string_len int 1 0
+            store slen 2
+        ";
+        assert_eq!(vars(body, &[]), ["blen", "slen"]);
     }
 }

@@ -299,10 +299,14 @@ fn os_thread_spawn_with(run: impl FnOnce() -> i64 + Send + 'static) -> i64 {
     // thread-local owner installed by `adopt_mutator_slot` marks the slot
     // exited as the thread returns.
     let cycle_slot = crate::cycle::mutator_slot_for_spawn();
-    let join_handle = std::thread::spawn(move || {
+    let cycle_slot_on_err = cycle_slot.clone();
+    let spawned = std::thread::Builder::new().spawn(move || {
         crate::cycle::adopt_mutator_slot(cycle_slot);
         crate::stack_guard::enter_thread();
-        let result = run();
+        // Contain Rust panics so TLS cleanup, completion publication, and slab
+        // reclamation always run and `os_thread_await` can never deadlock on
+        // `!state.done`.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or(0);
         crate::runtime_core::release_thread_tls();
         // publish completion to awaiters (condvar).
         {
@@ -322,6 +326,17 @@ fn os_thread_spawn_with(run: impl FnOnce() -> i64 + Send + 'static) -> i64 {
             handle_registry::unregister_id(handle, HandleKind::Task);
         }
     });
+
+    let join_handle = match spawned {
+        Ok(handle) => handle,
+        Err(_) => {
+            crate::cycle::abandon_mutator_slot(cycle_slot_on_err);
+            if lock_tasks().reclaim(index, generation) {
+                handle_registry::unregister_id(task_handle, HandleKind::Task);
+            }
+            return 0;
+        }
+    };
 
     // store the JoinHandle. the thread may already have finished and marked its
     // slot `finished`, but it can never have *reclaimed* it yet (reclaim needs
@@ -343,7 +358,14 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
         return 0;
     }
     // SAFETY: Caller guarantees `closure_handle` is a valid closure handle transferred to this task.
-    os_thread_spawn_with(move || unsafe { run_task_closure(closure_handle) })
+    let task_handle = os_thread_spawn_with(move || unsafe { run_task_closure(closure_handle) });
+    if task_handle == 0 {
+        // Spawn failed before the child thread ever started; release the
+        // closure reference that was transferred to the task.
+        // SAFETY: `closure_handle` was transferred to this spawn call.
+        unsafe { crate::pith_closure_release(closure_handle) };
+    }
+    task_handle
 }
 
 /// Codegen-facing await entrypoint. Routes through the scheduler seam, the
@@ -615,5 +637,22 @@ mod tests {
             assert_eq!(os_thread_is_done(bogus), 0);
             os_thread_detach(bogus); // must not panic
         }
+    }
+
+    #[test]
+    fn os_thread_await_unblocks_when_task_panics() {
+        let task = os_thread_spawn_with(|| panic!("intentional test panic"));
+        assert_ne!(task, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            let res = os_thread_await(task);
+            let _ = tx.send(res);
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).ok(),
+            Some(0),
+            "os_thread_await must unblock and return 0 if the task panics"
+        );
+        joiner.join().unwrap();
     }
 }

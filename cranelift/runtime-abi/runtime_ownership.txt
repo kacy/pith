@@ -35,7 +35,7 @@ pith_set_retain_handle|b|-|set.rs:367|retain: adds one count to arg 0 (no-op whe
 pith_set_release_handle|c|-|set.rs:378|release: drops one count via pith_set_release (set.rs:341); sets hold no counted elements
 pith_display_map|b,-,-|own|-|fresh cstring from pith_copy_bytes_to_cstring (map.rs:1863); map and its values only read
 pith_cstring_release|c|-|runtime_core.rs:289|release: drops one count, frees on last; no-op for literals and null
-pith_print|b|-|runtime_core.rs:1088|reads only. Rust signature takes PithString by value (ptr,len,is_heap: 24 bytes, passed in memory under SysV), not one I64; ABI line says I64
+pith_print|b|-|runtime_core.rs:1276|reads only; delegates to pith_print_cstr
 int_to_string|-|own|-|fresh
 uint_to_string|-|own|-|fresh
 float_to_string|-|own|-|fresh
@@ -149,7 +149,7 @@ pith_list_last_opt|b|own|runtime_core.rs:3770|fresh optional box or 0; payload n
 pith_list_first_opt_pair|b|pair:borrow:0|runtime_core.rs:3780|(1, stored element) or (0,0); element not retained
 pith_list_last_opt_pair|b|pair:borrow:0|runtime_core.rs:3780|(1, stored element) or (0,0); element not retained
 pith_list_len|b|-|-|
-pith_list_pop|b|-|list.rs:1062|UNSURE: ABI mismatch. Key says (I64)->I64 but the Rust symbol is (list: *mut PithList, elem_size: i64, out: *mut u8) -> bool. The popped element is written to *out with the list's count transferred to the caller (list.rs:1081-1083), so the out value is owned, but with one argument the out/elem_size registers are garbage
+pith_list_pop|b|own|list.rs:1404|pops and returns the last element with the list's count transferred to the caller; 0 when empty or invalid
 pith_auto_len|b|-|-|reads list length or cstring length
 pith_map_len|b|-|-|
 pith_string_contains|b,b|-|string.rs:239|reads only. Rust takes *const PithString (pointers to {ptr,len,is_heap} structs), not cstrings

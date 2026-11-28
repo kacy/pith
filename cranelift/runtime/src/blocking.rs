@@ -67,12 +67,14 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let Some(task) = offload_target() else {
+        let _native = crate::cycle::native_bracket();
         return work();
     };
     if !pool.ensure_worker() {
         // the OS refused us a thread and the pool has none at all. blocking the
         // worker is worse than not blocking it, but far better than parking a
         // task on a result that will never come.
+        let _native = crate::cycle::native_bracket();
         return work();
     }
 

@@ -547,17 +547,26 @@ fn method_name_of(key: String) -> String:
 # expression cache and offer its fields and methods; with no resolvable
 # type, offer every known method name.
 fn member_entries(path: String, line1: Int, line_text: String, dot_off: Int) -> List[String]:
-    mut recv_start := dot_off
+    mut safe_dot := dot_off
+    if safe_dot > line_text.len():
+        safe_dot = line_text.len()
+    mut recv_start := safe_dot
     while recv_start > 0 and is_receiver_byte(ord(line_text[recv_start - 1])):
         recv_start = recv_start - 1
     mut best := 0 - 1
     mut best_col := 0 - 1
-    if recv_start < dot_off:
+    if recv_start < safe_dot and analysis_is_checked():
         file_range := node_range_for_file(path)
         mut i := file_range.0
-        while i < file_range.1:
+        if i < 0:
+            i = 0
+        mut end := file_range.1
+        total_nodes := node_count()
+        if end > total_nodes:
+            end = total_nodes
+        while i < end:
             node := get_node(i)
-            if node.line == line1 and node.col > recv_start and node.col <= dot_off:
+            if node.line == line1 and node.col > recv_start and node.col <= safe_dot:
                 tid := c_get_expr_type(i)
                 if tid >= 0 and tid != TID_ERR:
                     # the node starting latest inside the receiver span

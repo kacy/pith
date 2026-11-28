@@ -1,0 +1,8 @@
+# recursive generic type expansion (`Boom[T]` containing `Boom[List[T]]?`)
+# must hit the depth cap and report E267 rather than overflowing the stack.
+struct Boom[T]:
+    next: Boom[List[T]]?
+
+fn main():
+    b := Boom[Int](none)
+    print((b.next == none).to_string())

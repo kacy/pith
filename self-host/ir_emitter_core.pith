@@ -460,6 +460,10 @@ mut ir_defer_is_err: List[Int] := []
 mut ir_defer_loop_slots: List[Map[String, String]] := []
 mut ir_defer_scope_starts: List[Int] := []
 mut ir_defer_loop_base_stack: List[Int] := []
+# upper bound on active defer indices while emitting a defer body itself, so an
+# early exit (`!`, `fail`, index-miss) inside defer `i` only emits outer defers
+# `< i` instead of recursing infinitely into defer `i`. `-1` means no cap.
+mut ir_defer_emit_limit := 0 - 1
 # open owned loop iterables (a split result, a keys() list). a `for` loop
 # releases its iterable at the loop's normal end label, but an early exit
 # (`return`, `fail`, `!`) leaves the function without reaching that label, so
@@ -1740,10 +1744,16 @@ fn ir_defer_emit_entry(i: Int):
 # (is_error_exit false) the errdefer entries are filtered out; at an error exit
 # every entry runs.
 fn ir_defer_emit_through(stop: Int, is_error_exit: Bool):
-    mut i := ir_defer_nodes.len() - 1
+    mut limit := ir_defer_nodes.len()
+    if ir_defer_emit_limit >= 0 and ir_defer_emit_limit < limit:
+        limit = ir_defer_emit_limit
+    mut i := limit - 1
     while i >= stop:
         if is_error_exit or ir_defer_is_err[i] == 0:
+            saved_limit := ir_defer_emit_limit
+            ir_defer_emit_limit = i
             ir_defer_emit_entry(i)
+            ir_defer_emit_limit = saved_limit
         i = i - 1
 
 # release every still-open loop's owned iterable at a function exit edge. the
@@ -1778,10 +1788,16 @@ fn ir_defer_pop_scope_emit():
     start := ir_defer_scope_starts[ir_defer_scope_starts.len() - 1]
     ir_defer_scope_starts.remove(ir_defer_scope_starts.len() - 1)
     if not ir_last_was_ret:
-        mut i := ir_defer_nodes.len() - 1
+        mut limit := ir_defer_nodes.len()
+        if ir_defer_emit_limit >= 0 and ir_defer_emit_limit < limit:
+            limit = ir_defer_emit_limit
+        mut i := limit - 1
         while i >= start:
             if ir_defer_is_err[i] == 0:
+                saved_limit := ir_defer_emit_limit
+                ir_defer_emit_limit = i
                 ir_defer_emit_entry(i)
+                ir_defer_emit_limit = saved_limit
             i = i - 1
     while ir_defer_nodes.len() > start:
         ir_defer_nodes.remove(ir_defer_nodes.len() - 1)
@@ -3828,7 +3844,7 @@ fn ir_lambda_reads_uncounted(lambda_idx: Int) -> Bool:
 
 fn ir_subtree_reads_uncounted(idx: Int, params: List[String]) -> Bool:
     node := get_node(idx)
-    if node.kind == "lambda":
+    if node.kind == "lambda" or node.kind == "self":
         return false
     if node.kind == "ident" and not params.contains(node.value):
         tid := c_get_expr_type(idx)
@@ -3836,8 +3852,14 @@ fn ir_subtree_reads_uncounted(idx: Int, params: List[String]) -> Bool:
             return false
     mut i := 0
     while i < node.children.len():
-        # a call's callee is a function, not a value the closure holds
-        if not (node.kind == "call" and i == 0 and node_kind(node.children[0]) == "ident"):
+        # skip only free-function callees; a local or param callee is a captured
+        # closure variable and must be checked like any other captured ident.
+        mut skip_callee := false
+        if node.kind == "call" and i == 0 and node_kind(node.children[0]) == "ident":
+            cname := node_value(node.children[0])
+            if not params.contains(cname) and not ir_var_regs.contains_key(cname) and not ir_name_is_func_local(cname):
+                skip_callee = true
+        if not skip_callee:
             if not ir_subtree_reads_uncounted(node.children[i], params):
                 return false
         i = i + 1
@@ -9963,7 +9985,10 @@ fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
         child := node_child(idx, i)
         cn := get_node(child)
         if cn.kind == "param":
-            params.push(cn.value)
+            mut pname := cn.value
+            if pname.ends_with(" mut"):
+                pname = pname.substring(0, pname.len() - 4)
+            params.push(pname)
             param_types.push(ir_extract_param_type(child))
         elif cn.kind == "body" or cn.kind == "block":
             body_idx = child
@@ -10003,7 +10028,7 @@ fn ir_emit_lambda_params(params: List[String], param_types: List[String]):
             ptype = param_types[i]
         if ptype.len() > 0 and ptype != "unknown":
             ir_var_types.insert(bare, ptype)
-        ir_emit("param " + param + ir_param_kind_suffix(ptype))
+        ir_emit("param " + bare + ir_param_kind_suffix(ptype))
 
 # a lambda's returned value transfers to the caller, like any function
 # return: a borrowed value (a field read, a parameter, a captured name) takes
@@ -10231,14 +10256,16 @@ struct SavedDefers:
     loop_slots: List[Map[String, String]]
     scope_starts: List[Int]
     loop_bases: List[Int]
+    emit_limit: Int
 
 fn ir_defers_enter_function() -> SavedDefers:
-    saved := SavedDefers(ir_defer_nodes, ir_defer_is_err, ir_defer_loop_slots, ir_defer_scope_starts, ir_defer_loop_base_stack)
+    saved := SavedDefers(ir_defer_nodes, ir_defer_is_err, ir_defer_loop_slots, ir_defer_scope_starts, ir_defer_loop_base_stack, ir_defer_emit_limit)
     ir_defer_nodes = []
     ir_defer_is_err = []
     ir_defer_loop_slots = []
     ir_defer_scope_starts = []
     ir_defer_loop_base_stack = []
+    ir_defer_emit_limit = 0 - 1
     return saved
 
 fn ir_defers_leave_function(saved: SavedDefers):
@@ -10247,6 +10274,7 @@ fn ir_defers_leave_function(saved: SavedDefers):
     ir_defer_loop_slots = saved.loop_slots
     ir_defer_scope_starts = saved.scope_starts
     ir_defer_loop_base_stack = saved.loop_bases
+    ir_defer_emit_limit = saved.emit_limit
 
 # build the `__spawn_N` wrapper a `spawn f(args)` runs on the new task: the
 # free variables of the callee expression and of every argument become the
@@ -12550,10 +12578,12 @@ fn ir_emit_bind_stmt(node: Node):
         if tracked and bind_target != "tuple" and ir_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
-            # a loop rebinding a cascade-eligible tuple local must cascade the
-            # OLD value's payload here, not just its shell. this is where the
-            # per-iteration leak lives.
-            ir_rc_release_local(old_r, bind_kind, name)
+            # a loop rebinding a cascade-eligible or count-released tuple local
+            # must release the OLD value's payload here, not just its shell.
+            if ir_result_local_releases_by_count(bind_kind, name):
+                ir_emit_result_box_release(old_r, ir_tuple_local_tid[name])
+            else:
+                ir_rc_release_local(old_r, bind_kind, name)
         ir_var_regs.insert(name, r)
         ir_emit_name_store(name, r)
         # not inside a generic body: a specialization re-emits the body and
@@ -12602,7 +12632,12 @@ fn ir_emit_assign_stmt(node: Node):
         if legacy_kind.len() > 0 and legacy_target != "tuple" and ir_expr_is_borrowed(node.children[0]):
             ir_rc_retain_reg(r, legacy_kind)
         if old_r >= 0:
-            ir_rc_release_local(old_r, legacy_kind, name)
+            if tracked and ir_result_local_releases_by_count(legacy_kind, name):
+                ir_emit_result_box_release(old_r, ir_tuple_local_tid[name])
+            elif tracked:
+                ir_rc_release_local(old_r, legacy_kind, name)
+            else:
+                ir_rc_release_reg(old_r, legacy_kind)
         ir_var_regs.insert(name, r)
         ir_emit_name_store(name, r)
 
@@ -12763,7 +12798,12 @@ fn ir_emit_compound_assignment(node: Node):
                 old_r = ir_reg()
                 ir_emit_name_load(old_r, name)
         if old_r >= 0:
-            ir_rc_release_reg(old_r, assign_kind)
+            if tracked and ir_result_local_releases_by_count(assign_kind, name):
+                ir_emit_result_box_release(old_r, ir_tuple_local_tid[name])
+            elif tracked:
+                ir_rc_release_local(old_r, assign_kind, name)
+            else:
+                ir_rc_release_reg(old_r, assign_kind)
         # any task can read a module global, so what it is given is marked
         # shared, by the value's own type (a function value's type names no
         # rc kind)
@@ -13192,6 +13232,11 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
     node := get_node(idx)
     if node.kind == "grouped" and node.children.len() > 0:
         return ir_optional_subject_is_owned(node.children[0])
+    # tag-only enums (and scalars) are unboxed integers, never heap shells:
+    # passing an unboxed enum tag to `pith_struct_release` would dereference it.
+    subj_tid := c_get_expr_type(idx)
+    if subj_tid >= 0 and ir_rc_kind(ir_type_from_tid(subj_tid)).len() == 0:
+        return false
     kind := node.kind
     # a weak read's shell owns the count its upgrade took (ir_emit_weak_read),
     # and a catch hands out an owned value on both arms (ir_emit_catch_expr):
@@ -14861,6 +14906,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_defer_loop_slots = []
     ir_defer_scope_starts = []
     ir_defer_loop_base_stack = []
+    ir_defer_emit_limit = 0 - 1
     ir_loop_iter_vars = []
     ir_loop_iter_kinds = []
     ir_loop_var_slots = {}

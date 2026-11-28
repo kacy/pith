@@ -1,0 +1,98 @@
+# Regression tests for Wave 3 self-host fixes:
+# - H-18a: `if let` / `while let` on an unboxed tag-only enum must not pass
+#          the raw integer tag (e.g. 32) to `pith_struct_release`.
+# - H-19b: indexing inside `defer` in a `-> T!` function must not recurse
+#          infinitely during IR emission.
+# - M-15a: lambdas calling captured closures or reading `self` must not drop
+#          from `ir_rc_locals` into stack-closure tracking.
+# - M-15b: `fn(mut x: Int)` parameters must emit valid IR without `mut` suffix.
+
+enum BigEnum:
+    V0
+    V1
+    V2
+    V3
+    V4
+    V5
+    V6
+    V7
+    V8
+    V9
+    V10
+    V11
+    V12
+    V13
+    V14
+    V15
+    V16
+    V17
+    V18
+    V19
+    V20
+    V21
+    V22
+    V23
+    V24
+    V25
+    V26
+    V27
+    V28
+    V29
+    V30
+    V31
+    V32
+    V33
+
+fn make_big(n: Int) -> BigEnum:
+    if n == 32:
+        return BigEnum.V32
+    return BigEnum.V0
+
+struct Counter:
+    mut step: Int
+
+impl Counter:
+    fn next_enum() -> BigEnum:
+        if self.step == 0:
+            self.step = 1
+            return BigEnum.V32
+        return BigEnum.V0
+
+    fn read_via_lambda() -> Int:
+        f := fn() => self.step + 10
+        return f()
+
+fn defer_index_result(xs: List[Int]) -> Int!:
+    mut out := 0
+    defer out = xs[0]
+    return xs[0] + 1
+
+fn call_captured_closure(g: fn(Int) -> Int) -> Int:
+    f := fn(x: Int) => g(x) + 1
+    return f(40)
+
+fn main():
+    mut hit := 0
+    if let BigEnum.V32 = make_big(32):
+        hit = hit + 1
+    if let BigEnum.V32 = make_big(0):
+        hit = hit + 100
+    assert(hit == 1)
+
+    c := Counter(0)
+    mut loops := 0
+    while let BigEnum.V32 = c.next_enum():
+        loops = loops + 1
+    assert(loops == 1)
+    assert(c.read_via_lambda() == 11)
+
+    xs := [7, 8]
+    v := defer_index_result(xs) catch -1
+    assert(v == 8)
+
+    inc := fn(mut x: Int) -> Int:
+        x = x + 1
+        return x
+    assert(inc(4) == 5)
+    assert(call_captured_closure(inc) == 42)
+    print("self-host-p1-ok")

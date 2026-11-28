@@ -381,12 +381,11 @@ pub fn get_scope_return_type(scope_id: Int) -> Int:
 pub fn is_in_loop_scope(scope_id: Int) -> Bool:
     return scope_entries[scope_id].in_loop
 
-# create a child scope with a specific return type
+# create a child scope with a specific return type. a function or lambda
+# boundary always starts outside any enclosing loop so `break`/`continue` in a
+# closure body cannot target an outer loop.
 pub fn create_function_scope(parent: Int, return_type: Int) -> Int:
-    mut in_lp := false
-    if parent >= 0:
-        in_lp = scope_entries[parent].in_loop
-    scope_entries.push(ScopeEntry(parent, return_type, in_lp, true))
+    scope_entries.push(ScopeEntry(parent, return_type, false, true))
     return scope_entries.len() - 1
 
 # create a child scope marked as inside a loop

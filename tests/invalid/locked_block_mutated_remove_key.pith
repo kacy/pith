@@ -1,0 +1,16 @@
+# Mutating the remove key between reading `s.items[k]` and calling
+# `s.items.remove(k)` does NOT remove the read element, so the escape must
+# still report E276.
+struct Store:
+    mu: Mutex
+    guard mu:
+        items: Map[String, List[Int]]
+
+fn leak(s: Store) -> List[Int]:
+    mut out: List[Int] := []
+    mut k := "a"
+    locked s.mu:
+        out = s.items[k]
+        k = "b"
+        s.items.remove(k)
+    return out

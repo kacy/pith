@@ -1,0 +1,1806 @@
+# ir_analysis.pith: static AST & interprocedural escape/borrow/keeper/capture
+# analyses, loop counter & index-offset overflow proofs, and upsert matchers.
+
+from ast import Node, get_node, node_child, node_child_count, node_count, node_kind, node_value
+from checker import c_argument_widens_to_optional, c_get_expr_type, get_definition_of, has_generic_declaration
+from checker_builtins import is_builtin_function
+from types import get_type_info, get_type_name
+from ir_ast_helpers import ir_binding_name, ir_is_binding_kind, ir_list_contains, ir_unwrap_pub_child
+from ir_common import ir_collect_bind_parts, ir_collect_if_branch, ir_copy_var_regs, ir_for_binding_names, ir_global_storage_symbol, ir_import_impl_method_name, ir_import_target_name, ir_root_items
+from ir_metadata import ir_is_known_returning_func
+from ir_state import ir_borrow_param_exported, ir_borrow_param_local, ir_boxed_enums, ir_cas_return_fns_exported, ir_cas_return_fns_local, ir_counter_steps, ir_current_impl_type, ir_current_module_path, ir_func_result_ok_kinds, ir_global_slot_names, ir_import_mutable_global_symbols, ir_import_renames, ir_index_offset_targets, ir_index_offsets_scanned, ir_keeper_pass_cas, ir_loop_var_slot, ir_loop_var_slots, ir_module_count, ir_mutable_global_names, ir_optional_tuple_dtor_needed, ir_result_reg_blocked, ir_result_reg_funcs, ir_storage_keepers_exported, ir_storage_keepers_local, ir_struct_names, ir_tuple_borrow_walk_active, ir_tuple_walk_pair_callee, ir_tuple_walk_pair_returns, ir_tuple_walk_root, ir_var_regs, ir_var_types
+from ir_types import ir_alias_target_node, ir_checked_index_type, ir_is_declared_callable, ir_lookup_specialized_method, ir_rc_kind, ir_resolve_assoc_type, ir_retkind, ir_type_from_tid
+from ir_symbols import ir_capture_blocked_names, ir_has_generic_params, ir_ident_callee, ir_is_fn_decl_kind, ir_is_generic_method_name, ir_plain_method_name, ir_resolve_module_alias_method_call_name, ir_resolve_static_callee, ir_resolve_type_node
+from ir_primitives import ir_call_arg_expr_index, ir_result_field_kind
+from ir_match_emit import ir_unwrap_tail_match
+from ir_type_infer import ir_extract_param_type, ir_extract_return_type, ir_fused_add_declines, ir_impl_identity_type, ir_impl_interface_base, ir_infer_type, ir_lookup_impl_method_for, ir_method_call_arg_expr, ir_method_receiver_type, ir_name_is_func_local, ir_node_contains_lambda_or_spawn, ir_optional_inner_type_of_node, ir_resolve_storage_name, ir_result_reg_enabled, ir_result_reg_ok_kind_fits, ir_tuple_elem_code
+
+# --- lambda capture analysis (merged from ir_capture) ---
+
+fn ir_copy_names(names: List[String]) -> List[String]:
+    mut copy: List[String] := []
+    for name in names:
+        copy.push(name)
+    return copy
+
+fn ir_should_capture_name(name: String, bound: List[String], free: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> Bool:
+    if ir_list_contains(bound, name) or ir_list_contains(free, name):
+        return false
+    # a real variable in the enclosing scope must be captured even if a global
+    # function or type shares its name; the local shadows the global (e.g. a
+    # parameter named `host` alongside std.net.url.host).
+    if locals.contains_key(name):
+        return true
+    if blocked_names.contains_key(name):
+        return false
+    # a builtin is called by name. taking `print` for a variable made the
+    # enclosing function load a local that does not exist.
+    if is_builtin_function(name):
+        return false
+    return not ir_is_known_returning_func(name)
+
+fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> List[String]:
+    node := get_node(idx)
+    if node.kind == "ident":
+        name := node.value
+        if ir_should_capture_name(name, bound, free, blocked_names, locals):
+            mut updated := ir_copy_names(free)
+            updated.push(name)
+            return updated
+        return free
+    # the receiver of an impl method is its own node kind rather than an ident,
+    # so it used to fall through to the generic child walk and never be
+    # captured. a spawn or lambda body that read it then emitted a bare
+    # `load self` into a thunk that has no such local, and the ir consumer
+    # rejected it with "unknown load source 'self'".
+    if node.kind == "self":
+        if ir_should_capture_name("self", bound, free, blocked_names, locals):
+            mut updated := ir_copy_names(free)
+            updated.push("self")
+            return updated
+        return free
+    if node.kind == "lambda":
+        inner_bound := ir_copy_names(bound)
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "param":
+                mut pname := cn.value
+                if pname.ends_with(" mut"):
+                    pname = pname.substring(0, pname.len() - 4)
+                inner_bound.push(pname)
+        mut updated_free := ir_copy_names(free)
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "body" or cn.kind == "block":
+                updated_free = ir_find_free_vars_walk(child, inner_bound, updated_free, blocked_names, locals)
+        return updated_free
+    # an `if let` / `while let` payload is bound by the construct itself, for
+    # its body only: the same relationship a lambda's parameters have to the
+    # lambda body above. the subject is walked under the OUTER set, since the
+    # payload name means nothing yet while it is evaluated, and so is an
+    # `if let`'s else block, where the payload is not in scope at all.
+    if node.kind == "if_let" or node.kind == "while_let":
+        if node.children.len() < 3:
+            return ir_walk_children(idx, bound, free, blocked_names, locals)
+        body_bound := ir_copy_names(bound)
+        ir_collect_pattern_names(node.children[0], body_bound)
+        mut let_free := ir_find_free_vars_walk(node.children[1], bound, free, blocked_names, locals)
+        let_free = ir_find_free_vars_walk(node.children[2], body_bound, let_free, blocked_names, locals)
+        if node.children.len() > 3:
+            let_free = ir_find_free_vars_walk(node.children[3], bound, let_free, blocked_names, locals)
+        return let_free
+    # a `for` loop binds its variable (and its optional index) for the body on
+    # the same terms. the loop variable lives in the loop's own slot rather
+    # than a frame local, so capturing it emitted a load of a name neither
+    # frame has.
+    if node.kind == "for_stmt" and node.children.len() >= 2:
+        loop_bound := ir_copy_names(bound)
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "loop_var" or cn.kind == "loop_index":
+                loop_bound.push(cn.value)
+        mut for_free := ir_find_free_vars_walk(node.children[0], bound, free, blocked_names, locals)
+        return ir_find_free_vars_walk(node.children[1], loop_bound, for_free, blocked_names, locals)
+    # a match arm's pattern binds names for its guard and body only.
+    if node.kind == "arm" and node.children.len() >= 2:
+        arm_bound := ir_copy_names(bound)
+        ir_collect_pattern_names(node.children[0], arm_bound)
+        mut arm_free := ir_copy_names(free)
+        mut k := 1
+        while k < node.children.len():
+            arm_free = ir_find_free_vars_walk(node.children[k], arm_bound, arm_free, blocked_names, locals)
+            k = k + 1
+        return arm_free
+    # a select recv arm evaluates its receive expression under the outer scope,
+    # then binds its name for the arm body only.
+    if node.kind == "select_recv_arm" and node.children.len() >= 1:
+        mut recv_free := ir_find_free_vars_walk(node.children[0], bound, free, blocked_names, locals)
+        recv_bound := ir_copy_names(bound)
+        if node.value.len() > 0 and node.value != "_" and not ir_list_contains(recv_bound, node.value):
+            recv_bound.push(node.value)
+        mut k := 1
+        while k < node.children.len():
+            recv_free = ir_find_free_vars_walk(node.children[k], recv_bound, recv_free, blocked_names, locals)
+            k = k + 1
+        return recv_free
+    if node.kind == "body" or node.kind == "block":
+        mut scoped_bound := ir_copy_names(bound)
+        mut updated_free := ir_copy_names(free)
+        for child in node.children:
+            updated_free = ir_find_free_vars_walk(child, scoped_bound, updated_free, blocked_names, locals)
+            child_node := get_node(child)
+            if ir_is_binding_kind(child_node.kind):
+                bind_name := ir_binding_name(child_node)
+                if bind_name.len() > 0 and not ir_list_contains(scoped_bound, bind_name):
+                    scoped_bound.push(bind_name)
+        return updated_free
+    return ir_walk_children(idx, bound, free, blocked_names, locals)
+
+fn ir_walk_children(idx: Int, bound: List[String], free: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> List[String]:
+    mut updated_free := ir_copy_names(free)
+    for child in get_node(idx).children:
+        updated_free = ir_find_free_vars_walk(child, bound, updated_free, blocked_names, locals)
+    return updated_free
+
+# every name a pattern binds, appended to `names`: the bare `pat_binding`
+# an `if let` unwraps an optional with, and the ones nested inside a tuple
+# or variant pattern. the literal and wildcard patterns bind nothing.
+fn ir_collect_pattern_names(idx: Int, names: List[String]):
+    node := get_node(idx)
+    if node.kind == "pat_binding":
+        if not ir_list_contains(names, node.value):
+            names.push(node.value)
+        return
+    for child in node.children:
+        ir_collect_pattern_names(child, names)
+
+# the names a lambda body has to capture from the scope around it: every
+# identifier under `idx` that nothing inside it declares. the emitter
+# calls this with the lambda's parameters as `bound` and uses the result
+# in order as the closure's environment layout, so slot i belongs to
+# name i on both the capture side and the load side.
+#
+# `blocked_names` are names that are not variables at all (module
+# aliases, import renames, struct names, known functions) and are
+# skipped. `locals` is the enclosing scope's live variables, and it wins:
+# a name that is a real local is captured even when a global of the same
+# name is blocked, so a parameter named `host` shadows std.net.url.host.
+# an unknown name that is not blocked and is not a known function is
+# captured on the assumption that it is a local.
+#
+# the bound set grows as the walk descends, for each name the construct
+# that introduces it puts in scope: a `bind` statement for the rest of its
+# block (and only after its own initializer is walked, so `x := x` captures
+# the outer x), a lambda's parameters for the lambda body, an `if let` or
+# `while let` payload for that body alone, and a `for` loop's variable and
+# index for the loop body. a name introduced by one of the last three used
+# to read as free and be captured, which emitted a load of a name neither
+# frame has and the ir consumer rejected with "unknown load source".
+# `self` is captured under that name like an ordinary variable.
+fn ir_capture_find_free_vars(idx: Int, bound: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> List[String]:
+    return ir_find_free_vars_walk(idx, bound, [], blocked_names, locals)
+
+## find free vars.
+pub fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
+    # ir_var_regs holds the enclosing scope's live variables, so a captured name
+    # that shadows a same-named global is recognized as a real local. a loop
+    # variable lives in a slot of its own and is just as real: one spelled like a
+    # function was left uncaptured, and the closure read the function's address.
+    if ir_loop_var_slots.len() == 0:
+        return ir_capture_find_free_vars(idx, bound, ir_capture_blocked_names(), ir_var_regs)
+    mut locals := ir_copy_var_regs(ir_var_regs)
+    for name in ir_loop_var_slots.keys():
+        locals.insert(name, 0)
+    return ir_capture_find_free_vars(idx, bound, ir_capture_blocked_names(), locals)
+
+# whether two binds of one name produce the same payload shape. result and
+# optional types are not interned, so `resp := c.get(a)` in two branches gives
+# two type ids for the same `Response!`; comparing ids alone marked the name
+# conflicting, and its plain shell release leaked the payload of every call.
+pub fn ir_tuple_tids_same_shape(a: Int, b: Int) -> Bool:
+    if a == b:
+        return true
+    if a < 0 or b < 0:
+        return false
+    if get_type_info(a).kind != get_type_info(b).kind:
+        return false
+    return ir_tuple_cascade_signature(a) == ir_tuple_cascade_signature(b)
+
+# true when `parent` uses its child ident `name` in a way that leaves the tuple
+# holding the count it was built with, so the cleanup path is the only thing
+# that ever releases the payload:
+#
+#   - a flag check, which only reads slot 0 and never touches the payload;
+#   - a `.ok`/`.err` read, which loads slot 8 / slot 16 as a BORROW. where the
+#     value escapes (`b := r.ok`, `return r.ok`) the emitter retains right after
+#     the field load, so the consumer holds its own count; where it does not
+#     (`f(r.ok)`, `r.ok.len()`) nothing is retained and nothing is released.
+#     either way the tuple's own count survives the read.
+#
+# nothing on this list releases the shell, so a local whose every use is one of
+# them is unambiguously the payload's sole owner at cleanup.
+#
+# `.ok` was excluded when the cascade first landed because whitelisting it made
+# tests/cases/test_http2_tls_roundtrip fail valgrind. that turned out to be a
+# separate ownership bug the leak had been hiding (a channel `try_send` handed
+# its value to another task without taking a count) and is fixed.
+#
+# for a RESULT local the extraction forms qualify too. `name.unwrap_or(d)`,
+# `name catch d`, and `name!` all classify a named operand as borrowed and
+# leave the shell holding the count it was built with: the ok arm hands the
+# consumer a freshly retained count (or, for a string payload, a borrow the
+# escape site retains), and the err arm keeps the error in the shell. so the
+# cleanup path is still the payload's sole owner, exactly like a `.ok` read.
+# without these entries an extraction disqualified the local from the cascade
+# and the count the shell holds was never released: one heap payload leaked
+# per extraction.
+#
+# the extraction entries are open for an OPTIONAL local too, for both
+# spellings: `name.unwrap_or(d)` and `name.value()` each retain the payload
+# they hand out for a cascade-eligible subject (ir_extraction_retains), so the
+# shell keeps the count it was built with and the cascade is its sole releaser,
+# the same contract as the result forms. `catch` and `!` stay result-only.
+#
+# `.value()` has to be on this list, not merely counted at the extraction
+# site. without it a local that only ever extracts falls off the cascade and
+# onto the shell-only path, where the extraction transfers the shell's single
+# count instead of taking its own, and a second extraction of the same local
+# then hands the same count out twice. `std.trace` reads four fields off one
+# parsed `SpanContext?` that way, and the first consumer's release freed what
+# the other three read.
+#
+# one whitelisted position lives in the walk instead of here: an argument of a
+# call whose callee provably only reads the parameter (ir_tuple_call_uses_safe
+# and ir_tuple_method_call_uses_safe); the parser wraps arguments in `arg`
+# nodes, so this per-parent check never sees the call they belong to.
+fn ir_tuple_use_is_whitelisted(parent: Node, name: String, is_result: Bool) -> Bool:
+    if parent.kind == "method_call" and parent.children.len() > 0:
+        recv := get_node(parent.children[0])
+        mname := ir_plain_method_name(parent.value)
+        if recv.kind == "ident" and recv.value == name and (mname == "unwrap_or" or (mname == "value" and not is_result)):
+            # only the receiver position is safe; the name appearing inside
+            # the fallback argument is a use the walk must judge on its own
+            mut ai := 1
+            mut arg_mentions := false
+            while ai < parent.children.len():
+                if ir_subtree_mentions_ident(parent.children[ai], name):
+                    arg_mentions = true
+                ai = ai + 1
+            return not arg_mentions
+    if is_result and (parent.kind == "catch_expr" or parent.kind == "catch_block") and parent.children.len() > 1:
+        operand := get_node(parent.children[0])
+        if operand.kind == "ident" and operand.value == name:
+            return not ir_subtree_mentions_ident(parent.children[1], name)
+    if is_result and parent.kind == "try" and parent.children.len() > 0:
+        operand := get_node(parent.children[0])
+        if operand.kind == "ident" and operand.value == name:
+            return true
+    if parent.kind == "field_access":
+        # the ident must be the receiver, and the field a flag or payload read
+        if parent.children.len() == 0:
+            return false
+        recv := get_node(parent.children[0])
+        if not (recv.kind == "ident" and recv.value == name):
+            return false
+        f := parent.value
+        if f == "ok" or f == "err":
+            return true
+        return f == "is_ok" or f == "is_err" or f == "is_some" or f == "is_none"
+    if parent.kind == "binary" and (parent.value == "eq" or parent.value == "neq"):
+        # `name == none` / `name != none`: only reads the flag, never releases
+        if parent.children.len() < 2:
+            return false
+        a := get_node(parent.children[0])
+        b := get_node(parent.children[1])
+        a_is_name := a.kind == "ident" and a.value == name
+        b_is_name := b.kind == "ident" and b.value == name
+        a_is_none := a.kind == "none_lit" or a.kind == "none"
+        b_is_none := b.kind == "none_lit" or b.kind == "none"
+        return (a_is_name and b_is_none) or (b_is_name and a_is_none)
+    return false
+
+# true when ident `name` appears anywhere under `idx`. used where a whole
+# subtree disqualifies a local no matter how the name is spelled there: an
+# assignment target, or a lambda body, both of which the surrounding walk would
+# otherwise wave through on the strength of a read-shaped `.ok`.
+fn ir_subtree_mentions_ident(idx: Int, name: String) -> Bool:
+    node := get_node(idx)
+    if node.kind == "ident" and node.value == name:
+        return true
+    for child_idx in node.children:
+        if ir_subtree_mentions_ident(child_idx, name):
+            return true
+    return false
+
+# the walk's view of one call node. an argument that is exactly the tracked
+# name is a borrow only when ir_tuple_call_arg_is_borrow can prove the callee
+# never keeps it; the callee position and every deeper subtree are judged by
+# the ordinary rules.
+fn ir_tuple_call_uses_safe(node: Node, name: String, is_result: Bool) -> Bool:
+    # a named argument may land in any declared position, so a positional
+    # argument's index is only trustworthy when the call has no named ones
+    mut has_named := false
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "arg" and cn.value.len() > 0:
+            has_named = true
+    for child, i in node.children:
+        cn := get_node(child)
+        if i == 0:
+            # the callee position: a fn value named `name` cannot be a tuple
+            # local, and nothing here may wave it through
+            if cn.kind == "ident" and cn.value == name:
+                return false
+            if cn.kind != "ident":
+                if not ir_tuple_uses_all_safe(child, name, is_result):
+                    return false
+        else:
+            mut expr_idx := child
+            mut arg_name := ""
+            if cn.kind == "arg":
+                arg_name = cn.value
+                if cn.children.len() > 0:
+                    expr_idx = cn.children[0]
+                else:
+                    expr_idx = 0 - 1
+            if expr_idx >= 0:
+                en := get_node(expr_idx)
+                if en.kind == "ident" and en.value == name:
+                    if has_named and arg_name.len() == 0:
+                        return false
+                    if not ir_tuple_call_arg_is_borrow(node, i - 1, arg_name, is_result):
+                        return false
+                elif not ir_tuple_uses_all_safe(expr_idx, name, is_result):
+                    return false
+    return true
+
+# true when handing the tracked tuple local to this call argument leaves the
+# caller the payload's sole owner at cleanup. that needs the callee's body:
+# a function declared in the module being emitted has its body walked here
+# for the receiving parameter, and an imported one is answered by the record
+# its own module made with the same walk (ir_record_borrow_params), so a
+# callee that stores, returns, sends, or captures the parameter (any use the
+# whitelist does not cover) answers "not safe", and the local keeps
+# shell-only cleanup. everything unresolvable stays excluded the same way:
+# a named argument to an imported callee (the record is by position), a
+# struct or enum construction (stores every argument), a builtin
+# or closure-typed callee (no declaration to read), a `mut`/`ref` parameter,
+# and a recursive chain already being walked. erring that way keeps the leak
+# the cascade has always tolerated and can never free a live payload.
+#
+# the callee's own extractions are safe on a borrowed parameter: `!`,
+# `catch` and `unwrap_or` classify a named operand as borrowed and retain
+# the payload they hand out (see ir_emit_result_unwrap_or for results and
+# the Some arm in ir_emit_typed_receiver_method for optionals; a parameter
+# subject always retains), so the caller stays the shell's sole owner. the
+# walk's `is_result` gate keeps `catch` and `!` result-only; unwrap_or is
+# open for both.
+#
+# an imported body is not walked from here because it names things the way
+# its own module does, and that module was emitted before this one.
+fn ir_tuple_call_arg_is_borrow(node: Node, arg_pos: Int, arg_name: String, is_result: Bool) -> Bool:
+    callee := ir_resolve_static_callee(node.children[0])
+    if callee.name.len() == 0:
+        return false
+    if callee.imported:
+        return arg_name.len() == 0 and ir_borrow_param_recorded(callee.name, arg_pos, is_result)
+    if ir_struct_names.contains_key(callee.name) or ir_boxed_enums.contains_key(callee.name):
+        return false
+    decl_idx := ir_tuple_walk_fn_decl(callee.name)
+    if decl_idx < 0:
+        return false
+    param := ir_tuple_walk_param_name(decl_idx, arg_pos, arg_name)
+    if param.len() == 0:
+        return false
+    body_idx := ir_tuple_walk_fn_body(decl_idx)
+    if body_idx < 0:
+        return false
+    return ir_tuple_param_walk(callee.name, body_idx, param, is_result)
+
+# whether `param` of the function `fname` (its symbol in this module) with
+# body `body_idx` passes the walk, with the register-abi knowledge below
+# when `fname` returns the pair.
+fn ir_tuple_param_walk(fname: String, body_idx: Int, param: String, is_result: Bool) -> Bool:
+    walk_key := fname + "/" + param
+    if ir_tuple_borrow_walk_active.contains(walk_key):
+        return false
+    ir_tuple_borrow_walk_active.push(walk_key)
+    saved_pair_callee := ir_tuple_walk_pair_callee
+    saved_pair_returns := ir_tuple_walk_pair_returns
+    ir_tuple_walk_pair_callee = is_result and ir_result_reg_funcs.contains_key(fname)
+    ir_tuple_walk_pair_returns = []
+    if ir_tuple_walk_pair_callee:
+        ir_collect_pair_returns(body_idx)
+        tail := ir_unwrap_tail_match(body_idx)
+        if tail >= 0:
+            ir_collect_tail_match_returns(tail)
+    safe := ir_tuple_uses_all_safe(body_idx, param, is_result)
+    ir_tuple_walk_pair_callee = saved_pair_callee
+    ir_tuple_walk_pair_returns = saved_pair_returns
+    ir_tuple_borrow_walk_active.remove(ir_tuple_borrow_walk_active.len() - 1)
+    return safe
+
+# the walk's view of a method call whose receiver is not the tracked name
+# (a receiver that is the name is judged by ir_tuple_use_is_whitelisted).
+# an argument that is exactly the name is a borrow only when the call
+# resolves to a function whose module recorded that parameter as borrowed:
+# a `mod.f(x)` call through an import alias, or a method of a user struct
+# or enum. a builtin, a generic, a closure field and anything else that
+# does not resolve answers "not safe".
+fn ir_tuple_method_call_uses_safe(idx: Int, node: Node, name: String, is_result: Bool) -> Bool:
+    if not ir_tuple_uses_all_safe(node.children[0], name, is_result):
+        return false
+    mut ai := 1
+    mut sym_known := false
+    mut sym := ""
+    while ai < node.children.len():
+        an := get_node(node.children[ai])
+        expr_idx := ir_method_call_arg_expr(node, ai - 1)
+        if expr_idx >= 0:
+            en := get_node(expr_idx)
+            if en.kind == "ident" and en.value == name:
+                if an.kind == "arg" and an.value.len() > 0:
+                    return false
+                if c_argument_widens_to_optional(expr_idx):
+                    return false
+                if not sym_known:
+                    sym = ir_tuple_method_call_symbol(idx, node)
+                    sym_known = true
+                if sym.len() == 0 or not ir_borrow_param_recorded(sym, ai - 1, is_result):
+                    return false
+            elif not ir_tuple_uses_all_safe(expr_idx, name, is_result):
+                return false
+        ai = ai + 1
+    return true
+
+# the symbol a method call lowers to, for the two shapes a borrow record can
+# cover, or "". this mirrors the dispatch order of ir_emit_method_call: an
+# import alias first, then an impl method on a user type.
+fn ir_tuple_method_call_symbol(idx: Int, node: Node) -> String:
+    alias_name := ir_resolve_module_alias_method_call_name(idx)
+    if alias_name.len() > 0:
+        return alias_name
+    recv_tid := c_get_expr_type(node.children[0])
+    if recv_tid < 0:
+        return ""
+    kind := get_type_info(recv_tid).kind
+    if kind != "struct" and kind != "enum":
+        return ""
+    mname := ir_plain_method_name(node.value)
+    obj_type := ir_method_receiver_type(node)
+    if ir_lookup_specialized_method(obj_type, mname).len() > 0:
+        return ""
+    impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, mname)
+    if impl_name.len() == 0 or ir_is_generic_method_name(impl_name):
+        return ""
+    return impl_name
+
+fn ir_borrow_param_recorded(sym: String, pos: Int, is_result: Bool) -> Bool:
+    key := sym + "/" + pos.to_string()
+    mut flavor := ""
+    if ir_borrow_param_local.contains_key(key):
+        flavor = ir_borrow_param_local[key]
+    elif ir_borrow_param_exported.contains_key(key):
+        flavor = ir_borrow_param_exported[key]
+    if is_result:
+        return flavor == "result"
+    return flavor == "optional"
+
+# record which result and optional parameters of this module's functions
+# and plain methods the walk proves borrowed, before any body is emitted, so
+# a call to one from anywhere in the build can read the answer without
+# walking a body it cannot name things in. generic functions and methods of
+# generic types are left out: their bodies re-emit per specialization under
+# other symbols, and a call to one finds no record. a callee whose own
+# record is not made yet when the walk reaches it answers "not safe", which
+# keeps the cascade off for that argument.
+pub fn ir_record_borrow_params(root_idx: Int):
+    ir_borrow_param_local = {}
+    ir_walk_module_fns(root_idx, false, ir_record_fn_borrow_params)
+
+# call `record` on each of this module's functions and each method of its
+# non-generic impl blocks, with the symbol it is emitted under and
+# ir_current_impl_type set to its impl type. a generic method is skipped, and
+# a generic function too unless `generic_fns` is set. true when any call
+# returned true.
+fn ir_walk_module_fns(root_idx: Int, generic_fns: Bool, record: fn(Int, String) -> Bool) -> Bool:
+    saved_impl_type := ir_current_impl_type
+    mut changed := false
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if ir_is_fn_decl_kind(node.kind):
+            if generic_fns or not ir_has_generic_params(node):
+                ir_current_impl_type = ""
+                if record(item_idx, node.value):
+                    changed = true
+        elif node.kind == "impl_decl":
+            impl_type := ir_impl_identity_type(node, ir_current_module_path)
+            if impl_type.len() > 0 and not impl_type.contains("[") and not has_generic_declaration(impl_type):
+                ir_current_impl_type = impl_type
+                for child in node.children:
+                    method_idx := ir_unwrap_pub_child(child)
+                    method_node := get_node(method_idx)
+                    if method_node.kind == "fn_decl" and not ir_has_generic_params(method_node):
+                        if record(method_idx, impl_type + "_" + method_node.value):
+                            changed = true
+    ir_current_impl_type = saved_impl_type
+    return changed
+
+# record a parameter under this module's symbol and, inside a module, under
+# the name an importer calls it by
+fn ir_record_borrow_param(sym: String, pos: Int, flavor: String):
+    key_tail := "/" + pos.to_string()
+    ir_borrow_param_local.insert(sym + key_tail, flavor)
+    if ir_current_module_path.len() > 0:
+        ir_borrow_param_exported.insert(ir_import_target_name(ir_current_module_path, sym) + key_tail, flavor)
+
+# true when this call recorded a parameter
+fn ir_record_fn_borrow_params(decl_idx: Int, sym: String) -> Bool:
+    body_idx := ir_tuple_walk_fn_body(decl_idx)
+    if body_idx < 0:
+        return false
+    mut added := false
+    mut pos := 0
+    for child in get_node(decl_idx).children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            mut flavor := ""
+            if cn.children.len() > 0:
+                type_kind := get_node(ir_alias_target_node(cn.children[0])).kind
+                if type_kind == "result_type":
+                    flavor = "result"
+                elif type_kind == "optional_type":
+                    flavor = "optional"
+            if flavor.len() > 0 and cn.value.split(" ").len() == 1:
+                if ir_tuple_param_walk(sym, body_idx, cn.value, flavor == "result"):
+                    ir_record_borrow_param(sym, pos, flavor)
+                    added = true
+            pos = pos + 1
+    return added
+
+# parameters of function type that a function only ever calls, or hands to a
+# parameter of some other function recorded the same way. a closure passed to
+# one cannot outlive the call, so a caller may build a lambda literal for it
+# in a stack slot (ir_emit_local_fn_arg). recorded in ir_borrow_param_local
+# and ir_borrow_param_exported with the flavor "closure", in passes until
+# nothing changes, since a function's record can depend on one declared after
+# it. a parameter in a lambda or a spawn, stored, returned, or reassigned is
+# never recorded. a generic function is recorded under its own name, which is
+# the name a call site resolves before it asks for a specialization.
+pub fn ir_record_closure_params(root_idx: Int):
+    mut changed := true
+    while changed:
+        changed = ir_walk_module_fns(root_idx, true, ir_record_fn_closure_params)
+
+# true when this pass recorded a parameter that was not recorded before
+fn ir_record_fn_closure_params(decl_idx: Int, sym: String) -> Bool:
+    body_idx := ir_tuple_walk_fn_body(decl_idx)
+    if body_idx < 0:
+        return false
+    mut shadowed: Map[String, Bool] := {}
+    ir_collect_decl_shadow_names(decl_idx, body_idx, shadowed)
+    mut added := false
+    mut pos := 0
+    for child in get_node(decl_idx).children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            key_tail := "/" + pos.to_string()
+            is_fn := cn.children.len() > 0 and get_node(ir_alias_target_node(cn.children[0])).kind == "fn_type"
+            if is_fn and not ir_borrow_param_local.contains_key(sym + key_tail) and not cn.value.contains(" "):
+                name := cn.value
+                if not ir_subtree_assigns_name(body_idx, name) and ir_count_name_nodes(body_idx, name) == ir_count_local_closure_uses(body_idx, name, shadowed):
+                    ir_record_borrow_param(sym, pos, "closure")
+                    added = true
+            pos = pos + 1
+    return added
+
+# collect names bound locally inside `decl_idx` (parameters and local/pattern/
+# loop/select bindings in its body, excluding nested lambda scopes) so a call
+# to a local closure variable that shares a name with a top-level helper is
+# never mistaken for a static call to that helper.
+fn ir_collect_decl_shadow_names(decl_idx: Int, body_idx: Int, out: Map[String, Bool]):
+    for child in get_node(decl_idx).children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            mut pname := cn.value
+            if pname.ends_with(" mut"):
+                pname = pname.substring(0, pname.len() - 4)
+            elif pname.ends_with(" ref"):
+                pname = pname.substring(0, pname.len() - 4)
+            if pname.len() > 0:
+                out.insert(pname, true)
+    ir_collect_body_shadow_names(body_idx, out)
+
+fn ir_collect_body_shadow_names(idx: Int, out: Map[String, Bool]):
+    node := get_node(idx)
+    if node.kind == "lambda":
+        return
+    if ir_is_binding_kind(node.kind):
+        parts := ir_collect_bind_parts(node)
+        if parts.name.len() > 0:
+            out.insert(parts.name, true)
+    elif node.kind == "loop_var" or node.kind == "pat_binding" or node.kind == "select_recv_arm":
+        if node.value.len() > 0:
+            out.insert(node.value, true)
+    for child in node.children:
+        ir_collect_body_shadow_names(child, out)
+
+# the mentions of `name` that keep a closure in this frame: the callee of a
+# call, or a positional argument to a recorded closure parameter. none inside
+# a lambda or a spawn counts.
+fn ir_count_local_closure_uses(idx: Int, name: String, shadowed: Map[String, Bool]) -> Int:
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return 0
+    mut n := 0
+    if node.kind == "call" and node.children.len() > 0:
+        callee := get_node(node.children[0])
+        if callee.kind == "ident" and callee.value == name:
+            n = 1
+        elif callee.kind == "ident" and not shadowed.contains_key(callee.value) and not ir_global_slot_names.contains(callee.value):
+            for pos in ir_local_closure_arg_positions(node, ir_resolve_static_callee(node.children[0]).name):
+                arg_idx := ir_call_arg_expr_index(node.children[pos + 1])
+                arg := get_node(arg_idx)
+                if arg.kind == "ident" and arg.value == name:
+                    n = n + 1
+    for child in node.children:
+        n = n + ir_count_local_closure_uses(child, name, shadowed)
+    return n
+
+# the positional arguments of a static call that land in a recorded closure
+# parameter of `callee_name`. a named argument is left out: the record is by
+# position.
+pub fn ir_local_closure_arg_positions(node: Node, callee_name: String) -> List[Int]:
+    mut positions: List[Int] := []
+    if callee_name.len() == 0:
+        return positions
+    mut i := 1
+    while i < node.children.len():
+        arg := get_node(node.children[i])
+        if not (arg.kind == "arg" and arg.value.len() > 0):
+            key := callee_name + "/" + (i - 1).to_string()
+            mut flavor := ""
+            if ir_borrow_param_local.contains_key(key):
+                flavor = ir_borrow_param_local[key]
+            elif ir_borrow_param_exported.contains_key(key):
+                flavor = ir_borrow_param_exported[key]
+            if flavor == "closure":
+                positions.push(i - 1)
+        i = i + 1
+    return positions
+
+# functions and plain methods that never drop a value some other owner
+# holds (ir_subtree_keeps_storage). a call to one cannot free a pinned
+# argument, so its arguments need no pin, which keeps comparators and
+# accessors (`less(xs[i], xs[j])`) free. recorded in passes until nothing
+# changes, since a function can depend on one declared after it; a recursive
+# function is never recorded, which only costs pins. generic functions and
+# methods of generic types are left out, as in ir_record_borrow_params.
+pub fn ir_record_storage_keepers(root_idx: Int):
+    ir_storage_keepers_local = {}
+    ir_cas_return_fns_local = {}
+    ir_keeper_pass_cas = false
+    ir_record_keeper_passes(root_idx)
+    ir_keeper_pass_cas = true
+    ir_record_keeper_passes(root_idx)
+    ir_keeper_pass_cas = false
+
+# one fixed-point walk over the module's functions, filling the maps the
+# current pass names
+fn ir_record_keeper_passes(root_idx: Int):
+    mut changed := true
+    while changed:
+        changed = ir_walk_module_fns(root_idx, false, ir_record_storage_keeper)
+
+# record one function when its body keeps storage and it is not recorded yet.
+# true when this call added it.
+fn ir_record_storage_keeper(decl_idx: Int, sym: String) -> Bool:
+    if ir_storage_keepers_local.contains_key(sym) or ir_cas_return_fns_local.contains_key(sym):
+        return false
+    body_idx := ir_tuple_walk_fn_body(decl_idx)
+    if body_idx < 0 or not ir_subtree_keeps_storage(body_idx, decl_idx, body_idx):
+        return false
+    mut exported := ""
+    if ir_current_module_path.len() > 0:
+        exported = ir_import_target_name(ir_current_module_path, sym)
+    if ir_keeper_pass_cas:
+        ir_cas_return_fns_local.insert(sym, true)
+        if exported.len() > 0:
+            ir_cas_return_fns_exported.insert(exported, true)
+    else:
+        ir_storage_keepers_local.insert(sym, true)
+        if exported.len() > 0:
+            ir_storage_keepers_exported.insert(exported, true)
+    return true
+
+## is storage keeper.
+pub fn ir_is_storage_keeper(name: String) -> Bool:
+    return ir_storage_keepers_local.contains_key(name) or ir_storage_keepers_exported.contains_key(name)
+
+# whether a call to `name` can skip its argument pins: a storage keeper, or a
+# function whose only release returns at once (ir_cas_return_fns_local)
+pub fn ir_call_needs_no_pins(name: String) -> Bool:
+    if ir_is_storage_keeper(name):
+        return true
+    return ir_cas_return_fns_local.contains_key(name) or ir_cas_return_fns_exported.contains_key(name)
+
+# `if cell.compare_set(a, b): return` with no elif or else, on an AtomicInt,
+# where the return carries nothing or a literal. the function ends the moment
+# the compare_set succeeds, so nothing it does can follow that release.
+fn ir_is_cas_return(node: Node) -> Bool:
+    if node.kind != "if" and node.kind != "if_stmt":
+        return false
+    for child in node.children:
+        ck := node_kind(child)
+        if ck == "elif" or ck == "else":
+            return false
+    branch := ir_collect_if_branch(node)
+    if branch.cond_idx < 0 or branch.body_idx < 0:
+        return false
+    cond := get_node(branch.cond_idx)
+    if cond.kind != "method_call" or ir_plain_method_name(cond.value) != "compare_set":
+        return false
+    recv_type := ir_infer_type(cond.children[0])
+    if recv_type != "AtomicInt" and recv_type != "opaque:AtomicInt":
+        return false
+    mut ret_idx := branch.body_idx
+    while (node_kind(ret_idx) == "then" or node_kind(ret_idx) == "block") and get_node(ret_idx).children.len() == 1:
+        ret_idx = get_node(ret_idx).children[0]
+    ret := get_node(ret_idx)
+    if ret.kind != "return":
+        return false
+    if ret.children.len() == 0:
+        return true
+    return ret.children.len() == 1 and ["int_lit", "bool_lit"].contains(node_kind(ret.children[0]))
+
+# the free builtins that touch no counted value and no other task. a byte
+# buffer holds raw bytes, so writing to one cannot release anything.
+fn ir_is_pure_builtin(name: String) -> Bool:
+    if name.starts_with("byte_buffer_"):
+        return true
+    return ["print", "print_err", "ord", "chr", "abs", "min", "max", "clamp", "sqrt", "floor", "ceil", "round", "pow", "fmt_float", "parse_int", "parse_float", "float_to_bits", "float_from_bits", "bit_not", "bit_and", "bit_or", "bit_xor", "bit_shl", "bit_shr", "bit_rotl32", "bit_rotr32", "bit_rotl64", "bit_rotr64", "bytes_eq", "bytes_len", "bytes_is_empty", "bytes_get", "bytes_slice", "bytes_concat", "bytes_to_string_utf8", "bytes_substring_utf8", "bytes_from_string_utf8", "crypto_constant_time_eq"].contains(name)
+
+# true when nothing in the subtree can drop a value that a field, a container
+# element or a global holds: no write to any of them, no container method that
+# evicts an element, no spawn, await or select, and calls only to pure
+# builtins and recorded keepers. a loop is allowed even though its back edge
+# can yield, because another task can only reach the same value if the two
+# share it without a lock, which docs/ownership.md leaves to the program.
+#
+# decl_idx and body_idx name the function, to tell its locals from globals
+# when assigned; a decl_idx below 0 asks the emitter's live locals instead.
+pub fn ir_subtree_keeps_storage(idx: Int, decl_idx: Int, body_idx: Int) -> Bool:
+    node := get_node(idx)
+    kind := node.kind
+    if kind == "lambda":
+        # a closure built here runs only if something calls it, and a call
+        # through a function value is refused below
+        return true
+    if kind == "spawn" or kind == "await" or kind == "select":
+        return false
+    if ir_keeper_pass_cas:
+        # a defer would run after the release a cas return makes
+        if kind == "defer":
+            return false
+        if ir_is_cas_return(node):
+            cond := get_node(ir_collect_if_branch(node).cond_idx)
+            for child in cond.children:
+                if not ir_subtree_keeps_storage(child, decl_idx, body_idx):
+                    return false
+            return true
+    if kind == "assignment":
+        target := get_node(node.children[0])
+        if target.kind != "ident" or not ir_name_is_bound_in(target.value, decl_idx, body_idx):
+            return false
+    elif kind == "assign":
+        if node.children.len() >= 2 or not ir_name_is_bound_in(node.value, decl_idx, body_idx):
+            return false
+    elif kind == "call":
+        callee := get_node(node.children[0])
+        if callee.kind != "ident":
+            return false
+        if ir_is_declared_callable(callee.value):
+            if not ir_is_storage_keeper(ir_resolve_static_callee(node.children[0]).name):
+                return false
+        elif not ir_is_pure_builtin(callee.value):
+            return false
+    elif kind == "method_call":
+        callee_sym := ir_tuple_method_call_symbol(idx, node)
+        if callee_sym.len() > 0:
+            if not ir_is_storage_keeper(callee_sym):
+                return false
+        elif not ir_method_keeps_storage(idx):
+            return false
+    for child in node.children:
+        if not ir_subtree_keeps_storage(child, decl_idx, body_idx):
+            return false
+    return true
+
+# a builtin method that releases nothing: anything on a string, a number or a
+# bool (none of them can be changed in place), the reading methods of the
+# containers, and the list methods that only add or reorder. a method that
+# takes a function is left out, since it runs that function.
+fn ir_method_keeps_storage(idx: Int) -> Bool:
+    node := get_node(idx)
+    recv_type := ir_infer_type(node.children[0])
+    name := ir_plain_method_name(node.value)
+    if recv_type == "string" or recv_type == "int" or recv_type == "float" or recv_type == "bool":
+        return true
+    if recv_type.starts_with("list"):
+        return ["len", "is_empty", "contains", "get", "index_of", "first", "last", "slice", "join", "push", "insert", "reverse", "sort"].contains(name)
+    if recv_type.starts_with("map"):
+        return ["len", "is_empty", "contains_key", "get", "get_default", "keys", "values"].contains(name)
+    if recv_type.starts_with("set"):
+        return ["len", "is_empty", "contains"].contains(name)
+    if recv_type == "bytes":
+        return ["len", "is_empty", "get", "slice"].contains(name)
+    # a load releases nothing and hands nothing to another task. a store or a
+    # compare_set can release a lock a program built from the cell, the way
+    # unlock, done and release do, and the other task can then replace the
+    # field, element or global the caller read an argument from, sync handles
+    # included. so those never count, and neither do the other sync methods.
+    if recv_type == "AtomicInt" or recv_type == "opaque:AtomicInt":
+        return name == "load"
+    return false
+
+# true when `name` is a parameter of the function or bound inside its body,
+# so assigning it rebinds a local rather than a global
+fn ir_name_is_bound_in(name: String, decl_idx: Int, body_idx: Int) -> Bool:
+    if decl_idx < 0:
+        return ir_name_is_func_local(name) or ir_loop_var_slot(name).len() > 0
+    for child in get_node(decl_idx).children:
+        cn := get_node(child)
+        if cn.kind == "param" and cn.value.split(" ")[0] == name:
+            return true
+    return ir_subtree_binds_name(body_idx, name)
+
+## subtree binds name.
+pub fn ir_subtree_binds_name(idx: Int, name: String) -> Bool:
+    node := get_node(idx)
+    if ir_is_binding_kind(node.kind) and ir_collect_bind_parts(node).name == name:
+        return true
+    for child in node.children:
+        if ir_subtree_binds_name(child, name):
+            return true
+    return false
+
+# a callee on the register abi never hands its caller the box it was given:
+# a returned result leaves as its payload, which takes a count of its own
+# when the box is borrowed (ir_emit_return_box_as_pair). so, walking such a
+# callee, the parameter in return position is a counted extraction like `!`
+# or `catch`, not the alias it is when the box itself goes back. these two
+# collect the return positions: every `return` value, and the arm values of
+# the function's tail match.
+fn ir_collect_pair_returns(idx: Int):
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return
+    if node.kind == "return" and node.children.len() > 0:
+        ir_tuple_walk_pair_returns.push(ir_unwrap_grouped(node.children[0]))
+    for child_idx in node.children:
+        ir_collect_pair_returns(child_idx)
+
+fn ir_collect_tail_match_returns(match_idx: Int):
+    node := get_node(match_idx)
+    mut i := 1
+    while i < node.children.len():
+        arm := get_node(node.children[i])
+        mut j := 1
+        while j < arm.children.len():
+            body := get_node(arm.children[j])
+            if body.kind == "body" and body.children.len() > 0:
+                ir_tuple_walk_pair_returns.push(ir_unwrap_grouped(body.children[0]))
+            elif body.kind != "guard" and body.kind != "block":
+                ir_tuple_walk_pair_returns.push(ir_unwrap_grouped(arm.children[j]))
+            j = j + 1
+        i = i + 1
+
+fn ir_unwrap_grouped(idx: Int) -> Int:
+    node := get_node(idx)
+    if node.kind == "grouped" and node.children.len() > 0:
+        return ir_unwrap_grouped(node.children[0])
+    return idx
+
+# inside a register-abi callee (see above), a local bound straight from the
+# parameter, `y := x`, shares its box, and so does a bare match binding over
+# it. neither can leave as the box either, so each is judged by walking its
+# own uses: the name is safe when the alias is.
+fn ir_tuple_pair_alias_name(stmt_idx: Int, name: String) -> String:
+    stmt := get_node(stmt_idx)
+    if stmt.kind != "bind" and stmt.kind != "binding":
+        return ""
+    parts := ir_collect_bind_parts(stmt)
+    if parts.type_idx >= 0 or parts.val_idx < 0 or parts.name.len() == 0:
+        return ""
+    val := get_node(ir_unwrap_grouped(parts.val_idx))
+    if val.kind == "ident" and val.value == name:
+        return parts.name
+    return ""
+
+fn ir_tuple_pair_block_safe(node: Node, name: String) -> Bool:
+    for child_idx, ci in node.children:
+        alias := ir_tuple_pair_alias_name(child_idx, name)
+        if alias.len() > 0:
+            mut k := ci + 1
+            while k < node.children.len():
+                if not ir_tuple_pair_child_safe(node.children[k], alias):
+                    return false
+                k = k + 1
+        elif not ir_tuple_pair_child_safe(child_idx, name):
+            return false
+    return true
+
+fn ir_tuple_pair_match_safe(node: Node, name: String) -> Bool:
+    mut i := 1
+    while i < node.children.len():
+        arm := get_node(node.children[i])
+        if arm.children.len() == 0:
+            return false
+        pat := get_node(arm.children[0])
+        mut binding := ""
+        if pat.kind == "pat_binding":
+            binding = pat.value
+        elif pat.kind != "pat_wildcard":
+            return false
+        mut j := 1
+        while j < arm.children.len():
+            if not ir_tuple_pair_child_safe(arm.children[j], name):
+                return false
+            if binding.len() > 0 and not ir_tuple_pair_child_safe(arm.children[j], binding):
+                return false
+            j = j + 1
+        i = i + 1
+    return true
+
+# the walk judges a name by its parent, so a statement or an arm value that
+# is the bare name itself is judged here: safe only in return position.
+fn ir_tuple_pair_child_safe(idx: Int, name: String) -> Bool:
+    node := get_node(idx)
+    if node.kind == "ident" and node.value == name:
+        return ir_tuple_walk_pair_returns.contains(idx)
+    return ir_tuple_uses_all_safe(idx, name, true)
+
+# the declaration of a bare-named function in the module being emitted, or -1.
+# ir_root_items unwraps `pub`, so public declarations resolve too.
+fn ir_tuple_walk_fn_decl(fname: String) -> Int:
+    if ir_tuple_walk_root < 0:
+        return 0 - 1
+    for item_idx in ir_root_items(ir_tuple_walk_root):
+        item := get_node(item_idx)
+        if ir_is_fn_decl_kind(item.kind) and item.value == fname:
+            return item_idx
+    return 0 - 1
+
+# the declared parameter a call argument lands in: a named argument by its own
+# name, a positional one by index among the param nodes. a `mut` or `ref`
+# modifier is folded into the param node's value after a space; such a
+# parameter is not a plain borrow, so the space makes the lookup miss and the
+# argument stays excluded.
+fn ir_tuple_walk_param_name(decl_idx: Int, arg_pos: Int, arg_name: String) -> String:
+    decl := get_node(decl_idx)
+    mut pi := 0
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if arg_name.len() > 0:
+                if cn.value == arg_name:
+                    return arg_name
+            elif pi == arg_pos:
+                if cn.value.split(" ").len() > 1:
+                    return ""
+                return cn.value
+            pi = pi + 1
+    return ""
+
+fn ir_tuple_walk_fn_body(decl_idx: Int) -> Int:
+    decl := get_node(decl_idx)
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "body" and cn.children.len() > 0:
+            return cn.children[0]
+    return 0 - 1
+
+# walk the subtree: every occurrence of ident `name` must appear as the child of
+# a whitelisted parent. any other appearance (bound, returned, matched,
+# iterated, ...) makes cascade unsafe and returns false.
+pub fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
+    node := get_node(idx)
+    # a lambda that mentions the local captures the three-slot shell and retains
+    # only that, never the payload behind it. the closure can outlive this
+    # frame, and then a `.ok` through the captured shell reads memory the
+    # cascade already dropped. capture is not an extraction the walk below can
+    # see, so rule the local out for the whole lambda.
+    if node.kind == "lambda":
+        return not ir_subtree_mentions_ident(idx, name)
+    # a spawned call runs on another task that can outlive this frame, so an
+    # argument there is not a borrow bounded by this function's cleanup order.
+    # any mention below a spawn rules the local out, the same as a capture.
+    if node.kind == "spawn":
+        return not ir_subtree_mentions_ident(idx, name)
+    # the whitelist covers `.ok`/`.err` as READS. on the left of an `=` the same
+    # syntax is a write into the tuple, which would replace the payload the
+    # cascade expects to own, so any mention of the name in an assignment target
+    # rules the local out.
+    if node.kind == "assignment" and node.children.len() > 0:
+        if ir_subtree_mentions_ident(node.children[0], name):
+            return false
+    # a call gets its own walk: the parser wraps every argument in an "arg"
+    # node, so the judgment needs the whole call in view, not the wrapper the
+    # generic loop below would hand ir_tuple_use_is_whitelisted.
+    if node.kind == "call" and node.children.len() > 0:
+        return ir_tuple_call_uses_safe(node, name, is_result)
+    if node.kind == "method_call" and node.children.len() > 0:
+        recv := get_node(node.children[0])
+        if not (recv.kind == "ident" and recv.value == name):
+            return ir_tuple_method_call_uses_safe(idx, node, name, is_result)
+    # a match on an OPTIONAL local reads the shell's flag, and its payload
+    # binding owns its own retained count (taken at bind, tracked by the
+    # prepass, released by the exit cleanup), so the local stays the last
+    # owner of the count the shell arrived with, the same contract as a
+    # `.ok` read. arm bodies are judged by the ordinary rules. a RESULT match
+    # is judged below, since its binding takes no count.
+    if not is_result and node.kind == "match_expr" and node.children.len() > 1:
+        subj := get_node(node.children[0])
+        if subj.kind == "ident" and subj.value == name:
+            mut mi := 1
+            while mi < node.children.len():
+                if not ir_tuple_uses_all_safe(node.children[mi], name, is_result):
+                    return false
+                mi = mi + 1
+            return true
+    # an `if let` / `while let` bare binding on an OPTIONAL local is the same
+    # contract as the match above: the condition reads the shell's flag, and
+    # the payload binding owns its own retained count (taken at bind, tracked
+    # by the prepass, released by the exit cleanup), so the local stays the
+    # last owner of the count the shell arrived with, and its cascade releases
+    # the payload even on the path where the condition fails and the binding
+    # never fires. bodies and the else block are judged by the ordinary
+    # rules. a RESULT subject and a variant pattern stay disqualifying.
+    if not is_result and (node.kind == "if_let" or node.kind == "while_let") and node.children.len() > 1:
+        let_subj := get_node(node.children[1])
+        if let_subj.kind == "ident" and let_subj.value == name:
+            let_pat := get_node(node.children[0])
+            if let_pat.kind == "pat_binding":
+                mut li := 2
+                while li < node.children.len():
+                    if not ir_tuple_uses_all_safe(node.children[li], name, is_result):
+                        return false
+                    li = li + 1
+                return true
+    if ir_tuple_walk_pair_callee and (node.kind == "body" or node.kind == "block"):
+        return ir_tuple_pair_block_safe(node, name)
+    # a match on a RESULT local binds the box itself to a bare arm binding,
+    # with no count of its own. the local stays the last owner as long as
+    # every arm reads the box, under either name, only through the uses the
+    # walk allows. a variant or literal pattern is refused.
+    if is_result and node.kind == "match_expr" and node.children.len() > 1:
+        subj := get_node(ir_unwrap_grouped(node.children[0]))
+        if subj.kind == "ident" and subj.value == name:
+            return ir_tuple_pair_match_safe(node, name)
+    for child_idx in node.children:
+        child := get_node(child_idx)
+        if child.kind == "ident" and child.value == name:
+            if ir_tuple_walk_pair_callee and ir_tuple_walk_pair_returns.contains(child_idx):
+                continue
+            if not ir_tuple_use_is_whitelisted(node, name, is_result):
+                return false
+            # a whitelisted parent consumes this ident safely; its sibling
+            # children are still visited by the loop below
+        else:
+            if not ir_tuple_uses_all_safe(child_idx, name, is_result):
+                return false
+    return true
+
+# true when a result/optional type holds an rc payload worth cascading: either
+# slot (ok/value or err) carries a heap value. all-scalar tuples cascade nothing,
+# so they stay on the cheaper shell-only path.
+pub fn ir_tuple_local_has_rc_payload(tid: Int) -> Bool:
+    info := get_type_info(tid)
+    if info.kind == "result":
+        if ir_rc_kind(ir_result_field_kind(tid, "ok")).len() > 0:
+            return true
+        return ir_rc_kind(ir_result_field_kind(tid, "err")).len() > 0
+    if info.kind == "optional" and info.inner >= 0:
+        return ir_rc_kind(ir_type_from_tid(info.inner)).len() > 0
+    return false
+
+# the ok/value payload kind (slot 8) and error payload kind (slot 16) a tuple
+# local's cascade must release, packed as two ir_tuple_elem_code chars. an
+# optional has no error slot, so its second code is always "0".
+pub fn ir_tuple_cascade_signature(tid: Int) -> String:
+    info := get_type_info(tid)
+    if info.kind == "result":
+        ok_code := ir_tuple_elem_code(ir_rc_kind(ir_result_field_kind(tid, "ok")))
+        err_code := ir_tuple_elem_code(ir_rc_kind(ir_result_field_kind(tid, "err")))
+        return ok_code + err_code
+    if info.kind == "optional" and info.inner >= 0:
+        return ir_tuple_elem_code(ir_rc_kind(ir_type_from_tid(info.inner))) + "0"
+    return "00"
+
+# module-suffixed so each module carries its own copy, exactly like the tuple
+# and struct destructors: no cross-module references, no name clashes.
+# the payload kind an optional over a genuine tuple attaches, or "" when the
+# inner type is not one. a `T??` inner reports kind "optional" rather than
+# "tuple" and is excluded here, which is what keeps the borrowing wrap it
+# needs: an inner shell has an owner of its own.
+#
+# every tuple payload takes the same walk, whatever its elements. an earlier
+# version keyed one destructor per element signature and released each element
+# from the shell, which released them twice: the payload carries its own
+# destructor for its elements already, so the shell releasing the payload runs
+# that walk. it also skipped a payload whose elements are all by-value, which
+# still leaves a heap allocation for the shell to release.
+pub fn ir_optional_tuple_payload_kind(tid: Int) -> String:
+    if tid < 0:
+        return ""
+    if get_type_info(tid).kind != "tuple":
+        return ""
+    ir_optional_tuple_dtor_needed = true
+    return "tuple"
+
+## tuple cascade helper name.
+pub fn ir_tuple_cascade_helper_name(sig: String) -> String:
+    return "__tuple_cascade_" + sig + "_m" + ir_module_count.to_string()
+
+## tuple stack cascade helper name.
+pub fn ir_tuple_stack_cascade_helper_name(sig: String) -> String:
+    return "__tuple_stack_cascade_" + sig + "_m" + ir_module_count.to_string()
+
+## result arg release helper name.
+pub fn ir_result_arg_release_helper_name(sig: String) -> String:
+    return "__result_arg_release_" + sig + "_m" + ir_module_count.to_string()
+
+# whether a bare-name assignment writes a module-level global's slot. that
+# slot owns a count on whatever it holds. nothing else releases it, not the
+# function's exit cleanup (globals are not locals) and not the store itself,
+# so the assignment has to drop the outgoing value the way a local rebind
+# does, or every value the global ever held is stranded along with everything
+# it owned. a threadlocal global counts: its per-thread slot owns its value
+# just the same, and nothing releases that either.
+#
+# two spellings do NOT write the global slot even when a global shares the
+# name, and both must stay out: a `for` variable, whose own slot holds a
+# borrowed element, and a local or parameter shadowing the global, whose
+# ownership the tracked-locals list already accounts for. releasing either
+# would be an over-release of a count this function never took.
+pub fn ir_assign_targets_global_slot(name: String) -> Bool:
+    if ir_loop_var_slot(name).len() > 0 or ir_name_is_func_local(name):
+        return false
+    if ir_global_slot_names.contains(name):
+        return true
+    # a `mut` global imported by name (`from store import items`) is a global
+    # slot too. without this an assignment to one skipped the release of the
+    # value it replaced, leaking it, and skipped the share marking every
+    # other global store gets.
+    return ir_import_mutable_global_symbols.contains_key(ir_resolve_storage_name(name))
+
+## result unshare helper name.
+pub fn ir_result_unshare_helper_name(sig: String) -> String:
+    return "__result_unshare_" + sig + "_m" + ir_module_count.to_string()
+
+# every node whose value is the name: idents, bindings, loop variables and
+# pattern bindings alike. a method that happens to share the name counts
+# too, which can only make the caller more cautious.
+# an operator node's value is the operator ("add", "mul", "and"), not a name,
+# so a local spelled like one is not counted at every operator.
+pub fn ir_count_name_nodes(idx: Int, name: String) -> Int:
+    node := get_node(idx)
+    mut n := 0
+    if node.value == name and node.kind != "binary" and node.kind != "unary":
+        n = 1
+    for child in node.children:
+        n = n + ir_count_name_nodes(child, name)
+    return n
+
+# calls whose callee is the bare name, not counting any inside a lambda or a
+# spawn, whose wrapper takes the closure along to another task.
+pub fn ir_count_direct_calls(idx: Int, name: String) -> Int:
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return 0
+    mut n := 0
+    if node.kind == "call" and node.children.len() > 0:
+        callee := get_node(node.children[0])
+        if callee.kind == "ident" and callee.value == name:
+            n = 1
+    for child in node.children:
+        n = n + ir_count_direct_calls(child, name)
+    return n
+
+# true when every name the lambda reads, other than its params and the
+# functions it calls, has a type without a count. a nested lambda is turned
+# away rather than walked.
+pub fn ir_lambda_reads_uncounted(lambda_idx: Int) -> Bool:
+    parts := ir_collect_lambda_parts(lambda_idx)
+    if parts.body_idx < 0:
+        return false
+    return ir_subtree_reads_uncounted(parts.body_idx, parts.params)
+
+fn ir_subtree_reads_uncounted(idx: Int, params: List[String]) -> Bool:
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "self":
+        return false
+    if node.kind == "ident" and not params.contains(node.value):
+        tid := c_get_expr_type(idx)
+        if tid < 0 or ir_rc_kind(ir_type_from_tid(tid)).len() > 0:
+            return false
+    mut i := 0
+    while i < node.children.len():
+        # skip only free-function callees; a local or param callee is a captured
+        # closure variable and must be checked like any other captured ident.
+        mut skip_callee := false
+        if node.kind == "call" and i == 0 and node_kind(node.children[0]) == "ident":
+            cname := node_value(node.children[0])
+            if not params.contains(cname) and not ir_var_regs.contains_key(cname) and not ir_name_is_func_local(cname):
+                skip_callee = true
+        if not skip_callee:
+            if not ir_subtree_reads_uncounted(node.children[i], params):
+                return false
+        i = i + 1
+    return true
+
+# true when a node's packed value string ("item, i", "x mut") names `name`.
+pub fn ir_value_mentions_name(value: String, name: String) -> Bool:
+    for part in value.replace(",", " ").split(" "):
+        if part.trim() == name:
+            return true
+    return false
+
+# whether a bare name reads a `mut` global, this module's or an imported one,
+# rather than a local, a parameter or a loop variable of the same spelling.
+# the name resolves the way its load does (ir_resolve_storage_name).
+pub fn ir_reads_mutable_global(name: String) -> Bool:
+    if ir_loop_var_slot(name).len() > 0 or ir_name_is_func_local(name):
+        return false
+    sym := ir_resolve_storage_name(name)
+    if ir_import_mutable_global_symbols.contains_key(sym):
+        return true
+    return sym == ir_global_storage_symbol(name) and ir_mutable_global_names.contains_key(name)
+
+# the same hazard without a user callee: an operand read out of storage is
+# still only a borrow when an operand evaluated after it runs code that can
+# drop its owner, and the operation reads it after that. `o.name +
+# rename(o)` and `m.insert(o.name, rename(o))` freed the read before the
+# concat or the insert used it. for each operand, whether a later one can
+# drop a value a field, an element or a global holds
+# (ir_subtree_keeps_storage); such an operand is pinned like an argument.
+pub fn ir_later_operands_drop(exprs: List[Int]) -> List[Bool]:
+    mut out: List[Bool] := []
+    for e in exprs:
+        out.push(false)
+    mut drops := false
+    mut i := exprs.len() - 1
+    while i >= 0:
+        out[i] = drops
+        if not drops and exprs[i] >= 0 and not ir_subtree_keeps_storage(exprs[i], 0 - 1, 0 - 1):
+            drops = true
+        i = i - 1
+    return out
+
+# true when calling the callee at callee_idx can run user code. a bare name
+# that is neither declared, nor imported, nor a variable holding a function
+# is a builtin. a name brought in with `from m import f` is declared under
+# its target's name, not the written one, so it is found through the renames.
+pub fn ir_callee_runs_user_code(callee_idx: Int) -> Bool:
+    callee := get_node(callee_idx)
+    if callee.kind != "ident":
+        return true
+    name := callee.value
+    if ir_import_renames.contains_key(name):
+        return true
+    return ir_is_declared_callable(name) or ir_name_is_func_local(name) or ir_loop_var_slot(name).len() > 0 or ir_global_slot_names.contains(name)
+
+# the ok payload kind of a method that returns a result, resolved through
+# the impl's associated-type bindings the same way its header type is.
+fn ir_method_result_ok_kind(impl_type: String, method_idx: Int) -> String:
+    node := get_node(method_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(ir_alias_target_node(returns_child))
+                if rn.kind == "result_type" and rn.children.len() > 0:
+                    return ir_retkind(ir_resolve_assoc_type(impl_type, ir_resolve_type_node(rn.children[0])))
+    return ""
+
+# register a plain-impl method for the register ABI when its result shape
+# fits. a generic impl target is excluded the same way a generic function is:
+# its methods re-emit per specialization while this registry keys the base
+# name. beyond that the gate matches the free-function one exactly, including
+# the lambda/spawn body exclusion (see ir_maybe_register_result_reg for the
+# rationale).
+#
+# a method of an interface impl (`impl Iface for T`) does not take the pair
+# on its own: its defaults are shared fn_decl nodes emitted once per
+# conforming type, and its methods back generic bounds whose bodies re-emit
+# under specialized names. a same-named method in the type's own impl
+# compiles to the same symbol, and that one does take the pair when every
+# body under the symbol fits, whichever impl is registered first. direct
+# calls then use the pair, and an interface value's slot points at an
+# adapter that boxes the result (ir_interface_slot_target).
+pub fn ir_maybe_register_result_reg_method(impl_node: Node, impl_type: String, method_idx: Int, method_node: Node, module_path: String):
+    if not ir_result_reg_enabled():
+        return
+    mut full_name := impl_type + "_" + method_node.value
+    if module_path.len() > 0:
+        full_name = ir_import_impl_method_name(module_path, impl_type, method_node.value)
+    ok_kind := ir_result_reg_method_ok_kind(impl_type, method_idx, method_node)
+    if ok_kind.len() == 0:
+        ir_result_reg_blocked.insert(full_name, true)
+        if ir_result_reg_funcs.contains_key(full_name):
+            ir_result_reg_funcs.remove(full_name)
+            ir_func_result_ok_kinds.remove(full_name)
+        return
+    if ir_impl_interface_base(impl_node).len() > 0 or ir_result_reg_blocked.contains_key(full_name):
+        return
+    ir_result_reg_funcs.insert(full_name, true)
+    ir_func_result_ok_kinds.insert(full_name, ok_kind)
+
+# the ok payload kind a method returns in the register pair, or "" when the
+# method does not fit it.
+fn ir_result_reg_method_ok_kind(impl_type: String, method_idx: Int, method_node: Node) -> String:
+    if impl_type.contains("[") or ir_has_generic_params(method_node):
+        return ""
+    if ir_resolve_assoc_type(impl_type, ir_extract_return_type(method_idx)) != "tuple":
+        return ""
+    ok_kind := ir_method_result_ok_kind(impl_type, method_idx)
+    if not ir_result_reg_ok_kind_fits(ok_kind):
+        return ""
+    for child_idx in method_node.children:
+        if ir_node_contains_lambda_or_spawn(child_idx):
+            return ""
+    return ok_kind
+
+# whether a receive arm's value is its bound name itself, which hands the
+# received shell's count on as the select's value
+pub fn ir_select_arm_returns_binding(body_idx: Int, bind_name: String) -> Bool:
+    mut value_idx := body_idx
+    body := get_node(body_idx)
+    if body.kind == "body" and body.children.len() > 0:
+        value_idx = body.children[0]
+    value := get_node(value_idx)
+    return value.kind == "ident" and value.value == bind_name
+
+## parsed parts of a lambda literal (parameters, body, captures, return type).
+pub struct LambdaParts:
+    pub params: List[String]
+    pub param_types: List[String]
+    pub body_idx: Int
+    pub captures: List[String]
+    # the lambda's declared return kind and, when that is an optional, its
+    # inner kind. both are "" when the lambda declares no return type, which
+    # leaves the body emitting exactly as it did before annotations existed.
+    pub ret_kind: String
+    pub ret_inner: String
+
+## collect lambda parts.
+pub fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
+    mut params: List[String] := []
+    mut param_types: List[String] := []
+    mut body_idx := 0 - 1
+    mut ret_kind := ""
+    mut ret_inner := ""
+    mut i := 0
+    while i < node_child_count(idx):
+        child := node_child(idx, i)
+        cn := get_node(child)
+        if cn.kind == "param":
+            mut pname := cn.value
+            if pname.ends_with(" mut"):
+                pname = pname.substring(0, pname.len() - 4)
+            params.push(pname)
+            param_types.push(ir_extract_param_type(child))
+        elif cn.kind == "body" or cn.kind == "block":
+            body_idx = child
+        elif cn.kind == "returns":
+            if cn.children.len() > 0:
+                ret_kind = ir_resolve_type_node(cn.children[0])
+                ret_inner = ir_optional_inner_type_of_node(cn.children[0])
+        i = i + 1
+    mut captures: List[String] := []
+    if body_idx >= 0:
+        captures = ir_find_free_vars(body_idx, params)
+    return LambdaParts(params, param_types, body_idx, captures, ret_kind, ret_inner)
+
+## ident is function value.
+pub fn ir_ident_is_function_value(idx: Int, name: String) -> Bool:
+    if ir_var_regs.contains_key(name) or ir_var_types.contains_key(name):
+        return false
+    callee := ir_ident_callee(name)
+    return ir_is_declared_callable(callee.name)
+
+# --- the fused map update ---
+#
+# `m[k] = m[k] + d` and `m.insert(k, m[k] + d)` are one update written as two
+# operations: a strict read of a slot and a store back into the same slot.
+# each one hashes the key and probes the table for it, and the shape is
+# usually guarded by a `contains_key` that hashed it once more. the runtime
+# has an entry point that reads and writes in a single probe, so recognizing
+# the shape here takes an update from three hashes to two.
+#
+# the rewrite is only safe under conditions the recognizer checks:
+#
+#   * both map expressions and both key expressions have to be the same
+#     side-effect-free expression, so evaluating each once rather than twice
+#     cannot change what the program does. a call anywhere inside either is
+#     enough to say no.
+#   * the delta has to be side-effect-free too. the unfused form reads the
+#     old value before evaluating the delta and the fused form reads it
+#     after, so a delta that could write the same slot would see one answer
+#     in one form and another in the other.
+#   * the map's values have to be integers. the runtime adds the stored word
+#     with wrapping arithmetic, which is what the `add` instruction does, and
+#     an integer-valued map holds no reference counts, so no count changes
+#     hands on the fused path.
+#   * inside a `T!` function whose miss propagates (`ir_current_func_miss_fails`),
+#     the emitter calls `map_try_upsert_add*` and branches on a miss to
+#     `ir_emit_miss_return("index out of bounds")`, matching `m[k]`'s error
+#     propagation while keeping the hit path at one hash and one probe. in
+#     non-fallible functions (and `T!E` functions with a non-String error type),
+#     `map_upsert_add*` aborts on miss as the strict read does.
+#
+# an expression kind that can only read: nothing here calls anything, indexes
+# anything, or allocates. the list is deliberately short, because everything
+# it admits gets evaluated a different number of times than the program wrote.
+fn ir_pure_read_kind(kind: String) -> Bool:
+    if kind == "ident" or kind == "self":
+        return true
+    if kind == "int_lit" or kind == "int" or kind == "integer":
+        return true
+    if kind == "string_lit" or kind == "string" or kind == "str_lit":
+        return true
+    if kind == "field_access":
+        return true
+    return false
+
+# true when the expression reads and does nothing else, all the way down.
+pub fn ir_pure_read_expr(idx: Int) -> Bool:
+    node := get_node(idx)
+    if not ir_pure_read_kind(node.kind):
+        return false
+    for child in node.children:
+        if not ir_pure_read_expr(child):
+            return false
+    return true
+
+# true when the two expressions are the same pure read: same kinds, same
+# names, same shape. Two identical reads of the same names in the same scope
+# name the same thing, which is what lets the fused form evaluate one of them.
+fn ir_same_pure_read(a_idx: Int, b_idx: Int) -> Bool:
+    a := get_node(a_idx)
+    b := get_node(b_idx)
+    if a.kind != b.kind or a.value != b.value:
+        return false
+    if not ir_pure_read_kind(a.kind):
+        return false
+    if a.children.len() != b.children.len():
+        return false
+    mut i := 0
+    while i < a.children.len():
+        if not ir_same_pure_read(a.children[i], b.children[i]):
+            return false
+        i = i + 1
+    return true
+
+# the delta in a value expression of the form `m[k] + d`, where `m[k]` reads
+# the very slot being written, or -1 for any other shape.
+pub fn ir_upsert_delta_idx(map_idx: Int, key_idx: Int, value_idx: Int) -> Int:
+    value := get_node(value_idx)
+    if value.kind != "binary" or value.value != "add" or value.children.len() < 2:
+        return 0 - 1
+    read := get_node(value.children[0])
+    if read.kind != "index" or read.children.len() < 2:
+        return 0 - 1
+    if not ir_same_pure_read(read.children[0], map_idx):
+        return 0 - 1
+    if not ir_same_pure_read(read.children[1], key_idx):
+        return 0 - 1
+    if not ir_pure_read_expr(value.children[1]):
+        return 0 - 1
+    if ir_checked_index_type(value.children[0]) != "int":
+        return 0 - 1
+    return value.children[1]
+
+# the one statement a branch body holds, unwrapping block wrappers, or -1
+# when it holds anything other than exactly one statement.
+pub fn ir_single_stmt(idx: Int) -> Int:
+    kind := node_kind(idx)
+    if kind == "block" or kind == "then" or kind == "else" or kind == "body":
+        if node_child_count(idx) != 1:
+            return 0 - 1
+        return ir_single_stmt(node_child(idx, 0))
+    return idx
+
+# true when the statement assigns to `m[k]` for this map and key, with `=`
+# or with the compound operator `op` ("=" for a plain store).
+fn ir_stores_map_slot(stmt: Node, map_idx: Int, key_idx: Int, op: String) -> Bool:
+    if stmt.children.len() < 2:
+        return false
+    if stmt.kind == "assign":
+        if op != "=":
+            return false
+    elif stmt.kind == "assignment":
+        if stmt.value != op:
+            return false
+    else:
+        return false
+    target := get_node(stmt.children[0])
+    if target.kind != "index" or target.children.len() < 2:
+        return false
+    return ir_same_pure_read(target.children[0], map_idx) and ir_same_pure_read(target.children[1], key_idx)
+
+# the value `m.insert(k, v)` stores, for this map and key, or -1.
+fn ir_inserted_map_value(stmt: Node, map_idx: Int, key_idx: Int) -> Int:
+    if stmt.kind != "method_call" or ir_plain_method_name(stmt.value) != "insert" or stmt.children.len() != 3:
+        return 0 - 1
+    if not ir_same_pure_read(stmt.children[0], map_idx):
+        return 0 - 1
+    arg_key := ir_method_call_arg_expr(stmt, 0)
+    if arg_key < 0 or not ir_same_pure_read(arg_key, key_idx):
+        return 0 - 1
+    return ir_method_call_arg_expr(stmt, 1)
+
+# the delta the update arm adds to `m[k]`, or -1 when the arm is not an
+# integer update of that slot.
+pub fn ir_count_update_delta(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
+    stmt := get_node(stmt_idx)
+    mut value_idx := ir_inserted_map_value(stmt, map_idx, key_idx)
+    if value_idx < 0 and ir_stores_map_slot(stmt, map_idx, key_idx, "="):
+        value_idx = stmt.children[1]
+    if value_idx >= 0:
+        if ir_fused_add_declines(c_get_expr_type(value_idx)):
+            return 0 - 1
+        return ir_upsert_delta_idx(map_idx, key_idx, value_idx)
+    if not ir_stores_map_slot(stmt, map_idx, key_idx, "+="):
+        return 0 - 1
+    target_idx := stmt.children[0]
+    if ir_checked_index_type(target_idx) != "int":
+        return 0 - 1
+    if ir_fused_add_declines(c_get_expr_type(target_idx)):
+        return 0 - 1
+    if not ir_pure_read_expr(stmt.children[1]):
+        return 0 - 1
+    return stmt.children[1]
+
+# the value the insert arm stores under `m[k]`, or -1.
+pub fn ir_count_insert_value(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
+    stmt := get_node(stmt_idx)
+    mut value_idx := ir_inserted_map_value(stmt, map_idx, key_idx)
+    if value_idx < 0 and ir_stores_map_slot(stmt, map_idx, key_idx, "="):
+        value_idx = stmt.children[1]
+    if value_idx < 0 or not ir_pure_read_expr(value_idx):
+        return 0 - 1
+    if ir_fused_add_declines(c_get_expr_type(value_idx)):
+        return 0 - 1
+    return value_idx
+
+# whether `idx` is a length: a `.len()` call, or a local bound once to one.
+# a length is far below the largest Int, so `i <= n` bounds i as tightly as
+# `i < n` does for the purpose of one step.
+fn ir_is_length_bound(idx: Int) -> Bool:
+    n := get_node(idx)
+    if n.kind == "method_call":
+        return ir_plain_method_name(n.value) == "len" and n.children.len() == 1
+    if n.kind != "ident":
+        return false
+    defs := get_definition_of()
+    if not defs.contains_key(idx):
+        return false
+    decl := get_node(defs[idx])
+    if decl.kind != "binding" or decl.value.contains(" mut") or decl.children.len() == 0:
+        return false
+    return ir_is_length_bound(decl.children[decl.children.len() - 1])
+
+# the Int locals a while condition bounds: "i+" for one bounded above
+# (`i < e`, `e > i`, or `i <= n` for a length n) and "i-" for one bounded
+# below (`i > e`, `e < i`), looking through `and`. `a < b` bounds both
+# sides when both are locals: a is below b, and b above a.
+fn ir_counter_candidates(cond_idx: Int, out: List[String]):
+    n := get_node(cond_idx)
+    if n.kind != "binary" or n.children.len() != 2:
+        return
+    if n.value == "and":
+        ir_counter_candidates(n.children[0], out)
+        ir_counter_candidates(n.children[1], out)
+        return
+    left := n.children[0]
+    right := n.children[1]
+    if n.value == "lt" or n.value == "gt":
+        mut below := left
+        mut above := right
+        if n.value == "gt":
+            below = right
+            above = left
+        if node_kind(below) == "ident" and get_type_name(c_get_expr_type(below)) == "Int":
+            out.push(node_value(below) + "+")
+        if node_kind(above) == "ident" and get_type_name(c_get_expr_type(above)) == "Int":
+            out.push(node_value(above) + "-")
+    elif n.value == "lte" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int" and ir_is_length_bound(right):
+        out.push(node_value(left) + "+")
+    elif n.value == "gte" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int" and ir_is_length_bound(left):
+        out.push(node_value(right) + "+")
+
+# whether `n` is `name + 1` (dir "+") or `name - 1` (dir "-")
+fn ir_is_counter_step_sum(n: Node, name: String, dir: String) -> Bool:
+    mut op := "add"
+    if dir == "-":
+        op = "sub"
+    if n.kind != "binary" or n.value != op or n.children.len() != 2:
+        return false
+    return node_kind(n.children[0]) == "ident" and node_value(n.children[0]) == name and node_kind(n.children[1]) == "int_lit" and node_value(n.children[1]) == "1"
+
+# the node to mark when assignment `idx` steps `name` by one in direction
+# `dir` ("+" or "-"): the binary of `i = i + 1`, or the `i += 1` itself.
+# -1 for any other assignment.
+fn ir_counter_step_node(idx: Int, name: String, dir: String) -> Int:
+    n := get_node(idx)
+    rhs := get_node(n.children[1])
+    if (n.value == dir + "=") and rhs.kind == "int_lit" and rhs.value == "1":
+        return idx
+    if n.value == "=" and ir_is_counter_step_sum(rhs, name, dir):
+        return n.children[1]
+    return 0 - 1
+
+# the statements of a block, or the node alone when it is one statement. an
+# `if` branch is a `then` holding one `block`, which runs the same
+# statements in the same order, so a block that holds only a block is read
+# through.
+fn ir_block_statements(idx: Int) -> List[Int]:
+    kind := node_kind(idx)
+    if kind == "block" or kind == "then" or kind == "else" or kind == "body":
+        children := get_node(idx).children
+        if children.len() == 1:
+            inner := node_kind(children[0])
+            if inner == "block" or inner == "then" or inner == "else" or inner == "body":
+                return ir_block_statements(children[0])
+        return children
+    return [idx]
+
+# mark the `name + 1` (or `name - 1`) sums in the subtree at idx. a deferred
+# statement runs at the end of its block, and a lambda or a spawned task may
+# run later still, so their subtrees are left alone.
+fn ir_mark_counter_sums(idx: Int, name: String, dir: String):
+    n := get_node(idx)
+    if n.kind == "defer" or n.kind == "errdefer" or n.kind == "lambda" or n.kind == "spawn":
+        return
+    if ir_is_counter_step_sum(n, name, dir):
+        ir_counter_steps.insert(idx, true)
+    for child in n.children:
+        ir_mark_counter_sums(child, name, dir)
+
+# mark the sums of a while counter in the statements of the body before its
+# step, when the step `step` marks is one of the body's own statements. the
+# condition was tested on the way in, and nothing before the step writes the
+# counter, so it is still within the bound there and `i + 1` (or `i - 1` for
+# a counter stepped down) stays in range, as the step itself does.
+fn ir_mark_counter_uses(body_idx: Int, step: Int, name: String, dir: String):
+    stmts := ir_block_statements(body_idx)
+    mut k := 0
+    while k < stmts.len():
+        stmt := stmts[k]
+        if stmt == step or (node_kind(stmt) == "assignment" and node_child_count(stmt) == 2 and node_child(stmt, 1) == step):
+            mut j := 0
+            while j < k:
+                ir_mark_counter_sums(stmts[j], name, dir)
+                j = j + 1
+            return
+        k = k + 1
+
+# mark the step an `if` branch takes on a name its condition bounds the way
+# a while condition does (ir_counter_candidates). with `x > e` true on the
+# way in, x is above the smallest Int, so the first `x = x - 1` of the
+# branch stays in range, and `x < e` does the same for `x + 1`. the step
+# must be one of the branch's own statements, since one in a nested block
+# may sit in a loop or a defer, and no statement before it may write x.
+pub fn ir_mark_guarded_steps(cond_idx: Int, body_idx: Int):
+    mut candidates: List[String] := []
+    ir_counter_candidates(cond_idx, candidates)
+    for cand in candidates:
+        name := cand.substring(0, cand.len() - 1)
+        dir := cand.substring(cand.len() - 1, cand.len())
+        if ir_assign_targets_global_slot(name):
+            continue
+        for stmt in ir_block_statements(body_idx):
+            mut found: List[Int] := []
+            ir_counter_assignments(stmt, name, dir, false, found)
+            if found.len() > 0:
+                if node_kind(stmt) == "assignment" and found.len() == 1 and found[0] >= 0:
+                    ir_counter_steps.insert(found[0], true)
+                break
+
+# the assignments to `name` in a loop body, as the step nodes they would
+# mark, with -1 for one that cannot be marked: one that is not a step of
+# one, one inside a nested loop or a closure (which may run it more than
+# once between two tests of the condition), or a new binding of the name.
+# a name is one slot for the whole function, so an `if let`, `while let` or
+# `match` payload of the same name would write the counter too, and so would a
+# parameter of that name. the checker rejects such a payload (E262), and the
+# rule stays so the proof does not lean on that.
+fn ir_counter_assignments(idx: Int, name: String, dir: String, nested: Bool, out: List[Int]):
+    n := get_node(idx)
+    if ir_is_binding_kind(n.kind) and ir_binding_name(n) == name:
+        out.push(0 - 1)
+    if (n.kind == "pat_binding" or n.kind == "param") and n.value == name:
+        out.push(0 - 1)
+    if n.kind == "for" or n.kind == "for_stmt":
+        names := ir_for_binding_names(n)
+        if names.value_name == name or names.index_name == name:
+            out.push(0 - 1)
+    if n.kind == "assignment" and n.children.len() == 2 and node_kind(n.children[0]) == "ident" and node_value(n.children[0]) == name:
+        if nested:
+            out.push(0 - 1)
+        else:
+            out.push(ir_counter_step_node(idx, name, dir))
+    inner := nested or n.kind == "lambda" or n.kind == "while" or n.kind == "while_stmt" or n.kind == "while_let" or n.kind == "for" or n.kind == "for_stmt"
+    for child in n.children:
+        ir_counter_assignments(child, name, dir, inner, out)
+
+# mark the counter steps of a while loop that cannot overflow. with `i < e`
+# tested before every iteration, i is below the largest Int when the body
+# starts, so one `i = i + 1` in it stays in range; `i > e` does the same for
+# `i - 1`. that holds only when the step is the one assignment to i the body
+# makes per test of the condition: a second step, or one in a nested loop,
+# could pass the bound. a local cannot change behind the loop's back, since
+# a closure cannot assign what it captures (E269), so the body is the only
+# place to look.
+pub fn ir_mark_counter_steps(cond_idx: Int, body_idx: Int):
+    mut candidates: List[String] := []
+    ir_counter_candidates(cond_idx, candidates)
+    for cand in candidates:
+        name := cand.substring(0, cand.len() - 1)
+        dir := cand.substring(cand.len() - 1, cand.len())
+        if ir_assign_targets_global_slot(name):
+            continue
+        mut found: List[Int] := []
+        ir_counter_assignments(body_idx, name, dir, false, found)
+        if found.len() == 1 and found[0] >= 0:
+            ir_counter_steps.insert(found[0], true)
+            ir_mark_counter_uses(body_idx, found[0], name, dir)
+
+# true when the subtree has an `=` or compound assignment whose target
+# mentions name, including an index or field write through it
+pub fn ir_subtree_assigns_name(idx: Int, name: String) -> Bool:
+    node := get_node(idx)
+    if node.kind == "assign":
+        if node.value == name:
+            return true
+        if node.children.len() >= 2 and ir_subtree_mentions_ident(node.children[0], name):
+            return true
+    if node.kind == "assignment" and node.children.len() > 0:
+        if ir_subtree_mentions_ident(node.children[0], name):
+            return true
+    for child_idx in node.children:
+        if ir_subtree_assigns_name(child_idx, name):
+            return true
+    return false
+
+# an index `xs[i + 1]` or `xs[i - 1]` into a list, a Bytes or a String, with
+# a constant offset under 2^32, needs no overflow check of its own: a sum that
+# wrapped would land near the far end of the Int range, which the index's
+# bounds check refuses, so the program still stops. a map key has no bounds
+# check, and a wrapped key would read another entry, so it keeps the check.
+# nodes are scanned once, as each parse adds them to the arena, for the shape
+# alone; ir_index_offset_unchecked tests the types.
+pub fn ir_mark_index_offsets():
+    end := node_count()
+    mut idx := ir_index_offsets_scanned
+    while idx < end:
+        n := get_node(idx)
+        if n.kind == "index" and n.children.len() == 2:
+            offset := get_node(n.children[1])
+            if offset.kind == "binary" and (offset.value == "add" or offset.value == "sub") and offset.children.len() == 2:
+                lit := get_node(offset.children[1])
+                if lit.kind == "int_lit" and lit.value.len() < 10:
+                    ir_index_offset_targets.insert(n.children[1], n.children[0])
+        idx = idx + 1
+    ir_index_offsets_scanned = end
+
+## index offset unchecked.
+pub fn ir_index_offset_unchecked(idx: Int) -> Bool:
+    if not ir_index_offset_targets.contains_key(idx):
+        return false
+    target_tid := c_get_expr_type(ir_index_offset_targets[idx])
+    target_name := get_type_name(target_tid)
+    if get_type_info(target_tid).kind != "list" and target_name != "Bytes" and target_name != "String":
+        return false
+    return get_type_name(c_get_expr_type(node_child(idx, 0))) == "Int"

@@ -1,0 +1,293 @@
+# ir_common.pith - naming, utility, control-flow, and cached AST helpers for IR lowering
+
+from ast import get_node, Node
+from ir_ast_helpers import ir_is_string_literal_kind, ir_unwrap_pub_child
+
+# --- symbol naming helpers ---
+
+# the name an `import a.b.c` binds when the import writes no `as`
+# clause: the last dotted segment, or the whole path when it has no
+# dot. this is the key the module-alias table is filled under, so a
+# later `c.foo` resolves back to the full path.
+pub fn ir_module_default_alias(module_path: String) -> String:
+    mut last_dot := 0 - 1
+    mut i := 0
+    while i < module_path.len():
+        if module_path[i] == ".":
+            last_dot = i
+        i = i + 1
+    if last_dot < 0:
+        return module_path
+    return module_path.substring(last_dot + 1, module_path.len())
+
+# the symbol prefix every IR name from this module carries: the path
+# with dots turned into underscores, plus a trailing underscore. an
+# empty path gives an empty prefix, so a symbol declared in the module
+# being emitted keeps its bare written name.
+pub fn ir_import_symbol_prefix(module_path: String) -> String:
+    if module_path.len() == 0:
+        return ""
+    mut prefix := ""
+    mut i := 0
+    while i < module_path.len():
+        if module_path[i] == ".":
+            prefix = prefix + "_"
+        else:
+            prefix = prefix + module_path[i]
+        i = i + 1
+    return prefix + "_"
+
+# the storage symbol a module-level global is emitted under. the IR
+# namespace is flat and the consumer resolves a bare `load`/`store`
+# operand to a global's data slot whenever one exists, so a global
+# emitted under its written name shares that namespace with every
+# local, parameter and pattern binding in the build.
+pub fn ir_global_storage_symbol(name: String) -> String:
+    return "__g_" + name
+
+# the flat IR symbol a name declared in module_path is emitted as.
+pub fn ir_import_target_name(module_path: String, name: String) -> String:
+    return ir_import_symbol_prefix(module_path) + name
+
+# a declaration's name with any generic parameter list cut off, so
+# `Box[T]` becomes `Box`.
+pub fn ir_base_decl_name(name: String) -> String:
+    if name.contains("["):
+        return name.substring(0, name.index_of("["))
+    return name
+
+# the IR symbol for a method defined in another module's impl block.
+# methods are flattened to `Type_method` before the module prefix goes on.
+pub fn ir_import_impl_method_name(module_path: String, impl_type: String, method_name: String) -> String:
+    return ir_import_target_name(module_path, impl_type + "_" + method_name)
+
+# --- small list, encoding, and parsing utilities ---
+
+# append to a list and hand it back, for the `xs = ir_push_string(xs, v)`
+# form the emitter's module-level stacks are written in. mutates in place.
+pub fn ir_push_string(items: List[String], value: String) -> List[String]:
+    mut updated: List[String] := items
+    updated.push(value)
+    return updated
+
+# the Int twin of ir_push_string, used for the defer-scope depth stacks.
+pub fn ir_push_int(items: List[Int], value: Int) -> List[Int]:
+    mut updated: List[Int] := items
+    updated.push(value)
+    return updated
+
+# build a new list containing every element of `items` except `drop`.
+pub fn ir_remove_string(items: List[String], drop: String) -> List[String]:
+    mut out: List[String] := []
+    for item in items:
+        if item != drop:
+            out.push(item)
+    return out
+
+# flatten node indices to one tab-separated string so the tree cache can
+# keep them in a List[String] instead of a list of lists.
+pub fn ir_encode_int_list(items: List[Int]) -> String:
+    mut encoded: List[String] := []
+    for item in items:
+        encoded.push(item.to_string())
+    return encoded.join(chr(9))
+
+fn ir_parse_cached_int(text: String) -> Int:
+    mut value := 0
+    mut i := 0
+    while i < text.len():
+        value = (value * 10) + (ord(text[i]) - ord("0"))
+        i = i + 1
+    return value
+
+# the tuple position a field name denotes, or -1 when the name is not all
+# digits.
+pub fn ir_parse_field_index(text: String) -> Int:
+    if text.len() == 0:
+        return 0 - 1
+    mut value := 0
+    mut i := 0
+    while i < text.len():
+        ch := text[i]
+        code := ord(ch)
+        if code < 48 or code > 57:
+            return 0 - 1
+        value = (value * 10) + (code - 48)
+        i = i + 1
+    return value
+
+# the inverse of ir_encode_int_list. builds a fresh list on every call.
+pub fn ir_decode_int_list(encoded: String) -> List[Int]:
+    mut decoded: List[Int] := []
+    if encoded.len() == 0:
+        return decoded
+    parts := encoded.split(chr(9))
+    for part in parts:
+        decoded.push(ir_parse_cached_int(part))
+    return decoded
+
+# an element-by-element copy of a name-to-register map.
+pub fn ir_copy_var_regs(src: Map[String, Int]) -> Map[String, Int]:
+    mut copy: Map[String, Int] := {}
+    for key in src.keys():
+        copy.insert(key, src[key])
+    return copy
+
+# an element-by-element copy of a name-to-type map.
+pub fn ir_copy_var_types(src: Map[String, String]) -> Map[String, String]:
+    mut copy: Map[String, String] := {}
+    for key in src.keys():
+        copy.insert(key, src[key])
+    return copy
+
+# read back a field position from ir_struct_field_index_lookup, which
+# stores each "Struct.field" index as a decimal string.
+pub fn ir_unpack_field_index(meta: String) -> Int:
+    mut value := 0
+    mut i := 0
+    while i < meta.len():
+        value = (value * 10) + (ord(meta[i]) - ord("0"))
+        i = i + 1
+    return value
+
+# --- statement and control-flow AST destructuring ---
+
+# the two halves of one `if` or `elif`: the condition and the body, as
+# arena indices.
+pub struct IrIfBranch:
+    pub cond_idx: Int
+    pub body_idx: Int
+
+# the names a `for` loop binds: the element, and the index when the
+# loop declares one. `index_name` is "" for the single-binding form.
+pub struct IrForBindingNames:
+    pub value_name: String
+    pub index_name: String
+
+# a binding statement taken apart: the name, the initializer, and the
+# written type annotation (`type_idx` is negative when absent).
+pub struct IrBindParts:
+    pub name: String
+    pub val_idx: Int
+    pub type_idx: Int
+
+# true for the node kinds that are expressions even when they stand
+# alone as a statement.
+pub fn ir_stmt_is_expr(kind: String) -> Bool:
+    if kind == "call" or kind == "method_call" or kind == "spawn":
+        return true
+    if kind == "await" or kind == "try" or kind == "try_expr":
+        return true
+    if kind == "catch_expr" or kind == "catch_block":
+        return true
+    if kind == "select_expr":
+        return true
+    if kind == "match_expr":
+        return true
+    return kind == "fail"
+
+# pick the condition and the body out of one arm of an if chain.
+pub fn ir_collect_if_branch(node: Node) -> IrIfBranch:
+    mut cond_idx := 0 - 1
+    mut body_idx := 0 - 1
+    for child in node.children:
+        cn := get_node(child)
+        if cond_idx < 0 and cn.kind != "then" and cn.kind != "else" and cn.kind != "elif" and cn.kind != "block":
+            cond_idx = child
+        elif cn.kind == "then" or cn.kind == "block":
+            body_idx = child
+    return IrIfBranch(cond_idx, body_idx)
+
+# split a for statement's loop variables.
+pub fn ir_for_binding_names(node: Node) -> IrForBindingNames:
+    mut value_name := node.value
+    mut index_name := ""
+    if value_name.contains(","):
+        parts := value_name.split(",")
+        value_name = parts[0].trim()
+        if parts.len() > 1:
+            index_name = parts[1].trim()
+    return IrForBindingNames(value_name, index_name)
+
+# the bare variable name from a binding node's value (modifiers stripped).
+pub fn ir_bind_stmt_name(raw_name: String) -> String:
+    mut name := raw_name
+    if name.contains(" "):
+        name = name.split(" ")[0]
+    return name
+
+# take a binding apart into its name, its initializer and its type annotation.
+pub fn ir_collect_bind_parts(node: Node) -> IrBindParts:
+    mut val_idx := 0 - 1
+    mut type_idx := 0 - 1
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "type" or cn.kind == "generic_type" or cn.kind == "optional_type" or cn.kind == "result_type" or cn.kind == "tuple_type" or cn.kind == "fn_type":
+            type_idx = child
+        else:
+            val_idx = child
+    return IrBindParts(ir_bind_stmt_name(node.value), val_idx, type_idx)
+
+# --- cached AST traversals ---
+
+mut ir_root_items_cache: Map[Int, List[Int]] := {}
+mut ir_string_node_cache_roots: List[Int] := []
+mut ir_string_node_cache_values: List[String] := []
+mut ir_decode_call_cache: Map[Int, List[Int]] := {}
+
+fn ir_is_decode_call_node(node: Node) -> Bool:
+    if node.kind != "call" or node.children.len() == 0:
+        return false
+    callee := get_node(node.children[0])
+    if callee.kind != "index" or callee.children.len() < 2:
+        return false
+    base := get_node(callee.children[0])
+    return base.kind == "field_access" and (base.value == "decode" or base.value == "decode_text")
+
+fn ir_collect_string_nodes(idx: Int) -> List[Int]:
+    mut string_nodes: List[Int] := []
+    mut decode_calls: List[Int] := []
+    mut stack: List[Int] := [idx]
+    while stack.len() > 0:
+        current := stack[stack.len() - 1]
+        stack.remove(stack.len() - 1)
+        node := get_node(current)
+        if ir_is_string_literal_kind(node.kind):
+            string_nodes.push(current)
+        elif ir_is_decode_call_node(node):
+            decode_calls.push(current)
+        kids := node.children
+        for kid in kids:
+            stack.push(kid)
+    ir_decode_call_cache.insert(idx, decode_calls)
+    return string_nodes
+
+# every typed decode call under root_idx, from the same walk that finds the
+# string literals.
+pub fn ir_cached_decode_call_nodes(root_idx: Int) -> List[Int]:
+    _nodes := ir_cached_string_nodes(root_idx)
+    if ir_decode_call_cache.contains_key(root_idx):
+        return ir_decode_call_cache[root_idx]
+    return []
+
+# every string-literal node under root_idx, cached across module emissions.
+pub fn ir_cached_string_nodes(root_idx: Int) -> List[Int]:
+    for cached_root, i in ir_string_node_cache_roots:
+        if cached_root == root_idx:
+            return ir_decode_int_list(ir_string_node_cache_values[i])
+    nodes := ir_collect_string_nodes(root_idx)
+    ir_string_node_cache_roots.push(root_idx)
+    ir_string_node_cache_values.push(ir_encode_int_list(nodes))
+    return nodes
+
+# the top-level declarations of a module, with any `pub` wrapper stripped.
+# cached per root; treat the returned list as read-only.
+pub fn ir_root_items(root_idx: Int) -> List[Int]:
+    if ir_root_items_cache.contains_key(root_idx):
+        return ir_root_items_cache[root_idx]
+    root := get_node(root_idx)
+    mut items: List[Int] := []
+    for child in root.children:
+        items.push(ir_unwrap_pub_child(child))
+    ir_root_items_cache.insert(root_idx, items)
+    return items

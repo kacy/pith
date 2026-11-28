@@ -1,0 +1,741 @@
+# ir_types.pith: type translation, struct/enum layout queries, RC classification,
+# and callable/method table helpers.
+#
+# consolidates ir_type_helpers, ir_struct_layouts, ir_struct_registry, and
+# ir_method_tables onto ir_state without any *_with_state trampolines.
+
+from ast import get_node, Node
+from checker import c_get_expr_type, c_is_interface_value_type
+from types import TypeInfo, get_type_info, get_type_name, lookup_declared_type_id, lookup_type_id
+from ir_ast_helpers import ir_unwrap_pub_node
+from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_string_returning_method
+from ir_state import ir_type_aliases, ir_type_alias_nodes, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_drop_symbols, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_dtor_memo, ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_assoc_bindings, ir_var_types, ir_global_kinds
+
+# ===========================================================================
+# Type alias, hint, retkind, and checked-tid translation
+# ===========================================================================
+
+## the type node an annotation stands for, following type aliases up to 16 hops.
+pub fn ir_alias_target_node(type_idx: Int) -> Int:
+    mut idx := type_idx
+    mut hops := 0
+    while idx >= 0 and hops < 16:
+        tn := get_node(idx)
+        if tn.kind != "type" or not ir_type_alias_nodes.contains_key(tn.value):
+            return idx
+        idx = ir_type_alias_nodes[tn.value]
+        hops = hops + 1
+    return idx
+
+## resolve a written type name through aliases and the struct table to an emission kind.
+pub fn ir_resolve_type_hint(type_name: String) -> String:
+    mut resolved := type_name
+    if ir_type_aliases.contains_key(resolved):
+        resolved = ir_type_aliases[resolved]
+    if resolved.starts_with("opaque:"):
+        resolved = resolved.substring(7, resolved.len())
+    if resolved == "String":
+        return "string"
+    if resolved == "Bytes":
+        return "bytes"
+    if resolved == "Bool":
+        return "bool"
+    if resolved == "Int":
+        return "int"
+    if resolved == "Float":
+        return "float"
+    if resolved.contains("List[String]"):
+        return "list_string"
+    if resolved.contains("List[") or resolved == "List":
+        return "list"
+    if resolved.contains("Map[Int,") or resolved.contains("Map[Int, "):
+        return "map_int"
+    if resolved.contains("Map[") or resolved == "Map":
+        return "map"
+    if resolved.contains("Set[Int]") or resolved.contains("Set[UInt]") or resolved.contains("Set[Int8]") or resolved.contains("Set[Int16]") or resolved.contains("Set[Int32]") or resolved.contains("Set[Int64]") or resolved.contains("Set[UInt8]") or resolved.contains("Set[UInt16]") or resolved.contains("Set[UInt32]") or resolved.contains("Set[UInt64]"):
+        return "set_int"
+    if resolved.contains("Set[") or resolved == "Set":
+        return "set"
+    if resolved.contains("Channel[") or resolved == "Channel":
+        return "channel"
+    if resolved.contains("Task[") or resolved == "Task":
+        return "task"
+    mut base := resolved
+    if base.contains("["):
+        base = base.substring(0, base.index_of("["))
+    if ir_struct_names.contains_key(base):
+        return base
+    mut iface_name := resolved
+    if lookup_type_id(iface_name) < 0 and iface_name.contains("."):
+        iface_name = iface_name.substring(iface_name.last_index_of(".") + 1, iface_name.len())
+    iface_tid := lookup_type_id(iface_name)
+    if iface_tid >= 0 and c_is_interface_value_type(iface_tid):
+        return "struct:" + iface_name
+    return resolved
+
+## the IR return/field kind tag for a declared type name ("struct:Name", "opaque:Mutex", ...).
+pub fn ir_retkind(type_name: String) -> String:
+    if type_name.len() == 0:
+        return "unknown"
+    resolved := ir_resolve_type_hint(type_name)
+    if resolved == "int" or resolved == "float" or resolved == "bool" or resolved == "string":
+        return resolved
+    if resolved == "list" or resolved == "list_string" or resolved == "map" or resolved == "map_int" or resolved == "set_int" or resolved == "set" or resolved == "void":
+        return resolved
+    if resolved == "Mutex" or resolved == "WaitGroup" or resolved == "Semaphore" or resolved == "AtomicInt":
+        return "opaque:" + resolved
+    if ir_struct_names.contains_key(resolved):
+        return "struct:" + resolved
+    tid := lookup_declared_type_id(resolved)
+    if tid >= 0 and get_type_info(tid).kind == "struct":
+        return "struct:" + resolved
+    return resolved
+
+## the kind of a `generic_type` annotation node for builtin containers, or "".
+pub fn ir_resolve_generic_type_node(tn: Node) -> String:
+    if tn.value == "List":
+        if tn.children.len() > 0:
+            first := get_node(tn.children[0])
+            if first.kind == "type" and first.value == "String":
+                return "list_string"
+        return "list"
+    if tn.value == "Map":
+        if tn.children.len() > 0:
+            first := get_node(tn.children[0])
+            if first.kind == "type" and first.value == "Int":
+                return "map_int"
+        return "map"
+    if tn.value == "Set":
+        if tn.children.len() > 0:
+            first := get_node(tn.children[0])
+            if first.kind == "type" and first.value == "Int":
+                return "set_int"
+        return "set"
+    return ""
+
+## every `T!` lowers to the same tuple representation regardless of ok kind.
+pub fn ir_resolve_result_type_kind(inner_type: String) -> String:
+    return "tuple"
+
+fn ir_is_int_primitive_name(name: String) -> Bool:
+    return name == "Int" or name == "UInt" or name == "Int8" or name == "Int16" or name == "Int32" or name == "Int64" or name == "UInt8" or name == "UInt16" or name == "UInt32" or name == "UInt64"
+
+## translate a checker type id to an emission kind string, or "" when unknown.
+pub fn ir_type_from_tid(tid: Int) -> String:
+    if tid < 0:
+        return ""
+    mut info := get_type_info(tid)
+    if info.kind == "result" or info.kind == "optional" or info.kind == "tuple":
+        return "tuple"
+    if info.kind == "primitive":
+        if ir_is_int_primitive_name(info.name):
+            return "int"
+        if info.name == "Float":
+            return "float"
+        if info.name == "Bool":
+            return "bool"
+        if info.name == "String":
+            return "string"
+        if info.name == "Bytes":
+            return "bytes"
+        return ""
+    if info.kind == "list":
+        elem_info := get_type_info(info.inner)
+        if elem_info.kind == "primitive" and elem_info.name == "String":
+            return "list_string"
+        return "list"
+    if info.kind == "map":
+        key_info := get_type_info(info.key_type)
+        if key_info.kind == "primitive" and ir_is_int_primitive_name(key_info.name):
+            return "map_int"
+        return "map"
+    if info.kind == "set":
+        elem_info := get_type_info(info.inner)
+        if elem_info.kind == "primitive" and ir_is_int_primitive_name(elem_info.name):
+            return "set_int"
+        return "set"
+    if info.kind == "enum":
+        mut vi := 0
+        while vi < info.variant_types.len():
+            if info.variant_types[vi].len() > 0:
+                return info.name
+            vi = vi + 1
+        return "int"
+    if info.kind == "struct":
+        if c_is_interface_value_type(tid):
+            return "struct:" + info.name
+        return info.name
+    if info.kind == "channel":
+        return "channel"
+    if info.kind == "task":
+        return "task"
+    if info.kind == "function":
+        return "closure"
+    return ""
+
+## return the bytes-keyed call-selection flavor ("set_bytes"/"map_bytes") when applicable.
+pub fn ir_bytes_keyed_type(expr_idx: Int, obj_type: String) -> String:
+    if obj_type != "set" and obj_type != "map":
+        return obj_type
+    tid := c_get_expr_type(expr_idx)
+    if tid < 0:
+        return obj_type
+    info := get_type_info(tid)
+    mut key_tid := 0 - 1
+    if info.kind == "set":
+        key_tid = info.inner
+    elif info.kind == "map":
+        key_tid = info.key_type
+    if key_tid < 0:
+        return obj_type
+    key_info := get_type_info(key_tid)
+    if key_info.kind == "primitive" and key_info.name == "Bytes":
+        return obj_type + "_bytes"
+    return obj_type
+
+## emission kind of the elements of a list expression, or "unknown".
+pub fn ir_list_element_kind(expr_idx: Int) -> String:
+    tid := c_get_expr_type(expr_idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "list":
+            kind := ir_type_from_tid(info.inner)
+            if kind.len() > 0:
+                return kind
+    return "unknown"
+
+## element type id of a list expression, or -1.
+pub fn ir_list_element_tid(expr_idx: Int) -> Int:
+    tid := c_get_expr_type(expr_idx)
+    if tid < 0:
+        return 0 - 1
+    info := get_type_info(tid)
+    if info.kind != "list":
+        return 0 - 1
+    return info.inner
+
+## return emission kind of a function-value expression, or "unknown".
+pub fn ir_function_return_kind(expr_idx: Int) -> String:
+    tid := c_get_expr_type(expr_idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "function":
+            kind := ir_type_from_tid(info.return_type)
+            if kind.len() > 0:
+                return kind
+    return "unknown"
+
+## emission kind the checker assigned to expression `idx`, or "".
+pub fn ir_checked_type(idx: Int) -> String:
+    return ir_type_from_tid(c_get_expr_type(idx))
+
+## "tuple" when the checker typed expression `idx` as a `T!`, else "".
+pub fn ir_checked_result_kind(idx: Int) -> String:
+    tid := c_get_expr_type(idx)
+    if tid < 0:
+        return ""
+    info := get_type_info(tid)
+    if info.kind != "result":
+        return ""
+    return "tuple"
+
+## emission kind yielded by an index expression `coll[k]`.
+pub fn ir_checked_index_type(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind != "index" or node.children.len() == 0:
+        return ir_checked_type(idx)
+    coll_tid := c_get_expr_type(node.children[0])
+    if coll_tid < 0:
+        return ir_checked_type(idx)
+    mut coll_info := get_type_info(coll_tid)
+    if coll_info.kind == "optional" or coll_info.kind == "result":
+        if coll_info.inner < 0:
+            return ir_checked_type(idx)
+        coll_info = get_type_info(coll_info.inner)
+    if coll_info.kind == "map" and coll_info.value_type >= 0:
+        return ir_type_from_tid(coll_info.value_type)
+    if coll_info.kind == "list" and coll_info.inner >= 0:
+        return ir_type_from_tid(coll_info.inner)
+    return ir_checked_type(idx)
+
+## O(1) lookup of an identifier's emission kind from current locals then module globals.
+pub fn ir_lookup_name_type(name: String) -> String:
+    if ir_var_types.contains_key(name):
+        return ir_var_types[name]
+    if ir_global_kinds.contains_key(name):
+        return ir_global_kinds[name]
+    return ""
+
+## scalar kind returned by a builtin function, or "".
+pub fn ir_known_scalar_return_type(fname: String) -> String:
+    if ir_is_float_returning_func(fname):
+        return "float"
+    if ir_is_bool_returning_func(fname):
+        return "bool"
+    if ir_is_int_returning_func(fname):
+        return "int"
+    if ir_is_string_returning_func(fname):
+        return "string"
+    if ir_is_bytes_returning_func(fname):
+        return "bytes"
+    return ""
+
+## list kind returned by a builtin function, or "".
+pub fn ir_known_collection_return_type(fname: String) -> String:
+    if ir_is_list_returning_func(fname):
+        return "list"
+    if ir_is_list_string_returning_func(fname):
+        return "list_string"
+    return ""
+
+## return kind of a receiver-independent builtin string/collection method, or "".
+pub fn ir_known_string_method_return_type(meth: String) -> String:
+    if ir_is_string_returning_method(meth) or meth == "to_string_utf8":
+        return "string"
+    if meth == "keys" or meth == "values" or meth == "split" or meth == "split_exact" or meth == "chars":
+        return "list_string"
+    return ""
+
+## return kind of receiver-dependent channel/task/list builtin methods, or "".
+pub fn ir_known_collection_method_return_type(obj_type: String, meth: String) -> String:
+    if obj_type == "channel" or obj_type.starts_with("channel:"):
+        if meth == "recv" or meth == "try_recv":
+            return "tuple"
+        if meth == "len" or meth == "cap":
+            return "int"
+        if meth == "send" or meth == "try_send" or meth == "close" or meth == "is_closed":
+            return "bool"
+    if (obj_type == "task" or obj_type.starts_with("task:")) and meth == "is_done":
+        return "bool"
+    if meth == "index_of" and (obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")):
+        return "int"
+    if meth == "slice" or meth == "sort":
+        if obj_type == "list_string":
+            return "list_string"
+        if obj_type == "list" or obj_type.starts_with("list:"):
+            return "list"
+    return ""
+
+## emission kind of a literal AST node, or "".
+pub fn ir_literal_expr_type(node: Node, kind: String) -> String:
+    if kind == "int_lit" or kind == "int" or kind == "integer":
+        return "int"
+    if kind == "float_lit" or kind == "float":
+        return "float"
+    if kind == "bool_lit" or kind == "bool":
+        return "bool"
+    if kind == "string_lit" or kind == "string" or kind == "str_lit" or kind == "string_interp":
+        return "string"
+    if kind == "list":
+        if node.children.len() > 0:
+            first := get_node(node.children[0])
+            if first.kind == "string_lit" or first.kind == "string":
+                return "list_string"
+        return "list"
+    if kind == "map":
+        return "map"
+    if kind == "set":
+        if node.children.len() > 0:
+            first := get_node(node.children[0])
+            if first.kind == "int_lit" or first.kind == "int" or first.kind == "integer":
+                return "set_int"
+        return "set"
+    if kind == "tuple":
+        return "tuple"
+    return ""
+
+## fallback emission kind for an untyped unary expression.
+pub fn ir_unary_expr_type(node: Node) -> String:
+    if node.value == "not":
+        return "bool"
+    return "int"
+
+# ===========================================================================
+# Struct & enum layout queries, RC classification, and destructor predicates
+# ===========================================================================
+
+## strip type arguments: Box[Int] and Box share one layout.
+pub fn ir_struct_base_name(sname: String) -> String:
+    if sname.len() == 0:
+        return sname
+    bracket := sname.index_of("[")
+    if bracket >= 0:
+        return sname.substring(0, bracket)
+    return sname
+
+## resolve a struct annotation name to its registered layout key.
+pub fn ir_struct_layout_name(struct_name: String) -> String:
+    if ir_struct_names.contains_key(struct_name):
+        return struct_name
+    if struct_name.contains("["):
+        base_name := struct_name.substring(0, struct_name.index_of("["))
+        if ir_struct_names.contains_key(base_name):
+            return base_name
+    return struct_name
+
+## number of fields/slots in a registered struct layout, or 0 when unknown.
+pub fn ir_struct_field_count(struct_name: String) -> Int:
+    layout_name := ir_struct_layout_name(struct_name)
+    if ir_struct_names.contains_key(layout_name):
+        return ir_struct_names[layout_name]
+    return 0
+
+## field name at `field_index` in declaration order, or "".
+pub fn ir_struct_field_name_at(struct_name: String, field_index: Int) -> String:
+    prefix := ir_struct_layout_name(struct_name) + "."
+    want := field_index.to_string()
+    struct_tid := lookup_type_id(struct_name)
+    if struct_tid >= 0:
+        struct_info := get_type_info(struct_tid)
+        if struct_info.kind == "struct" and field_index >= 0 and field_index < struct_info.fields.len():
+            candidate := struct_info.fields[field_index]
+            if ir_struct_field_index_lookup.get_default(prefix + candidate, "") == want:
+                return candidate
+    for key in ir_struct_field_index_lookup:
+        if key.starts_with(prefix) and ir_struct_field_index_lookup[key] == want:
+            return key.substring(prefix.len(), key.len())
+    return ""
+
+## emission kind recorded for a struct field, or "".
+pub fn ir_struct_field_type_name(struct_name: String, field_name: String) -> String:
+    key := ir_struct_layout_name(struct_name) + "." + field_name
+    if ir_struct_field_lookup.contains_key(key):
+        return ir_struct_field_lookup[key]
+    return ""
+
+fn ir_struct_resolve_type_node(type_idx: Int) -> String:
+    type_node := get_node(ir_alias_target_node(type_idx))
+    if type_node.kind == "type":
+        return ir_resolve_type_hint(type_node.value)
+    if type_node.kind == "generic_type":
+        resolved := ir_resolve_generic_type_node(type_node)
+        if resolved.len() > 0:
+            return resolved
+        return ir_resolve_type_hint(type_node.value)
+    if type_node.kind == "optional_type" and type_node.children.len() > 0:
+        return "tuple"
+    if type_node.kind == "result_type" and type_node.children.len() > 0:
+        inner_type := ir_struct_resolve_type_node(type_node.children[0])
+        return ir_resolve_result_type_kind(inner_type)
+    if type_node.kind == "fn_type":
+        return "closure"
+    if type_node.kind == "tuple_type":
+        return "tuple"
+    return ""
+
+## emission kind of field `field_index` read from the struct declaration AST.
+pub fn ir_struct_field_kind_from_decl(struct_name: String, field_index: Int) -> String:
+    layout_name := ir_struct_layout_name(struct_name)
+    if not ir_struct_decl_nodes.contains_key(layout_name):
+        return ""
+    decl := get_node(ir_struct_decl_nodes[layout_name])
+    mut current_index := 0
+    for child in decl.children:
+        field_node := ir_unwrap_pub_node(child)
+        if field_node.kind != "field":
+            continue
+        if current_index == field_index:
+            if field_node.children.len() > 0:
+                return ir_struct_resolve_type_node(field_node.children[0])
+            return ""
+        current_index = current_index + 1
+    return ""
+
+## map an emission kind back to its primitive or struct type id, or -1.
+pub fn ir_field_kind_tid(kind: String) -> Int:
+    if kind == "int":
+        return 0
+    if kind == "float":
+        return 2
+    if kind == "bool":
+        return 3
+    if kind == "string":
+        return 4
+    if kind == "bytes":
+        return 5
+    if kind == "void":
+        return 6
+    if ir_struct_names.contains_key(kind):
+        return lookup_type_id(kind)
+    return 0 - 1
+
+## checked tid for a struct field by index, reconciling against declaration layout.
+pub fn ir_struct_field_tid_at(struct_name: String, field_index: Int, fallback_tid: Int) -> Int:
+    mut field_kind := ir_struct_field_kind_from_decl(struct_name, field_index)
+    if field_kind.len() == 0:
+        field_name := ir_struct_field_name_at(struct_name, field_index)
+        field_kind = ir_struct_field_type_name(struct_name, field_name)
+    if field_kind.len() == 0:
+        return fallback_tid
+    field_tid := ir_field_kind_tid(field_kind)
+    if field_tid < 0:
+        return fallback_tid
+    if fallback_tid < 0:
+        return field_tid
+    if ir_type_from_tid(fallback_tid) != field_kind:
+        return field_tid
+    return fallback_tid
+
+## AST node index of a struct field's default expression, or -1.
+pub fn ir_struct_field_default_node(struct_name: String, field_name: String) -> Int:
+    key := ir_struct_layout_name(struct_name) + "." + field_name
+    if ir_struct_field_default_nodes.contains_key(key):
+        return ir_struct_field_default_nodes[key]
+    return 0 - 1
+
+## true when any field of `target_info` declares a default value expression.
+pub fn ir_struct_has_default_fields(target_info: TypeInfo) -> Bool:
+    for field_name in target_info.fields:
+        if ir_struct_field_default_nodes.contains_key(target_info.name + "." + field_name):
+            return true
+    return false
+
+## true when `type_hint` names a tag-only enum (lowered as a plain integer).
+pub fn ir_unboxed_enum_hint(type_hint: String) -> Bool:
+    mut name := type_hint
+    if name.starts_with("struct:"):
+        name = name.substring(7, name.len())
+    name = ir_struct_base_name(name)
+    dotted := name.last_index_of(".")
+    if dotted >= 0:
+        name = name.substring(dotted + 1, name.len())
+    if name.len() == 0:
+        return false
+    return ir_enum_variant_lists.contains_key(name) and not ir_boxed_enums.contains_key(name)
+
+## true when `type_hint` names one of the four sync primitive handles.
+pub fn ir_sync_type_hint(type_hint: String) -> Bool:
+    mut name := type_hint
+    if name.starts_with("opaque:"):
+        name = name.substring(7, name.len())
+    return name == "Mutex" or name == "WaitGroup" or name == "Semaphore" or name == "AtomicInt"
+
+## reference-counting kind for an emission type hint, or "" for non-RC types.
+pub fn ir_rc_kind(type_hint: String) -> String:
+    if type_hint == "string":
+        return "string"
+    if type_hint == "channel" or type_hint.starts_with("channel:"):
+        return "channel"
+    if ir_sync_type_hint(type_hint):
+        return "sync"
+    if type_hint == "list" or type_hint == "list_string":
+        return "list"
+    if type_hint == "map" or type_hint == "map_int":
+        return "map"
+    if type_hint == "set" or type_hint == "set_int":
+        return "set"
+    if type_hint == "bytes":
+        return "bytes"
+    if type_hint == "closure":
+        return "closure"
+    if type_hint == "tuple":
+        return "tuple"
+    if ir_unboxed_enum_hint(type_hint):
+        return ""
+    if type_hint.starts_with("struct:"):
+        return "struct"
+    base := ir_struct_base_name(type_hint)
+    if ir_struct_names.contains_key(base):
+        return "struct"
+    dot := base.last_index_of(".")
+    mut bare := base
+    if dot >= 0:
+        bare = base.substring(dot + 1, base.len())
+        if ir_struct_names.contains_key(bare):
+            return "struct"
+    tid := lookup_declared_type_id(bare)
+    if tid >= 0 and get_type_info(tid).kind == "struct":
+        return "struct"
+    return ""
+
+## struct name returned by well-known compiler/struct constructors, or "".
+pub fn ir_known_struct_return_type(fname: String) -> String:
+    if ir_struct_names.contains_key(fname):
+        return fname
+    if fname == "get_node":
+        return "Node"
+    if fname == "advance_token" or fname == "expect":
+        return "Token"
+    if fname == "ti_primitive" or fname == "ti_struct" or fname == "ti_enum" or fname == "ti_function" or fname == "ti_optional" or fname == "ti_result" or fname == "ti_tuple" or fname == "ti_list" or fname == "ti_map" or fname == "ti_set" or fname == "ti_task" or fname == "ti_channel" or fname == "get_type_info":
+        return "TypeInfo"
+    return ""
+
+## boxed-enum name for an equality node, or "" when neither side is a boxed enum.
+pub fn ir_binary_enum_eq_name(node: Node) -> String:
+    left_name := get_type_name(c_get_expr_type(node.children[0]))
+    if ir_boxed_enums.contains_key(left_name):
+        return left_name
+    right_name := get_type_name(c_get_expr_type(node.children[1]))
+    if ir_boxed_enums.contains_key(right_name):
+        return right_name
+    return ""
+
+## true when any variant of a boxed enum carries an RC payload.
+pub fn ir_enum_needs_dtor(ename: String) -> Bool:
+    if not ir_enum_variant_lists.contains_key(ename):
+        return false
+    for variant in ir_enum_variant_lists[ename].split(","):
+        vkey := ename + "." + variant
+        if ir_enum_payload_kinds.contains_key(vkey):
+            for pk in ir_enum_payload_kinds[vkey].split(","):
+                if ir_rc_field_kind(pk).len() > 0:
+                    return true
+    return false
+
+## true when a struct (or boxed enum) holds any RC field or implements Drop.
+pub fn ir_struct_needs_dtor(raw_name: String) -> Bool:
+    sname := ir_struct_base_name(raw_name)
+    if ir_dtor_memo.contains_key(sname):
+        return ir_dtor_memo[sname] == 1
+    ir_dtor_memo.insert(sname, 2)
+    if ir_boxed_enums.contains_key(sname):
+        enum_needs := ir_enum_needs_dtor(sname)
+        if enum_needs:
+            ir_dtor_memo.insert(sname, 1)
+        return enum_needs
+    count := ir_struct_field_count(sname)
+    mut i := 0
+    mut needs := false
+    while i < count:
+        fname := ir_struct_field_name_at(sname, i)
+        ftype := ir_struct_field_type_name(sname, fname)
+        if ir_rc_field_kind(ftype).len() > 0:
+            needs = true
+        i = i + 1
+    if ir_struct_drop_symbol(sname).len() > 0:
+        needs = true
+    if needs:
+        ir_dtor_memo.insert(sname, 1)
+    return needs
+
+## flat IR symbol of the Drop method for a struct, or "".
+pub fn ir_struct_drop_symbol(raw_name: String) -> String:
+    sname := ir_struct_base_name(raw_name)
+    if not ir_struct_decl_nodes.contains_key(sname):
+        return ""
+    decl_idx := ir_struct_decl_nodes[sname]
+    if ir_struct_drop_symbols.contains_key(decl_idx):
+        return ir_struct_drop_symbols[decl_idx]
+    return ""
+
+## RC kind of a struct field, including nested dtor-bearing structs.
+pub fn ir_rc_field_kind(ftype: String) -> String:
+    base := ir_rc_kind(ftype)
+    if base.len() > 0:
+        return base
+    if ftype.starts_with("struct:"):
+        if ir_struct_needs_dtor(ftype.substring(7, ftype.len())):
+            return "struct"
+    return ""
+
+# ===========================================================================
+# Callable signatures, impl method tables, and associated types
+# ===========================================================================
+
+## bound type name for an associated type on a concrete impl, else unchanged.
+pub fn ir_resolve_assoc_type(impl_type: String, type_name: String) -> String:
+    key := impl_type + "." + type_name
+    if ir_assoc_bindings.contains_key(key):
+        return ir_assoc_bindings[key]
+    return type_name
+
+## lookup key for an impl method on a type: "Type.method".
+pub fn ir_impl_method_key(type_name: String, method_name: String) -> String:
+    return type_name + "." + method_name
+
+## tid-keyed lookup key for a method on a specific declaration: "#tid.method".
+pub fn ir_impl_tid_key(tid: Int, method_name: String) -> String:
+    return "#" + tid.to_string() + "." + method_name
+
+## turn a type-qualified name (e.g. MapIter[Range,Int]) into a legal IR symbol.
+pub fn ir_sanitize_symbol(name: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < name.len():
+        c := name[i]
+        if c == "[" or c == "]" or c == ",":
+            out = out + "_"
+        elif c == " ":
+            i = i + 1
+            continue
+        else:
+            out = out + c
+        i = i + 1
+    return out
+
+## drop `[T]` type arguments from a type name.
+pub fn ir_strip_type_args(name: String) -> String:
+    mut i := 0
+    while i < name.len():
+        if name[i] == "[":
+            return name.substring(0, i)
+        i = i + 1
+    return name
+
+## look up a declared function's recorded return-type hint, or "unknown".
+pub fn ir_lookup_func_return(full_name: String, base_name: String) -> String:
+    if ir_func_returns.contains_key(full_name):
+        return ir_func_returns[full_name]
+    if ir_func_returns.contains_key(base_name):
+        return ir_func_returns[base_name]
+    return "unknown"
+
+## true when `name` is a recorded user function, impl method, or specialization.
+pub fn ir_is_declared_callable(name: String) -> Bool:
+    return ir_func_returns.contains_key(name)
+
+## raw recorded return kind for a declared callable, or "".
+pub fn ir_declared_callable_ir_retkind(fname: String) -> String:
+    if not ir_func_returns.contains_key(fname):
+        return ""
+    return ir_func_returns[fname]
+
+## emission return kind for a declared callable, or "".
+pub fn ir_declared_callable_return_type(fname: String) -> String:
+    ret_kind := ir_declared_callable_ir_retkind(fname)
+    if ret_kind.len() == 0:
+        return ""
+    if ret_kind == "result_int":
+        return "int"
+    if ret_kind == "result_bool":
+        return "bool"
+    if ret_kind == "tuple":
+        return "tuple"
+    return ir_resolve_type_hint(ret_kind)
+
+## specialized symbol for a generic impl method instantiation, or "".
+pub fn ir_lookup_specialized_method(type_name: String, method_name: String) -> String:
+    key := ir_impl_method_key(type_name, method_name)
+    if ir_impl_method_specializations.contains_key(key) == false:
+        return ""
+    name := ir_impl_method_specializations[key]
+    base_type := ir_strip_type_args(type_name)
+    base_key := ir_impl_method_key(base_type, method_name)
+    if ir_impl_methods.contains_key(base_key):
+        base_full := ir_impl_methods[base_key]
+        expected_base := base_type + "_" + method_name
+        if base_full.len() > expected_base.len() and base_full.ends_with(expected_base):
+            prefix := base_full.substring(0, base_full.len() - expected_base.len())
+            if name.starts_with(prefix) == false:
+                return prefix + name
+    return name
+
+## register one generic-method specialization symbol under its instance key.
+pub fn ir_register_one_specialized_method_name(method_node: Node, base_impl_type: String, instance_type: String, arg_names: List[String]):
+    orig_name := method_node.value
+    mut suffix := ""
+    for an in arg_names:
+        suffix = suffix + "_" + ir_sanitize_symbol(an)
+    full_name := base_impl_type + suffix + "_" + orig_name
+    method_key := ir_impl_method_key(instance_type, orig_name)
+    if ir_impl_method_specializations.contains_key(method_key):
+        return
+    base_key := ir_impl_method_key(base_impl_type, orig_name)
+    expected_base_sym := base_impl_type + "_" + orig_name
+    mut prefixed_full := full_name
+    if ir_impl_methods.contains_key(base_key):
+        base_sym := ir_impl_methods[base_key]
+        if base_sym.len() > expected_base_sym.len() and base_sym.ends_with(expected_base_sym):
+            prefix_len := base_sym.len() - expected_base_sym.len()
+            prefixed_full = base_sym.substring(0, prefix_len) + full_name
+    ir_impl_method_specializations.insert(method_key, prefixed_full)

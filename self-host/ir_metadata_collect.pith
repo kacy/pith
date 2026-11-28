@@ -1,0 +1,861 @@
+# ir_metadata_collect.pith: string prepass and phase 1/2 metadata collectors
+# for imports, type aliases, structs, enums, impls, Drop, and globals.
+
+from ast import Node, get_node
+from checker import collect_generic_parameter_names, decode_tid_list, generic_base_identity, get_generic_declaration_index, has_generic_declaration, module_declares_generic, struct_instance_base_name, struct_instance_tids, struct_instance_type_args
+from types import get_type_name, lookup_entry_type_id, lookup_qualified_type_id, lookup_type_id
+from ir_ast_helpers import ir_binding_name, ir_is_binding_kind, ir_unwrap_pub_child, ir_unwrap_pub_node
+from ir_common import ir_base_decl_name, ir_cached_string_nodes, ir_collect_bind_parts, ir_global_storage_symbol, ir_import_impl_method_name, ir_import_target_name, ir_root_items
+from ir_metadata import ir_sentinel_result_builtin_names
+from ir_builder import ir_emit, ir_label, ir_reg, ir_str
+from ir_state import ir_all_module_paths, ir_all_module_roots, ir_assoc_bindings, ir_boxed_enums, ir_collecting_entry_impls, ir_count_marks, ir_current_module_path, ir_entry_root, ir_enum_payload_kinds, ir_enum_variant_lists, ir_func_result_ok_kinds, ir_func_returns, ir_global_map_value_types, ir_impl_method_owner, ir_impl_methods, ir_import_renames, ir_interface_decl_index, ir_local_struct_names, ir_module_aliases, ir_mutable_global_names, ir_next_tls_slot, ir_preloaded_import_paths, ir_preloaded_import_roots, ir_record_global_slot, ir_record_global_type, ir_reset_import_metadata, ir_reset_phase_one_metadata, ir_reset_phase_two_metadata, ir_struct_decl_nodes, ir_struct_drop_symbols, ir_struct_field_default_nodes, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_struct_names, ir_test_source_file, ir_threadlocal_kinds, ir_threadlocal_slots, ir_type_alias_nodes, ir_type_aliases, ir_type_assoc_names
+from ir_types import ir_alias_target_node, ir_checked_type, ir_impl_method_key, ir_impl_tid_key, ir_register_one_specialized_method_name, ir_resolve_assoc_type, ir_retkind, ir_type_from_tid
+from ir_symbols import ir_collect_from_import_renames, ir_collect_preloaded_root_metadata, ir_has_generic_params, ir_is_fn_decl_kind, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_register_import_alias, ir_resolve_map_value_type_node, ir_resolve_type_node
+from ir_primitives import ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_label
+from ir_type_infer import ir_emit_func_header, ir_emit_zero_ret_endfunc, ir_extract_return_type, ir_impl_defines_method, ir_impl_identity_type, ir_impl_interface_base, ir_impl_target_type, ir_infer_type, ir_inherited_default_indices, ir_is_type_node_kind, ir_maybe_register_result_reg, ir_module_root_for_path, ir_owner_type_param_count, ir_struct_field_name, ir_tls_key, ir_top_level_decl_name, ir_type_node_text
+from ir_analysis import ir_mark_index_offsets, ir_maybe_register_result_reg_method
+from ir_synth_helpers import ir_cc_register_fn_name, ir_count_mark_kind, ir_prepare_func_emission
+
+# --- collect strings (iterative to avoid deep recursion crashes) ---
+pub fn ir_collect_strings(idx: Int):
+    nodes := ir_cached_string_nodes(idx)
+    for node_idx in nodes:
+        ir_str(get_node(node_idx).value)
+
+## collect struct field strings.
+pub fn ir_collect_struct_field_strings(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        actual := ir_unwrap_pub_node(item_idx)
+        if actual.kind == "struct_decl" or actual.kind == "struct":
+            # the string table is emitted before function bodies, so the
+            # labels the synthesized struct display uses must be interned
+            # here, not when the display code emits.
+            ir_str(actual.value + "(")
+            ir_str(")")
+            ir_str("...")
+            mut first := true
+            for child in actual.children:
+                field_node := get_node(child)
+                if field_node.kind == "field":
+                    fname := ir_struct_field_name(field_node)
+                    ir_str(fname)
+                    if first:
+                        ir_str(fname + ": ")
+                        first = false
+                    else:
+                        ir_str(", " + fname + ": ")
+
+fn ir_register_struct_layout(name: String, field_names: List[String], field_types: List[String]):
+    if ir_struct_names.contains_key(name):
+        return
+    for field_name, i in field_names:
+        ir_struct_field_lookup.insert(name + "." + field_name, field_types[i])
+        ir_struct_field_index_lookup.insert(name + "." + field_name, i.to_string())
+    ir_struct_names.insert(name, field_names.len())
+    if not ir_local_struct_names.contains(name):
+        ir_local_struct_names.push(name)
+    ir_emit("struct " + name + " " + field_names.join(" "))
+
+# collect each impl's associated-type bindings so a method's `-> Item` header
+# resolves to the bound type (and, for heap types, gets the right return kind).
+fn ir_collect_assoc_bindings_in_root(root_idx: Int, module_path: String):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        mut actual := node
+        if node.kind == "pub":
+            actual = get_node(node.children[0])
+        if actual.kind == "impl_decl":
+            impl_type := ir_impl_identity_type(actual, module_path)
+            if impl_type.len() > 0:
+                mut names: List[String] := []
+                for child in actual.children:
+                    cn := get_node(child)
+                    if cn.kind == "assoc_type_bind":
+                        ir_assoc_bindings.insert(impl_type + "." + cn.value, ir_resolve_type_node(cn.children[0]))
+                        names.push(cn.value)
+                if names.len() > 0:
+                    ir_type_assoc_names.insert(impl_type, names.join(","))
+
+# index every interface_decl in a root by its base name so impls can find the
+# defaults they inherit. must run before impl signatures are collected.
+fn ir_index_interfaces_in_root(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        mut actual_idx := item_idx
+        if node.kind == "pub":
+            actual_idx = node.children[0]
+        actual := get_node(actual_idx)
+        if actual.kind == "interface_decl":
+            ir_interface_decl_index.insert(actual.value, actual_idx)
+
+fn ir_record_struct_field(struct_name: String, field_names: List[String], field_node: Node) -> List[String]:
+    field_name := ir_struct_field_name(field_node)
+    mut updated_fields := field_names
+    field_index := updated_fields.len()
+    updated_fields.push(field_name)
+    if field_node.children.len() > 0:
+        type_node := get_node(ir_alias_target_node(field_node.children[0]))
+        # a closure field (fn_type) must be recorded too, or the struct's
+        # destructor won't know to release it and the closure leaks. so must
+        # a tuple field: unrecorded, it was a plain word, and the struct's
+        # last release stranded the tuple and everything in it. a result
+        # field is the same, with its box and payload.
+        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "optional_type" or type_node.kind == "fn_type" or type_node.kind == "tuple_type" or type_node.kind == "result_type":
+            ir_struct_field_lookup.insert(struct_name + "." + field_name, ir_resolve_type_node(field_node.children[0]))
+        if field_node.children.len() > 1:
+            ir_struct_field_default_nodes.insert(struct_name + "." + field_name, field_node.children[1])
+    ir_struct_field_index_lookup.insert(struct_name + "." + field_name, field_index.to_string())
+    return updated_fields
+
+fn ir_collect_struct_decl(node_idx: Int, node: Node, emit_decl: Bool, module_path: String):
+    bare := ir_base_decl_name(node.value)
+    # a generic base whose bare name a second module also declares is filed
+    # under its declaring module's key as well, so an instance built from that
+    # identity finds its own module's layout. the bare entry stays for the call
+    # sites that only have a written name to go on; it is the only entry when
+    # the name is unambiguous, which is every program without such a clash.
+    sname := generic_base_identity(module_path, bare)
+    ir_struct_decl_nodes.insert(sname, node_idx)
+    mut field_names: List[String] := []
+    for child in node.children:
+        field_node := ir_unwrap_pub_node(child)
+        if field_node.kind == "field":
+            field_names = ir_record_struct_field(sname, field_names, field_node)
+    ir_struct_names.insert(sname, field_names.len())
+    if sname != bare:
+        ir_struct_decl_nodes.insert(bare, node_idx)
+        mut bare_fields: List[String] := []
+        for child in node.children:
+            field_node := ir_unwrap_pub_node(child)
+            if field_node.kind == "field":
+                bare_fields = ir_record_struct_field(bare, bare_fields, field_node)
+        ir_struct_names.insert(bare, bare_fields.len())
+    if emit_decl:
+        if not ir_local_struct_names.contains(sname):
+            ir_local_struct_names.push(sname)
+        ir_emit("struct " + sname + " " + field_names.join(" "))
+
+fn ir_collect_enum_decl(node: Node, emit_decl: Bool, module_path: String):
+    # a generic enum base takes the same identity a generic struct base does,
+    # so two modules declaring the same enum name keep their variants apart.
+    sname := generic_base_identity(module_path, node.value)
+    variant_names := ir_record_enum_variants(node, sname)
+    # the module's own bodies write the bare name (`Opt.Some(v)`), so the
+    # module emitting its own declaration files it under that name as well.
+    # an importer's copy stays under the declaring module's key only, so the
+    # bare name keeps meaning the importer's own enum.
+    if emit_decl and sname != node.value:
+        _bare := ir_record_enum_variants(node, node.value)
+    if emit_decl:
+        ir_emit("struct " + sname + " " + variant_names.join(" "))
+
+# file one enum's variants, their payload kinds and its variant count under
+# `sname`, and answer the variant names in order.
+fn ir_record_enum_variants(node: Node, sname: String) -> List[String]:
+    mut variant_names: List[String] := []
+    for child in node.children:
+        variant_node := ir_unwrap_pub_node(child)
+        if variant_node.kind == "variant":
+            variant_index := variant_names.len()
+            variant_names.push(variant_node.value)
+            ir_struct_field_lookup.insert(sname + "." + variant_node.value, sname)
+            ir_struct_field_index_lookup.insert(sname + "." + variant_node.value, variant_index.to_string())
+            if variant_node.children.len() > 0:
+                mut kinds: List[String] := []
+                for type_idx in variant_node.children:
+                    mut kind := ir_resolve_type_node(type_idx)
+                    if kind.len() == 0:
+                        kind = "unknown"
+                    kinds.push(kind)
+                ir_enum_payload_kinds.insert(sname + "." + variant_node.value, kinds.join(","))
+                ir_boxed_enums.insert(sname, true)
+    ir_enum_variant_lists.insert(sname, variant_names.join(","))
+    ir_struct_names.insert(sname, variant_names.len())
+    return variant_names
+
+# record the drop method of every `impl Drop for T` in a root, keyed by the
+# declaration node of the struct it names. the struct has to be declared in
+# the same root (the checker refuses anything else, E268), which is what lets
+# the symbol be spelled here: the method flattens to `T_drop` and takes the
+# module's prefix exactly as any other impl method does. the destructor
+# generated for T calls this symbol at its head, so a struct that names one
+# is released like any counted value and cleaned up like a closed one.
+fn ir_collect_drop_impls(root_idx: Int, module_path: String):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if node.kind != "impl_decl" or ir_impl_interface_base(node) != "Drop":
+            continue
+        target := ir_impl_target_type(node)
+        if target.len() == 0 or not ir_impl_defines_method(node, "drop"):
+            continue
+        decl_idx := ir_root_struct_decl_index(root_idx, target)
+        if decl_idx < 0:
+            continue
+        mut sym := target + "_drop"
+        if module_path.len() > 0:
+            sym = ir_import_impl_method_name(module_path, target, "drop")
+        ir_struct_drop_symbols.insert(decl_idx, sym)
+
+# the declaration node of the struct a root declares under `name`, or -1.
+fn ir_root_struct_decl_index(root_idx: Int, name: String) -> Int:
+    for item_idx in ir_root_items(root_idx):
+        cn := get_node(item_idx)
+        if (cn.kind == "struct_decl" or cn.kind == "struct") and ir_base_decl_name(cn.value) == name:
+            return item_idx
+    return 0 - 1
+
+# a generic enum imported by name (`from m import Opt`) whose name a second
+# module also declares is held under m's key only, so this module's bare
+# `Opt.Some` patterns and constructors would find nothing. file it under the
+# bare name too, as the name means here.
+fn ir_collect_from_imported_enums(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if node.kind != "from_import":
+            continue
+        parts := ir_expand_wildcard_import(node.value, root_idx).split(" ")
+        if parts.len() < 2:
+            continue
+        module_root := ir_module_root_for_path(parts[0])
+        if module_root < 0:
+            continue
+        for decl_idx in ir_root_items(module_root):
+            decl := get_node(decl_idx)
+            if decl.kind != "enum_decl" and decl.kind != "enum":
+                continue
+            if not parts.contains(decl.value):
+                continue
+            if generic_base_identity(parts[0], decl.value) != decl.value:
+                _variants := ir_record_enum_variants(decl, decl.value)
+
+fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool, module_path: String):
+    for item_idx in ir_root_items(root_idx):
+        cn := get_node(item_idx)
+        if cn.kind == "struct_decl" or cn.kind == "struct":
+            ir_collect_struct_decl(item_idx, cn, emit_decl, module_path)
+        elif cn.kind == "enum_decl" or cn.kind == "enum":
+            ir_collect_enum_decl(cn, emit_decl, module_path)
+
+fn ir_register_known_import_structs():
+    ir_register_struct_layout("Node", ["kind", "value", "children", "line", "col"], ["string", "string", "list", "int", "int"])
+    ir_register_struct_layout("Token", ["kind", "value", "line", "column", "offset", "len"], ["string", "string", "int", "int", "int", "int"])
+    ir_register_struct_layout("TypeInfo", ["kind", "name", "fields", "field_types", "field_pub", "field_mut", "param_types", "return_type", "inner", "key_type", "value_type", "elements", "variants", "variant_types"], ["string", "string", "list_string", "list", "list", "list", "list", "int", "int", "int", "int", "list", "list_string", "list"])
+    ir_register_struct_layout("Diagnostic", ["severity", "code", "message", "file", "line", "col", "fix"], ["string", "string", "string", "string", "int", "int", "string"])
+
+# the entry's interfaces, associated types and impl method signatures, when
+# another module is being emitted. they go in first, so every name-keyed entry
+# a module in the graph registers for the same bare name replaces them; only
+# the tid keys of the entry's own declarations keep pointing at the entry.
+# the entry's symbols carry no module prefix, so the empty path names them.
+fn ir_collect_entry_impls(root_idx: Int):
+    if ir_entry_root < 0 or ir_entry_root == root_idx:
+        return
+    ir_index_interfaces_in_root(ir_entry_root)
+    ir_collect_assoc_bindings_in_root(ir_entry_root, "")
+    ir_collecting_entry_impls = true
+    ir_collect_impl_methods(ir_entry_root, "")
+    ir_collecting_entry_impls = false
+
+fn ir_collect_impl_methods(root_idx: Int, module_path: String):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if node.kind == "impl_decl":
+            ir_collect_impl_method_signatures(node, module_path)
+
+fn ir_collect_generic_function_decls_from_root(root_idx: Int, module_path: String):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if ir_is_fn_decl_kind(node.kind) and ir_has_generic_params(node):
+            ir_record_generic_function_decl(item_idx, node, module_path)
+
+# the enum table entries a specialization from another module replaced:
+# their keys, and the values they held before, for ir_restore_enum_tables.
+## saved enum/struct layout tables when switching into another module's namespace.
+pub struct IrEnumTables:
+    pub names: List[String]
+    pub variant_keys: List[String]
+    pub boxed: Map[String, Bool]
+    pub variant_lists: Map[String, String]
+    pub struct_names: Map[String, Int]
+    pub payload_kinds: Map[String, String]
+    pub field_lookup: Map[String, String]
+    pub field_index_lookup: Map[String, String]
+
+# point the name tables at another module's, so a generic body that module
+# declares resolves its names the way its module does rather than the way the
+# instantiating module does: its imports, for `gather(xs)` and `b.gather(xs)`
+# (#1095), and the generic enums it declares under a name a second module
+# shares, which its body writes bare (`Opt.Some(v)`) and every other module
+# holds under the declaring module's key only. the caller saves and restores
+# the import tables; the enum entries come back from this call.
+pub fn ir_use_module_names(module_path: String) -> IrEnumTables:
+    mut saved := IrEnumTables([], [], {}, {}, {}, {}, {}, {})
+    if module_path.len() == 0 or module_path == ir_current_module_path:
+        return saved
+    root := ir_module_root_for_path(module_path)
+    if root < 0:
+        return saved
+    ir_import_renames = {}
+    ir_module_aliases = {}
+    for item_idx in ir_root_items(root):
+        ir_collect_import_item(get_node(item_idx), root)
+    for item_idx in ir_root_items(root):
+        node := get_node(item_idx)
+        if node.kind != "enum_decl" and node.kind != "enum":
+            continue
+        name := node.value
+        if generic_base_identity(module_path, name) == name:
+            continue
+        saved.names.push(name)
+        if ir_boxed_enums.contains_key(name):
+            saved.boxed.insert(name, ir_boxed_enums[name])
+        if ir_enum_variant_lists.contains_key(name):
+            saved.variant_lists.insert(name, ir_enum_variant_lists[name])
+        if ir_struct_names.contains_key(name):
+            saved.struct_names.insert(name, ir_struct_names[name])
+        for child in node.children:
+            variant_node := ir_unwrap_pub_node(child)
+            if variant_node.kind != "variant":
+                continue
+            key := name + "." + variant_node.value
+            saved.variant_keys.push(key)
+            if ir_enum_payload_kinds.contains_key(key):
+                saved.payload_kinds.insert(key, ir_enum_payload_kinds[key])
+            if ir_struct_field_lookup.contains_key(key):
+                saved.field_lookup.insert(key, ir_struct_field_lookup[key])
+            if ir_struct_field_index_lookup.contains_key(key):
+                saved.field_index_lookup.insert(key, ir_struct_field_index_lookup[key])
+        if ir_boxed_enums.contains_key(name):
+            ir_boxed_enums.remove(name)
+        _variants := ir_record_enum_variants(node, name)
+    return saved
+
+## restore enum tables.
+pub fn ir_restore_enum_tables(saved: IrEnumTables):
+    for name in saved.names:
+        if ir_boxed_enums.contains_key(name):
+            ir_boxed_enums.remove(name)
+        if saved.boxed.contains_key(name):
+            ir_boxed_enums.insert(name, saved.boxed[name])
+        if ir_enum_variant_lists.contains_key(name):
+            ir_enum_variant_lists.remove(name)
+        if saved.variant_lists.contains_key(name):
+            ir_enum_variant_lists.insert(name, saved.variant_lists[name])
+        if ir_struct_names.contains_key(name):
+            ir_struct_names.remove(name)
+        if saved.struct_names.contains_key(name):
+            ir_struct_names.insert(name, saved.struct_names[name])
+    for key in saved.variant_keys:
+        if ir_enum_payload_kinds.contains_key(key):
+            ir_enum_payload_kinds.remove(key)
+        if saved.payload_kinds.contains_key(key):
+            ir_enum_payload_kinds.insert(key, saved.payload_kinds[key])
+        if ir_struct_field_lookup.contains_key(key):
+            ir_struct_field_lookup.remove(key)
+        if saved.field_lookup.contains_key(key):
+            ir_struct_field_lookup.insert(key, saved.field_lookup[key])
+        if ir_struct_field_index_lookup.contains_key(key):
+            ir_struct_field_index_lookup.remove(key)
+        if saved.field_index_lookup.contains_key(key):
+            ir_struct_field_index_lookup.insert(key, saved.field_index_lookup[key])
+
+fn ir_collect_impl_method_signatures(node: Node, module_path: String):
+    impl_type := ir_impl_identity_type(node, module_path)
+    if impl_type.len() == 0:
+        return
+    for child in node.children:
+        method_idx := ir_unwrap_pub_child(child)
+        method_node := get_node(method_idx)
+        if ir_is_fn_decl_kind(method_node.kind):
+            ir_record_impl_method_signature(impl_type, method_idx, method_node, module_path)
+            ir_maybe_register_result_reg_method(node, impl_type, method_idx, method_node, module_path)
+    # inherited interface defaults get a signature under this concrete type
+    # too. a default compiles under the same symbol as a same-named method of
+    # the type's own impl, so it has to fit the register pair as well.
+    for default_idx in ir_inherited_default_indices(node):
+        ir_record_impl_method_signature(impl_type, default_idx, get_node(default_idx), module_path)
+        ir_maybe_register_result_reg_method(node, impl_type, default_idx, get_node(default_idx), module_path)
+
+# the declaration an impl target names, resolved in the impl's own module
+# (falling back to the module currently being emitted, then the global
+# table). a generic base has no single tid and answers -1; so does a target
+# the module cannot see, and the method then stays name-keyed only.
+fn ir_impl_owner_tid(impl_type: String, module_path: String) -> Int:
+    if impl_type.contains("["):
+        return 0 - 1
+    if ir_collecting_entry_impls:
+        return lookup_entry_type_id(impl_type)
+    mut path := module_path
+    if path.len() == 0:
+        path = ir_current_module_path
+    # the module's own generic of this name has no tid, whatever plain struct
+    # another module registered under the bare name
+    if module_declares_generic(path, impl_type):
+        return 0 - 1
+    if path.len() > 0:
+        qualified := lookup_qualified_type_id(path, impl_type)
+        if qualified >= 0:
+            return qualified
+    return lookup_type_id(impl_type)
+
+# register one impl method under its name key and, when the impl target
+# resolves to a concrete declaration, under a tid key too. the name key
+# remembers its owner so dispatch on a same-named struct from another module
+# can refuse it; the owner tracks the latest name-key write so the key and
+# its owner always describe the same declaration.
+pub fn ir_register_impl_method_entry(impl_type: String, method_name: String, full_name: String, module_path: String):
+    key := ir_impl_method_key(impl_type, method_name)
+    ir_impl_methods.insert(key, full_name)
+    owner_tid := ir_impl_owner_tid(impl_type, module_path)
+    if owner_tid >= 0:
+        ir_impl_methods.insert(ir_impl_tid_key(owner_tid, method_name), full_name)
+        ir_impl_method_owner.insert(key, owner_tid)
+    elif ir_impl_method_owner.contains_key(key):
+        ir_impl_method_owner.remove(key)
+
+fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_node: Node, module_path: String):
+    method_name := method_node.value
+    mut full_name := impl_type + "_" + method_name
+    if module_path.len() > 0:
+        full_name = ir_import_impl_method_name(module_path, impl_type, method_name)
+    key := ir_impl_method_key(impl_type, method_name)
+    ret_type := ir_resolve_assoc_type(impl_type, ir_extract_return_type(method_idx))
+    ir_register_impl_method_entry(impl_type, method_name, full_name, module_path)
+    ir_func_returns.insert(key, ret_type)
+    ir_func_returns.insert(full_name, ret_type)
+    # a method with type parameters of its own has no single body: it is
+    # specialized per call site the way a free generic function is. file the
+    # declaration under the symbol dispatch already resolves to, so a call site
+    # that reaches this name can queue the specialization instead of emitting a
+    # call to a body that was never written out.
+    if ir_has_generic_params(method_node):
+        ir_record_generic_method_decl(method_idx, full_name, impl_type, module_path, ir_owner_type_param_count(impl_type))
+
+## collect test decls.
+pub fn ir_collect_test_decls(root_idx: Int) -> List[Int]:
+    mut tests: List[Int] := []
+    for item_idx in ir_root_items(root_idx):
+        if get_node(item_idx).kind == "test_decl":
+            tests.push(item_idx)
+    return tests
+
+# the tags a test block carries, comma-joined, or "" for an untagged test.
+# the parser puts them on a `test_tags` child so the body stays the child
+# every other walker finds by kind.
+pub fn ir_test_decl_tags(idx: Int) -> String:
+    for child in get_node(idx).children:
+        if get_node(child).kind == "test_tags":
+            return get_node(child).value
+    return ""
+
+# the generated test main is a pure dispatcher: for each test it forks, runs the
+# test in the child, and records the outcome in the parent. isolating each test
+# in its own process means a failing assert (which exits) or a crash ends only
+# that test; the rest still run and every result is reported. the parent never
+# runs a test body, so no test's state leaks into the next child.
+pub fn ir_emit_test_main(root_idx: Int):
+    tests := ir_collect_test_decls(root_idx)
+    if tests.len() == 0:
+        return
+    ir_prepare_func_emission("int")
+    ir_emit_func_header("main", 0, "int")
+    # test builds replace user main, so the tracer registration call the
+    # normal main prelude carries is emitted here instead.
+    ir_emit_call0(ir_reg(), ir_cc_register_fn_name(), "int")
+
+    # every result carries the file it came from, which the runner cannot work
+    # out on its own: the binary it runs has no idea what it was built from.
+    file_r := ir_reg()
+    ir_emit("strref " + file_r.to_string() + " " + ir_str(ir_test_source_file))
+    ir_emit_call1(ir_reg(), "pith_test_set_file", "int", file_r)
+
+    for test_idx, i in tests:
+        name_r := ir_reg()
+        ir_emit("strref " + name_r.to_string() + " " + ir_str(get_node(test_idx).value))
+        tags_r := ir_reg()
+        ir_emit("strref " + tags_r.to_string() + " " + ir_str(ir_test_decl_tags(test_idx)))
+
+        # skip tests filtered out by PITH_TEST_FILTER, or by the tags this run
+        # selected or excluded, before doing any work
+        run_r := ir_reg()
+        ir_emit_call2(run_r, "pith_test_should_run", "int", name_r, tags_r)
+        run_l := ir_label()
+        skip_l := ir_label()
+        ir_emit("brif " + run_r.to_string() + " " + run_l + " " + skip_l)
+
+        ir_emit_label(run_l)
+        pid_r := ir_reg()
+        ir_emit_call0(pid_r, "pith_test_fork", "int")
+        parent_l := ir_label()
+        child_l := ir_label()
+        ir_emit("brif " + pid_r.to_string() + " " + parent_l + " " + child_l)
+
+        # child: remember the test name (so skip_test can name it), run the one
+        # test, then exit cleanly (a failed assert or skip exits first)
+        ir_emit_label(child_l)
+        ir_emit_call1(ir_reg(), "pith_test_enter", "int", name_r)
+        ir_emit_call0(ir_reg(), "__test_" + i.to_string(), "int")
+        ir_emit_call0(ir_reg(), "pith_test_child_ok", "int")
+        term_r := ir_reg()
+        ir_emit("iconst " + term_r.to_string() + " 0")
+        ir_emit("ret " + term_r.to_string())
+
+        # parent: wait for the child and record pass/fail, then rejoin
+        ir_emit_label(parent_l)
+        ir_emit_call2(ir_reg(), "pith_test_record", "int", name_r, pid_r)
+        ir_emit("jmp " + skip_l)
+        ir_emit_label(skip_l)
+
+    # exit with the failure count so `pith test` fails the process on any failure,
+    # regardless of how the entry wrapper treats main's return value.
+    summary_r := ir_reg()
+    ir_emit_call0(summary_r, "pith_test_summary", "int")
+    ir_emit_call1(ir_reg(), "exit", "unknown", summary_r)
+    ir_emit_zero_ret_endfunc()
+
+# the module's type aliases. every target node is recorded first, so a
+# target that names another alias (`Map[Id,String]`) is written out in full
+# whichever order the two are declared in. an alias of a plain or generic
+# type also gets that text in ir_type_aliases, for the resolvers that only
+# have a name; an optional, tuple, function or result target has no such
+# spelling and is reached through ir_alias_target_node alone.
+fn ir_collect_type_aliases(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if node.kind == "type_alias":
+            for tc in node.children:
+                if ir_is_type_node_kind(get_node(tc).kind):
+                    ir_type_alias_nodes.insert(node.value, tc)
+                    break
+    for name in ir_type_alias_nodes.keys():
+        target := ir_type_node_text(ir_type_alias_nodes[name], 0)
+        if target.len() > 0:
+            ir_type_aliases.insert(name, target)
+
+fn ir_collect_import_item(node: Node, root_idx: Int):
+    if node.kind == "import":
+        ir_register_import_alias(node.value)
+    elif node.kind == "from_import":
+        ir_collect_from_import_renames(ir_expand_wildcard_import(node.value, root_idx))
+
+# a from-import's value with a `*` spelled out as the names it brings in:
+# every public declaration of the module that `root_idx` does not declare
+# itself, since a module's own declaration shadows a wildcard import, as it
+# does in the checker. any other value comes back unchanged.
+fn ir_expand_wildcard_import(value: String, root_idx: Int) -> String:
+    parts := value.split(" ")
+    if parts.len() != 2 or parts[1] != "*":
+        return value
+    module_root := ir_module_root_for_path(parts[0])
+    if module_root < 0:
+        return value
+    mut local: Map[String, Bool] := {}
+    for item_idx in ir_root_items(root_idx):
+        name := ir_top_level_decl_name(get_node(item_idx))
+        if name.len() > 0:
+            local.insert(name, true)
+    mut names: List[String] := [parts[0]]
+    for child in get_node(module_root).children:
+        pub_node := get_node(child)
+        if pub_node.kind != "pub" or pub_node.children.len() == 0:
+            continue
+        name := ir_top_level_decl_name(get_node(pub_node.children[0]))
+        if name.len() > 0 and not local.contains_key(name):
+            names.push(name)
+    return names.join(" ")
+
+fn ir_register_alias_structs(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        cn := get_node(item_idx)
+        if cn.kind == "type_alias":
+            aname := cn.value
+            if ir_type_aliases.contains_key(aname):
+                target := ir_type_aliases[aname]
+                if ir_struct_names.contains_key(target):
+                    ir_struct_names.insert(aname, ir_struct_names[target])
+                    ir_emit("struct_alias " + aname + " " + target)
+
+fn ir_record_function_return(node: Node):
+    mut has_returns := false
+    for returns_idx in node.children:
+        returns_node := get_node(returns_idx)
+        if returns_node.kind == "returns":
+            ir_record_returns_clause(node.value, returns_node)
+            has_returns = true
+    # a function with no returns clause returns void; still record it so it is
+    # recognized as a declared callable (e.g. usable as a fn-value).
+    if not has_returns:
+        ir_func_returns.insert(node.value, "void")
+    ir_maybe_register_result_reg(node.value, node, ir_current_module_path)
+
+fn ir_record_function_return_as(name: String, node: Node, home_module: String):
+    mut has_returns := false
+    for returns_idx in node.children:
+        returns_node := get_node(returns_idx)
+        if returns_node.kind == "returns":
+            ir_record_returns_clause(name, returns_node)
+            has_returns = true
+    if not has_returns:
+        ir_func_returns.insert(name, "void")
+    ir_maybe_register_result_reg(name, node, home_module)
+
+fn ir_record_returns_clause(name: String, returns_node: Node):
+    for type_idx in returns_node.children:
+        type_node := get_node(ir_alias_target_node(type_idx))
+        # a function that returns a function type is still a declared callable,
+        # and recording it is what keeps it out of a lambda's capture set: the
+        # capture blocker is built from this table's keys, so a name missing
+        # here is read as a free variable and the enclosing function emits a
+        # `load` for it. `fn pick() -> fn(Int) -> Int` used to fail that way,
+        # with "unknown load source 'pick'". merely naming it inside a lambda
+        # was enough, no call required.
+        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "result_type" or type_node.kind == "optional_type" or type_node.kind == "fn_type":
+            ir_func_returns.insert(name, ir_resolve_type_node(type_idx))
+        if type_node.kind == "result" or type_node.kind == "result_type":
+            if type_node.children.len() > 0:
+                ir_func_result_ok_kinds.insert(name, ir_retkind(ir_resolve_type_node(type_node.children[0])))
+
+fn ir_emit_global_binding(node: Node, is_threadlocal: Bool):
+    gname := ir_binding_name(node)
+    ir_record_global_slot(gname)
+    if node.value.contains(" mut"):
+        ir_mutable_global_names.insert(gname, true)
+    mut init_val := "0"
+    mut global_type := ""
+    mut global_map_value_type := ""
+    for gc in node.children:
+        gcn := get_node(ir_alias_target_node(gc))
+        if gcn.kind == "type" or gcn.kind == "generic_type" or gcn.kind == "optional_type" or gcn.kind == "fn_type":
+            global_type = ir_resolve_type_node(gc)
+            if global_map_value_type.len() == 0:
+                global_map_value_type = ir_resolve_map_value_type_node(gc)
+        elif gcn.kind == "int_lit":
+            init_val = gcn.value
+            if global_type.len() == 0:
+                global_type = "int"
+        elif gcn.kind == "string_lit":
+            si := ir_str(gcn.value)
+            init_val = "str:" + si
+            if global_type.len() == 0:
+                global_type = "string"
+        elif gcn.kind == "list":
+            init_val = "list"
+            if global_type.len() == 0:
+                global_type = "list"
+        elif gcn.kind == "map":
+            init_val = "map"
+            if global_type.len() == 0:
+                global_type = "map"
+        elif gcn.kind == "set":
+            init_val = ir_checked_type(gc)
+            if init_val.len() == 0:
+                init_val = ir_infer_type(gc)
+            if init_val.len() == 0:
+                init_val = "set"
+            if global_type.len() == 0:
+                global_type = init_val
+        elif gcn.kind == "bool_lit":
+            if gcn.value == "true":
+                init_val = "1"
+            else:
+                init_val = "0"
+            if global_type.len() == 0:
+                global_type = "bool"
+    if global_type.len() > 0:
+        ir_record_global_type(gname, global_type)
+    if global_map_value_type.len() > 0:
+        ir_global_map_value_types.insert(gname, global_map_value_type)
+    if is_threadlocal:
+        # per-thread storage: no shared data slot. record a unique slot and the
+        # global's kind so reads/writes route through the tls runtime calls, and
+        # so ir_emit_tls_thunks can generate its lazy per-thread initializer.
+        # assign the slot once so re-processing the same global (across emission
+        # passes) can never hand two access sites different slots.
+        key := ir_tls_key(gname)
+        if not ir_threadlocal_slots.contains_key(key):
+            ir_threadlocal_slots.insert(key, ir_next_tls_slot)
+            ir_next_tls_slot = ir_next_tls_slot + 1
+        ir_threadlocal_kinds.insert(key, global_type)
+        return
+    ir_emit("global " + ir_global_storage_symbol(gname) + " " + init_val)
+    if ir_count_marks:
+        # an initializer that isn't a plain literal (`-1`, a call) leaves
+        # global_type empty; the mark falls back on the checked type, without
+        # changing what the code above records
+        mut mark_kind := global_type
+        for gc in node.children:
+            if mark_kind.len() == 0:
+                mark_kind = ir_checked_type(gc)
+        ir_emit("mark global " + ir_global_storage_symbol(gname) + " " + ir_count_mark_kind(mark_kind))
+
+## emit global bindings.
+pub fn ir_emit_global_bindings(root: Node):
+    for child in root.children:
+        cn := ir_unwrap_pub_node(child)
+        if cn.kind == "threadlocal":
+            inner := get_node(cn.children[0])
+            if ir_is_binding_kind(inner.kind):
+                ir_emit_global_binding(inner, true)
+        elif ir_is_binding_kind(cn.kind):
+            ir_emit_global_binding(cn, false)
+
+# a global whose initializer is a bare literal that ir_emit_global_binding can
+# inline gets its value through the declaration; anything else (calls,
+# operators, interpolation, collection literals with elements) must run at
+# startup. only the literal kinds ir_emit_global_binding actually inlines (a
+# positive int, a string, a bool) count as inlined here. a float literal and a
+# negative/unary literal are NOT inlined there (the declaration would zero them),
+# so they must run at startup like any other computed initializer.
+pub fn ir_global_needs_runtime_init(cn: Node) -> Bool:
+    parts := ir_collect_bind_parts(cn)
+    if parts.val_idx < 0:
+        return false
+    vk := get_node(parts.val_idx).kind
+    if vk == "int_lit" or vk == "bool_lit" or vk == "true" or vk == "false":
+        return false
+    if vk == "string_lit" or vk == "string" or vk == "str_lit":
+        return false
+    return true
+
+# the text of every error a body synthesizes rather than reads from the
+# source: the "<name> failed" message of a sentinel builtin's wrapped
+# result, and the messages an index miss, a `?` on none and a `.value()` on
+# none propagate. no
+# literal holds them, so the collector cannot see them, and a body that
+# interned one itself would add it after the table was written, where the
+# consumer reads it as a null string (#1147, #1109).
+pub fn ir_preseed_synthesized_error_strings():
+    for builtin_name in ir_sentinel_result_builtin_names():
+        ir_str(builtin_name + " failed")
+    _index_id := ir_str("index out of bounds")
+    _unwrap_id := ir_str("unwrap of none")
+    _value_id := ir_str("value() on none")
+
+## collect root import metadata.
+pub fn ir_collect_root_import_metadata(root_idx: Int):
+    ir_reset_import_metadata()
+    for root, i in ir_preloaded_import_roots:
+        ir_collect_preloaded_root_metadata(root, ir_preloaded_import_paths[i])
+
+## collect root phase one metadata.
+pub fn ir_collect_root_phase_one_metadata(root_idx: Int):
+    ir_mark_index_offsets()
+    ir_reset_phase_one_metadata()
+
+    for root, preload_i in ir_preloaded_import_roots:
+        mut module_path := ""
+        if preload_i < ir_preloaded_import_paths.len():
+            module_path = ir_preloaded_import_paths[preload_i]
+        for item_idx in ir_root_items(root):
+            node := get_node(item_idx)
+            if ir_is_fn_decl_kind(node.kind):
+                ir_record_function_return_as(ir_import_target_name(module_path, node.value), node, module_path)
+        ir_collect_generic_function_decls_from_root(root, module_path)
+
+    ir_collect_type_aliases(root_idx)
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        ir_collect_import_item(node, root_idx)
+        if ir_is_fn_decl_kind(node.kind):
+            ir_record_function_return(node)
+            if ir_has_generic_params(node):
+                ir_record_generic_function_decl(item_idx, node, "")
+
+# the second metadata pass, run once names and generic declarations are
+# known from phase one: index interfaces and associated types across the
+# module graph, then register struct and enum shapes, drop impls and impl
+# method signatures from the imports and this module, so lowering can
+# resolve every field and method a body touches.
+pub fn ir_collect_root_phase_two_metadata(root_idx: Int):
+    ir_reset_phase_two_metadata()
+    ir_register_known_import_structs()
+
+    # impl blocks (and the interfaces whose defaults they inherit) are
+    # collected from every module in the build, not just direct imports: a
+    # method can live in an impl a module away from both the struct's
+    # declaration and the call site, and a call the checker resolved must
+    # have a symbol to lower to. struct layout collection stays scoped to
+    # direct imports. falls back to the direct list when no full graph was
+    # provided.
+    mut method_roots := ir_all_module_roots
+    mut method_paths := ir_all_module_paths
+    if method_roots.len() == 0:
+        method_roots = ir_preloaded_import_roots
+        method_paths = ir_preloaded_import_paths
+
+    # index every interface (imports + root) before any impl signatures are
+    # collected, so an impl can find its interface's defaults regardless of
+    # declaration order across modules
+    ir_collect_entry_impls(root_idx)
+    mut iface_i := 0
+    while iface_i < method_roots.len():
+        ir_index_interfaces_in_root(method_roots[iface_i])
+        ir_collect_assoc_bindings_in_root(method_roots[iface_i], method_paths[iface_i])
+        iface_i = iface_i + 1
+    ir_index_interfaces_in_root(root_idx)
+    ir_collect_assoc_bindings_in_root(root_idx, ir_current_module_path)
+
+    mut preload_i := 0
+    while preload_i < ir_preloaded_import_roots.len():
+        ir_collect_struct_decls(ir_preloaded_import_roots[preload_i], false, ir_preloaded_import_paths[preload_i])
+        ir_collect_drop_impls(ir_preloaded_import_roots[preload_i], ir_preloaded_import_paths[preload_i])
+        preload_i = preload_i + 1
+
+    mut impl_i := 0
+    while impl_i < method_roots.len():
+        ir_collect_impl_methods(method_roots[impl_i], method_paths[impl_i])
+        impl_i = impl_i + 1
+    ir_collect_from_imported_enums(root_idx)
+
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if node.kind == "struct_decl" or node.kind == "struct":
+            ir_collect_struct_decl(item_idx, node, true, ir_current_module_path)
+        elif node.kind == "enum_decl" or node.kind == "enum":
+            ir_collect_enum_decl(node, true, ir_current_module_path)
+        elif node.kind == "impl_decl":
+            ir_collect_impl_method_signatures(node, "")
+    ir_collect_drop_impls(root_idx, "")
+
+    ir_register_alias_structs(root_idx)
+
+# walk every impl_decl in the current root and register specialization name
+# entries into ir_impl_method_specializations without emitting bodies yet.
+# then ir_emit_impl_methods's per-impl loop can emit bodies safely; any
+# cross-impl dispatch lookup will already find the right specialized symbol.
+pub fn ir_preregister_all_impl_specializations(root_idx: Int, root: Node):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        mut actual_node := node
+        if node.kind == "pub":
+            actual_node = get_node(node.children[0])
+        if actual_node.kind == "impl_decl":
+            impl_type := ir_impl_identity_type(actual_node, ir_current_module_path)
+            if impl_type.len() > 0:
+                ir_register_impl_method_specialization_names(actual_node, impl_type)
+
+fn ir_register_impl_method_specialization_names(impl_node: Node, impl_type: String):
+    if not has_generic_declaration(impl_type):
+        return
+    sdecl := get_node(get_generic_declaration_index(impl_type))
+    struct_params := collect_generic_parameter_names(sdecl)
+    if struct_params.len() == 0:
+        return
+    instance_tids := struct_instance_tids
+    for inst_tid in instance_tids:
+        if struct_instance_base_name[inst_tid] != impl_type:
+            continue
+        if not struct_instance_type_args.contains_key(inst_tid):
+            continue
+        arg_tids := decode_tid_list(struct_instance_type_args[inst_tid])
+        mut arg_names: List[String] := []
+        for at in arg_tids:
+            arg_names.push(ir_type_from_tid(at))
+        instance_type_name := get_type_name(inst_tid)
+        for child in impl_node.children:
+            child_node := get_node(child)
+            # a method with type parameters of its own has no per-instance
+            # copy: each call queues a specialization keyed by the instance
+            # and the method's own arguments (ir_queue_generic_method_call)
+            if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
+                ir_register_one_specialized_method_name(child_node, impl_type, instance_type_name, arg_names)

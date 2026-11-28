@@ -1,0 +1,621 @@
+# ir_module_emit.pith: top-level module, function, impl-method, generic
+# specialization, global-init, and TLS-thunk emission driver (emit_ir).
+
+from ast import Node, get_node
+from checker import c_check_method_body_for, c_check_method_specialization, c_check_specialization, collect_generic_parameter_names, decode_tid_list, get_generic_declaration_index, has_generic_declaration, struct_instance_base_name, struct_instance_tids, struct_instance_type_args
+from types import get_type_name, lookup_type_id
+from ir_ast_helpers import ir_binding_name, ir_is_binding_kind, ir_unwrap_pub_child, ir_unwrap_pub_node
+from ir_common import ir_base_decl_name, ir_collect_bind_parts, ir_global_storage_symbol, ir_root_items
+from ir_builder import ir_builder_lines, ir_emit, ir_emit_string_table, ir_reg, ir_str
+from ir_state import IrDecodeHooks, ir_active_fn_bindings, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_params, ir_current_arc_func, ir_current_func_miss_fails, ir_current_func_optional_inner_kind, ir_current_func_return_kind, ir_current_func_returns_result, ir_current_impl_subst_args, ir_current_impl_subst_params, ir_current_impl_type, ir_current_module_path, ir_emit_tests, ir_emitting_main_body, ir_emitting_test_func, ir_finish_module_emit, ir_func_local_names, ir_func_returns, ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_emitted_specializations, ir_generic_method_owners, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_impl_method_specializations, ir_impl_methods, ir_import_renames, ir_lambda_bodies, ir_lambda_count, ir_module_aliases, ir_preloaded_import_roots, ir_reset_generic_dtor_maps, ir_reset_module_state, ir_result_reg_funcs, ir_tail_match_node, ir_test_source_file, ir_tuple_walk_root
+from ir_types import ir_impl_method_key, ir_lookup_func_return, ir_rc_kind, ir_resolve_assoc_type, ir_sanitize_symbol, ir_type_from_tid
+from ir_symbols import ir_decode_generic_spec_subst_tids, ir_decode_type_list, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_extract_return_type_with_subst, ir_generic_owner_param_count, ir_has_generic_params, ir_resolve_type_node
+from ir_primitives import ir_emit_call0, ir_rc_retain_reg
+from ir_match_emit import ir_function_tail_match
+from ir_decode_emit import ir_emit_config_decode_specialization_body, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_is_config_decode_specialization, ir_is_handle_decode_path_specialization, ir_is_handle_decode_specialization, ir_is_handle_decode_text_path_specialization, ir_is_handle_decode_text_specialization, ir_is_json_decode_object_specialization, ir_is_json_decode_path_specialization, ir_is_json_decode_specialization, ir_json_intern_nested_specs
+from ir_type_infer import ir_emit_func_header, ir_emit_zero_ret_endfunc, ir_extract_optional_inner_type, ir_extract_return_type, ir_find_body, ir_fn_miss_fails, ir_fn_returns_result, ir_generic_subst_params, ir_impl_identity_type, ir_infer_type, ir_inherited_default_indices, ir_map_init_target, ir_optional_inner_kind_of_param_return, ir_param_count, ir_resolve_assoc_in_generic, ir_specialized_optional_inner, ir_struct_instance_for_args
+from ir_analysis import ir_record_borrow_params, ir_record_closure_params, ir_record_storage_keepers
+from ir_rc_lifecycle import ir_emit_rc_cleanup, ir_emit_rc_prologue, ir_expr_is_borrowed, ir_fn_bindings_by_param, ir_main_returns_exit_code
+from ir_synth_helpers import ir_append_lambda_bodies, ir_cc_register_fn_name, ir_emit_cc_register_tracers, ir_emit_count_marks, ir_emit_enum_dtors, ir_emit_enum_eq_fns, ir_emit_enum_tracers, ir_emit_fn_params, ir_emit_fn_params_with_types, ir_emit_generic_enum_instance_dtors, ir_emit_generic_enum_instance_tracers, ir_emit_generic_struct_instance_dtors, ir_emit_generic_struct_instance_tracers, ir_emit_interface_adapters, ir_emit_kinded_release_helper, ir_emit_named_param, ir_emit_optional_tuple_walks, ir_emit_optional_walks, ir_emit_result_arg_release_helpers, ir_emit_result_unshare_helpers, ir_emit_share_expr, ir_emit_share_reg, ir_emit_struct_walks, ir_emit_tuple_cascade_helpers, ir_emit_tuple_walks, ir_prepare_func_emission
+from ir_metadata_collect import ir_collect_root_import_metadata, ir_collect_root_phase_one_metadata, ir_collect_root_phase_two_metadata, ir_collect_strings, ir_collect_struct_field_strings, ir_collect_test_decls, ir_emit_global_bindings, ir_emit_test_main, ir_global_needs_runtime_init, ir_preregister_all_impl_specializations, ir_preseed_synthesized_error_strings, ir_register_impl_method_entry, ir_restore_enum_tables, ir_test_decl_tags, ir_use_module_names
+from ir_lower import ir_block, ir_defer_emit_to_function_frame, ir_emit_value_for_target, ir_expr
+
+fn ir_emit_impl_methods(node: Node, impl_type: String):
+    # for a generic struct, also emit one specialized copy of each method per
+    # known instantiation so calls inside the body (`self.src.next()`) can
+    # dispatch on the concrete type rather than the unresolved generic
+    # parameter (`I.next` -> `next unknown`). emit these BEFORE the base
+    # bodies so we can read each method's still-prefixed base symbol name
+    # out of ir_impl_methods (ir_impl_func below overwrites it).
+    ir_emit_impl_method_specializations(node, impl_type)
+    for child in node.children:
+        # a pub method sits behind a pub wrapper node; without this
+        # unwrap the method silently never emits and calls return zero
+        method_idx := ir_unwrap_pub_child(child)
+        child_node := get_node(method_idx)
+        if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
+            ir_impl_func(method_idx, impl_type)
+    # emit a per-type copy of each interface default this impl didn't override.
+    # the checker walked the default once per implementing type, but the
+    # expression-type cache is keyed by node, so every copy read the types of
+    # whichever type was checked last. re-check the default against this type
+    # just before its copy is emitted, silently, so `self.name()` inside it
+    # carries this implementation's types and ownership.
+    for default_idx in ir_inherited_default_indices(node):
+        if not ir_has_generic_params(get_node(default_idx)):
+            impl_tid := lookup_type_id(impl_type)
+            if impl_tid >= 0:
+                c_check_method_body_for(default_idx, impl_tid, false)
+            ir_impl_func(default_idx, impl_type)
+
+fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
+    if not has_generic_declaration(impl_type):
+        return
+    sdecl := get_node(get_generic_declaration_index(impl_type))
+    struct_params := collect_generic_parameter_names(sdecl)
+    if struct_params.len() == 0:
+        return
+    instance_tids := struct_instance_tids
+    for inst_tid in instance_tids:
+        if struct_instance_base_name[inst_tid] != impl_type:
+            continue
+        if not struct_instance_type_args.contains_key(inst_tid):
+            continue
+        arg_tids := decode_tid_list(struct_instance_type_args[inst_tid])
+        mut arg_names: List[String] := []
+        for at in arg_tids:
+            arg_names.push(ir_type_from_tid(at))
+        instance_type_name := get_type_name(inst_tid)
+        for child in impl_node.children:
+            method_idx := ir_unwrap_pub_child(child)
+            child_node := get_node(method_idx)
+            if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
+                ir_impl_func_specialized(method_idx, impl_type, instance_type_name, inst_tid, struct_params, arg_names)
+
+# emit one method of a generic impl for a single instance (`MapIter[Range,
+# Int, Int].next` as `MapIter_Range_int_int_next`), once per emit pass. the
+# instance's symbol is also recorded in ir_impl_method_specializations, with
+# the module prefix the base method carries, so call sites in other modules
+# reach the same symbol. the body is re-checked against the instance first,
+# so its nodes carry concrete types while it emits.
+fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: String, inst_tid: Int, params: List[String], arg_names: List[String]):
+    node := get_node(idx)
+    orig_name := node.value
+    # specialized symbol name e.g. MapIter_Range_int_int_next
+    mut suffix := ""
+    for an in arg_names:
+        suffix = suffix + "_" + ir_sanitize_symbol(an)
+    full_name := base_impl_type + suffix + "_" + orig_name
+    method_key := ir_impl_method_key(instance_type, orig_name)
+    # if ir_impl_methods already has a specialized entry (e.g. a previous
+    # ir_impl_func_specialized for the same instance ran in this emit pass)
+    # then the body is already on its way out; skip emitting it again
+    if ir_impl_methods.contains_key(method_key):
+        return
+    ir_impl_methods.insert(method_key, full_name)
+    # also record in a dedicated, non-reset map keyed by the instance-typed
+    # method. derive the module-path prefix from the base method's currently
+    # registered symbol (phase-two metadata inserted it with the right
+    # prefix; this runs before ir_impl_func overwrites it for the current
+    # module's impls) so cross-module call sites use the right linker symbol.
+    base_key := ir_impl_method_key(base_impl_type, orig_name)
+    expected_base_sym := base_impl_type + "_" + orig_name
+    mut prefixed_full := full_name
+    if ir_impl_methods.contains_key(base_key):
+        base_sym := ir_impl_methods[base_key]
+        if base_sym.len() > expected_base_sym.len() and base_sym.ends_with(expected_base_sym):
+            prefix_len := base_sym.len() - expected_base_sym.len()
+            prefixed_full = base_sym.substring(0, prefix_len) + full_name
+    ir_impl_method_specializations.insert(method_key, prefixed_full)
+
+    body_idx := ir_find_body(idx)
+    param_count := ir_param_count(idx) + 1
+    ret_type := ir_extract_return_type(idx)
+    ir_prepare_func_emission(ret_type)
+    ir_current_func_optional_inner_kind = ir_specialized_optional_inner(idx, inst_tid)
+    ir_current_func_returns_result = ir_fn_returns_result(idx)
+    ir_current_func_miss_fails = ir_fn_miss_fails(idx)
+    ir_current_impl_type = instance_type
+    ir_current_impl_subst_params = params
+    ir_current_impl_subst_args = arg_names
+    # type-check the method against this instance before emitting it (see
+    # ir_emit_generic_specialization); the prologue's bind prepass then reads
+    # real tids for the body's nodes.
+    c_check_method_specialization(idx, inst_tid, false)
+    ir_emit_func_header(full_name, param_count, ret_type)
+    ir_emit_named_param("self", instance_type)
+    ir_emit_fn_params(idx)
+    # like every other function body, track owned locals so the exit cleanup
+    # releases them. the body was re-checked against this instance just above,
+    # so the prologue's bind prepass reads real tids for its nodes; the
+    # impl-subst context (set above) still names the concrete types for the
+    # emitter's own resolution of annotations spelled with the parameters.
+    ir_emit_rc_prologue(body_idx)
+    ir_func_returns.insert(method_key, ret_type)
+    ir_func_returns.insert(full_name, ret_type)
+    ir_finish_func_emission(body_idx)
+    ir_current_impl_type = ""
+    ir_current_impl_subst_params = []
+    ir_current_impl_subst_args = []
+
+# emit the body of one queued generic specialization. `key` is the
+# tab-separated base name and type arguments ir_queue_generic_specialization
+# registered; the declaration is type-checked under those arguments and then
+# emitted under the specialized symbol with the substitution active.
+fn ir_emit_generic_specialization(key: String):
+    if not ir_generic_specialization_names.contains_key(key):
+        return
+    base_name := key.split(chr(9))[0]
+    if not ir_generic_decl_indices.contains_key(base_name):
+        return
+    decl_idx := ir_generic_decl_indices[base_name]
+    decl_node := get_node(decl_idx)
+    # the names the type arguments substitute: for a method on a generic
+    # owner the owner's parameters lead and the method's own follow, in
+    # both the kinds list and the checker's type ids, split at owner_count.
+    generic_params := ir_generic_subst_params(base_name)
+    owner_count := ir_generic_owner_param_count(base_name)
+    concrete_types := ir_decode_type_list(ir_generic_specialization_type_lists[key])
+    spec_name := ir_generic_specialization_names[key]
+    body_idx := ir_find_body(decl_idx)
+    param_count := ir_param_count(decl_idx)
+    ret_type := ir_resolve_assoc_in_generic(ir_extract_return_type_with_subst(decl_idx, generic_params, concrete_types), generic_params, concrete_types)
+    mut param_types := ir_extract_param_types_with_subst(decl_idx, generic_params, concrete_types)
+    mut resolved_param_types: List[String] := []
+    for pt in param_types:
+        resolved_param_types.push(ir_resolve_assoc_in_generic(pt, generic_params, concrete_types))
+    param_types = resolved_param_types
+    # a generic impl method carries an implicit self ahead of its declared
+    # parameters and emits inside its impl's context, so `self.field` resolves
+    # against the owner's layout. everything else about its specialization is
+    # a free generic function's. on a generic owner the context is the
+    # receiver's instance (`Box[Int]`), found from the leading type
+    # arguments, and its own parameters are in force the way they are for a
+    # per-instance copy of a plain method (ir_impl_func_specialized).
+    mut owner_type := ""
+    if ir_generic_method_owners.contains_key(base_name):
+        owner_type = ir_generic_method_owners[base_name]
+    mut owner_tid := 0 - 1
+    mut owner_params: List[String] := []
+    mut owner_kinds: List[String] := []
+    # type-check the body against this specialization's concrete types
+    # before emitting it, so c_get_expr_type answers real tids for its nodes
+    # instead of the error type the unchecked body carries. the walk records
+    # nothing: the checker's own pass reported already. the type arguments
+    # come from the checker's record at the call that first asked for this
+    # specialization; a key with none recorded (an explicit spelling the
+    # checker did not resolve) is emitted as before.
+    spec_tids := ir_decode_generic_spec_subst_tids(key)
+    if spec_tids.len() == generic_params.len():
+        mut method_tids := spec_tids
+        if owner_type.len() > 0:
+            owner_tid = lookup_type_id(owner_type)
+        if owner_count > 0:
+            mut owner_tids: List[Int] := []
+            method_tids = []
+            for t, i in spec_tids:
+                if i < owner_count:
+                    owner_tids.push(t)
+                    owner_params.push(generic_params[i])
+                    owner_kinds.push(concrete_types[i])
+                else:
+                    method_tids.push(t)
+            owner_tid = ir_struct_instance_for_args(owner_type, owner_tids)
+            if owner_tid < 0:
+                return
+            owner_type = get_type_name(owner_tid)
+        c_check_specialization(decl_idx, owner_tid, method_tids, false)
+    elif owner_count > 0:
+        return
+    saved_impl_type := ir_current_impl_type
+    saved_impl_params := ir_current_impl_subst_params
+    saved_impl_args := ir_current_impl_subst_args
+    saved_params := ir_active_generic_params
+    saved_types := ir_active_generic_concrete_types
+    saved_module_path := ir_active_generic_module_path
+    saved_fn_bindings := ir_active_fn_bindings
+    ir_active_fn_bindings = {}
+    if owner_type.len() == 0:
+        ir_active_fn_bindings = ir_fn_bindings_by_param(key, decl_idx)
+    ir_active_generic_params = generic_params
+    ir_active_generic_concrete_types = concrete_types
+    if owner_count > 0:
+        ir_current_impl_subst_params = owner_params
+        ir_current_impl_subst_args = owner_kinds
+    if ir_generic_decl_module_paths.contains_key(base_name):
+        ir_active_generic_module_path = ir_generic_decl_module_paths[base_name]
+    else:
+        ir_active_generic_module_path = ""
+    saved_import_renames := ir_import_renames
+    saved_module_aliases := ir_module_aliases
+    saved_enum_tables := ir_use_module_names(ir_active_generic_module_path)
+    ir_prepare_func_emission(ret_type)
+    # a return type written as the bare parameter (`-> T`) is an optional
+    # whenever the type argument is one, and the return path must then forward
+    # the value instead of boxing it: the substituted kind is "tuple", which
+    # the return path otherwise reads as a result and wraps as an ok box (a
+    # second shell around the optional, #1042). the written-`T?` extractor
+    # below answers nothing for it, so the type argument answers instead.
+    mut param_return_inner := ""
+    if spec_tids.len() == generic_params.len():
+        param_return_inner = ir_optional_inner_kind_of_param_return(decl_idx, generic_params, spec_tids)
+    ir_current_func_optional_inner_kind = ir_resolve_assoc_in_generic(ir_extract_optional_inner_type_with_subst(decl_idx, generic_params, concrete_types), generic_params, concrete_types)
+    if ir_current_func_optional_inner_kind.len() == 0:
+        ir_current_func_optional_inner_kind = param_return_inner
+    ir_current_func_returns_result = ir_fn_returns_result(decl_idx)
+    ir_current_func_miss_fails = ir_fn_miss_fails(decl_idx)
+    if owner_type.len() > 0:
+        ir_current_impl_type = owner_type
+        ir_emit_func_header(spec_name, param_count + 1, ret_type)
+        ir_emit_named_param("self", owner_type)
+    else:
+        ir_emit_func_header(spec_name, param_count, ret_type)
+    ir_emit_fn_params_with_types(decl_idx, param_types)
+    ir_func_returns.insert(spec_name, ret_type)
+    decode_hooks := IrDecodeHooks(ir_expr, ir_emit_value_for_target, ir_emit_default_return)
+    if concrete_types.len() == 1 and ir_is_config_decode_specialization(base_name, false, ir_active_generic_module_path, decl_idx):
+        ir_emit_config_decode_specialization_body(concrete_types[0], false, decode_hooks)
+    elif concrete_types.len() == 1 and ir_is_config_decode_specialization(base_name, true, ir_active_generic_module_path, decl_idx):
+        ir_emit_config_decode_specialization_body(concrete_types[0], true, decode_hooks)
+    elif concrete_types.len() == 1 and ir_is_handle_decode_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_handle_decode_specialization_body(concrete_types[0], ir_active_generic_module_path, decode_hooks)
+    elif concrete_types.len() == 1 and ir_is_handle_decode_text_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_handle_decode_text_specialization_body(concrete_types[0], ir_active_generic_module_path, concrete_types, ret_type)
+    elif concrete_types.len() == 1 and ir_is_handle_decode_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_handle_decode_path_specialization_body(concrete_types[0], ir_active_generic_module_path, decode_hooks)
+    elif concrete_types.len() == 1 and ir_is_handle_decode_text_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_handle_decode_text_path_specialization_body(concrete_types[0], ir_active_generic_module_path, concrete_types, ret_type)
+    elif concrete_types.len() == 1 and ir_is_json_decode_specialization(base_name, ir_active_generic_module_path, decl_idx, false):
+        ir_emit_json_decode_specialization_body(concrete_types[0], ir_active_generic_module_path, false, decode_hooks)
+    elif concrete_types.len() == 1 and ir_is_json_decode_specialization(base_name, ir_active_generic_module_path, decl_idx, true):
+        ir_emit_json_decode_specialization_body(concrete_types[0], ir_active_generic_module_path, true, decode_hooks)
+    elif concrete_types.len() == 1 and ir_is_json_decode_object_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_json_decode_object_specialization_body(concrete_types[0], ir_active_generic_module_path, decode_hooks)
+    elif concrete_types.len() == 1 and ir_is_json_decode_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_json_decode_path_specialization_body(concrete_types[0], ir_active_generic_module_path, decode_hooks)
+    else:
+        # the body was type-checked against this specialization's concrete
+        # types just above, so the ownership classification reads real
+        # types here and the prologue every concrete body runs applies: the
+        # bind prepass, the zero-stores, the release of a previous value on
+        # rebind and the exit cleanup, with the same escape rules (a
+        # returned local's count leaves with the value, a container store
+        # takes its own, a capture is untracked). a specialization used to
+        # decide its own tracked set with a syntactic walk over the body,
+        # tracking only the locals it could prove confined and publishing
+        # every other one untracked; that walk is gone with the blindness
+        # it worked around.
+        ir_emit_rc_prologue(body_idx)
+        ir_finish_func_emission(body_idx)
+    ir_active_generic_params = saved_params
+    ir_active_generic_concrete_types = saved_types
+    ir_active_generic_module_path = saved_module_path
+    ir_import_renames = saved_import_renames
+    ir_module_aliases = saved_module_aliases
+    ir_restore_enum_tables(saved_enum_tables)
+    ir_active_fn_bindings = saved_fn_bindings
+    ir_current_impl_type = saved_impl_type
+    ir_current_impl_subst_params = saved_impl_params
+    ir_current_impl_subst_args = saved_impl_args
+
+fn ir_emit_generic_specializations():
+    mut i := 0
+    while i < ir_generic_specialization_keys.len():
+        key := ir_generic_specialization_keys[i]
+        if not ir_generic_emitted_specializations.contains_key(key):
+            ir_emit_generic_specialization(key)
+            ir_generic_emitted_specializations.insert(key, 1)
+        i = i + 1
+
+# returns a throwaway 0 so it can travel as a fn value: void
+# functions are not yet recognized by the function-value path.
+fn ir_emit_default_return() -> Int:
+    ir_defer_emit_to_function_frame(false)
+    ir_emit_rc_cleanup("")
+    dr := ir_reg()
+    ir_emit("iconst " + dr.to_string() + " 0")
+    if ir_current_func_return_kind == "result_reg":
+        # a pair-returning function's trailing (unreachable) default return
+        # must still match the two-value signature.
+        dr2 := ir_reg()
+        ir_emit("iconst " + dr2.to_string() + " 0")
+        ir_emit("ret2 " + dr.to_string() + " " + dr2.to_string())
+    else:
+        ir_emit("ret " + dr.to_string())
+    ir_emit_count_marks()
+    ir_emit("endfunc")
+    return 0
+
+# a value-returning function whose body ends in a bare match has no explicit
+# return, so the match is the implicit return value. (Such functions return 0
+# today, so handling this can only fix behavior.) Returns the tail match node
+# index, or -1.
+# find a tail-position match: unwrap block/body wrappers to the last statement,
+# and report it if it is a match in a value-returning function. Such a function
+# returns 0 today (no implicit-return support), so honoring the tail match can
+# only fix behavior.
+fn ir_finish_func_emission(body_idx: Int):
+    if body_idx >= 0:
+        # mark the tail match (if any) so it returns its value instead of
+        # discarding it; ir_block emits the body, prefix statements included.
+        ir_tail_match_node = ir_function_tail_match(body_idx)
+        ir_block(body_idx)
+        ir_tail_match_node = 0 - 1
+    ir_emit_default_return()
+
+fn ir_emit_test_func(idx: Int, ordinal: Int):
+    body_idx := ir_find_body(idx)
+    ir_prepare_func_emission("int")
+    ir_emit_func_header("__test_" + ordinal.to_string(), 0, "int")
+    ir_emitting_test_func = true
+    # a test body is an ordinary function body: without the prologue its
+    # locals are never collected or zero-stored, so a match payload binding
+    # (which releases the binding's previous value) would load a name the ir
+    # has not declared. mirrors ir_func.
+    ir_emit_rc_prologue(body_idx)
+    ir_finish_func_emission(body_idx)
+    ir_emitting_test_func = false
+
+# --- emit function ---
+fn ir_func(idx: Int):
+    node := get_node(idx)
+    full_name := node.value
+    name := ir_base_decl_name(full_name)
+    body_idx := ir_find_body(idx)
+    param_count := ir_param_count(idx)
+    mut ret_type := ir_lookup_func_return(full_name, name)
+    if ir_result_reg_funcs.contains_key(name):
+        ret_type = "result_reg"
+    ir_prepare_func_emission(ret_type)
+    ir_current_arc_func = name
+    ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
+    ir_current_func_returns_result = ir_fn_returns_result(idx)
+    ir_current_func_miss_fails = ir_fn_miss_fails(idx)
+    ir_emitting_main_body = name == "main"
+    mut header_ret_type := ret_type
+    if ir_main_returns_exit_code():
+        header_ret_type = "int"
+    ir_emit_func_header(name, param_count, header_ret_type)
+    ir_emit_fn_params(idx)
+    if ir_emitting_main_body:
+        # register this module's tracer pairs before any user code, the
+        # way the driver injects the imported modules' init calls. an
+        # imported module's main is stripped by the driver, so only the
+        # root module's call survives into the combined program.
+        ir_emit_call0(ir_reg(), ir_cc_register_fn_name(), "int")
+    ir_emit_rc_prologue(body_idx)
+    ir_finish_func_emission(body_idx)
+    ir_emitting_main_body = false
+
+# --- emit impl method ---
+fn ir_impl_func(idx: Int, impl_type: String):
+    node := get_node(idx)
+    orig_name := node.value
+    full_name := impl_type + "_" + orig_name
+    method_key := ir_impl_method_key(impl_type, orig_name)
+    ir_register_impl_method_entry(impl_type, orig_name, full_name, "")
+
+    body_idx := ir_find_body(idx)
+    param_count := ir_param_count(idx) + 1
+    # resolve an associated-type return (`-> Item`) to the impl's bound type so
+    # the function's return kind is right, critical for heap types and arc
+    ret_type := ir_resolve_assoc_type(impl_type, ir_extract_return_type(idx))
+    # a registered method emits the pair signature, but the recorded return
+    # below stays "tuple", the same split ir_func keeps for free functions,
+    # so everything outside the rcall paths still sees the box world.
+    mut emit_ret := ret_type
+    if ir_result_reg_funcs.contains_key(full_name):
+        emit_ret = "result_reg"
+    ir_prepare_func_emission(emit_ret)
+    # an `-> Item?` return: resolve the inner kind too so the optional's
+    # payload is reclaimed correctly for heap-typed bindings
+    ir_current_func_optional_inner_kind = ir_resolve_assoc_type(impl_type, ir_extract_optional_inner_type(idx))
+    ir_current_func_returns_result = ir_fn_returns_result(idx)
+    ir_current_func_miss_fails = ir_fn_miss_fails(idx)
+    ir_current_impl_type = impl_type
+    ir_current_arc_func = full_name
+    ir_emit_func_header(full_name, param_count, emit_ret)
+    ir_emit_named_param("self", impl_type)
+    ir_emit_fn_params(idx)
+    ir_emit_rc_prologue(body_idx)
+    ir_func_returns.insert(method_key, ret_type)
+    ir_func_returns.insert(full_name, ret_type)
+    ir_finish_func_emission(body_idx)
+    ir_current_impl_type = ""
+
+# generate the per-thread lazy initializer for each threadlocal global: a
+# `() -> kind` thunk that builds the same initial value a plain global would get
+# at startup. pith_tls_get_or_init calls it the first time a thread reads the
+# global. mirrors the value-building in ir_emit_init_globals, but returns the
+# value instead of storing it into a shared slot.
+fn ir_emit_tls_thunks(root: Node):
+    for child in root.children:
+        cn := ir_unwrap_pub_node(child)
+        if cn.kind != "threadlocal":
+            continue
+        binding := get_node(cn.children[0])
+        if not ir_is_binding_kind(binding.kind):
+            continue
+        gname := ir_binding_name(binding)
+        parts := ir_collect_bind_parts(binding)
+        mut target := ""
+        if parts.type_idx >= 0:
+            target = ir_resolve_type_node(parts.type_idx)
+        if target.len() == 0:
+            target = ir_infer_type(parts.val_idx)
+        ir_prepare_func_emission(target)
+        ir_emit_func_header("__tlsinit_" + gname, 0, target)
+        gtarget := ir_map_init_target(gname, target)
+        r := ir_emit_value_for_target(parts.val_idx, gtarget)
+        gkind := ir_rc_kind(target)
+        if gkind.len() > 0 and gtarget != "tuple" and ir_expr_is_borrowed(parts.val_idx):
+            ir_rc_retain_reg(r, gkind)
+        ir_emit("ret " + r.to_string())
+        ir_emit("endfunc")
+
+fn ir_emit_init_globals(root: Node):
+    mut has_runtime_inits := false
+    for child in root.children:
+        cn := ir_unwrap_pub_node(child)
+        if ir_is_binding_kind(cn.kind) and ir_global_needs_runtime_init(cn):
+            has_runtime_inits = true
+    if not has_runtime_inits:
+        return
+
+    # a global initializer is not inside any function's name scope: every
+    # bare name in one is a global.
+    ir_func_local_names = {}
+    ir_emit_func_header("__init_globals", 0, "int")
+    for child in root.children:
+        cn := ir_unwrap_pub_node(child)
+        if ir_is_binding_kind(cn.kind) and ir_global_needs_runtime_init(cn):
+            gname := ir_binding_name(cn)
+            parts := ir_collect_bind_parts(cn)
+            mut target := ""
+            if parts.type_idx >= 0:
+                target = ir_resolve_type_node(parts.type_idx)
+            if target.len() == 0:
+                target = ir_infer_type(parts.val_idx)
+            gtarget := ir_map_init_target(gname, target)
+            r := ir_emit_value_for_target(parts.val_idx, gtarget)
+            gkind := ir_rc_kind(target)
+            if gkind.len() > 0 and gtarget != "tuple" and ir_expr_is_borrowed(parts.val_idx):
+                ir_rc_retain_reg(r, gkind)
+            if gkind.len() > 0:
+                ir_emit_share_reg(r, gkind)
+            else:
+                ir_emit_share_expr(r, parts.val_idx)
+            ir_emit("store " + ir_global_storage_symbol(gname) + " " + r.to_string())
+    ir_emit_zero_ret_endfunc()
+
+fn ir_emit_top_level_items(root_idx: Int, root: Node):
+    mut test_ord := 0
+    for item_idx in ir_root_items(root_idx):
+        actual_node := get_node(item_idx)
+        if actual_node.kind == "fn" or actual_node.kind == "fn_decl":
+            if ir_has_generic_params(actual_node):
+                continue
+            if not (ir_emit_tests and actual_node.value == "main"):
+                ir_func(item_idx)
+        elif actual_node.kind == "test_decl":
+            if ir_emit_tests:
+                ir_emit_test_func(item_idx, test_ord)
+                test_ord = test_ord + 1
+        elif actual_node.kind == "impl_decl":
+            impl_type := ir_impl_identity_type(actual_node, ir_current_module_path)
+            ir_emit_impl_methods(actual_node, impl_type)
+    if ir_emit_tests:
+        ir_emit_test_main(root_idx)
+
+# the emission phase of emit_ir for the module being lowered, in output
+# order: globals and their init, the walks for the types the module
+# declares, the top-level functions, impls and tests, the queued generic
+# specializations and lambda bodies, and last the per-instance and tuple
+# helpers, which those bodies register only as they emit.
+fn ir_emit_root_module(root_idx: Int, root: Node):
+    ir_reset_generic_dtor_maps()
+    ir_emit_global_bindings(root)
+    ir_emit_tls_thunks(root)
+    ir_emit_init_globals(root)
+    ir_emit_optional_walks(false)
+    ir_emit_struct_walks(false)
+    ir_emit_enum_dtors()
+    ir_emit_optional_walks(true)
+    ir_emit_struct_walks(true)
+    ir_emit_enum_tracers()
+    ir_emit_enum_eq_fns()
+    # pre-register all impl method specializations across the module so that
+    # an earlier impl's specialized body can dispatch to a later impl's
+    # specialized version (e.g. MapIter[FilterIter[..], ..].next calling
+    # FilterIter[Range, Int].next)
+    ir_preregister_all_impl_specializations(root_idx, root)
+    ir_record_borrow_params(root_idx)
+    ir_record_closure_params(root_idx)
+    ir_record_storage_keepers(root_idx)
+    ir_emit_top_level_items(root_idx, root)
+    ir_emit_generic_specializations()
+    # per-instance destructors for generic structs built via a backend
+    # constructor call: emitted after the specializations, since those bodies
+    # are where such constructions (and their attaches) are recorded.
+    ir_emit_generic_enum_instance_dtors()
+    ir_emit_generic_enum_instance_tracers()
+    ir_append_lambda_bodies()
+    # after every body that can build an interface value
+    ir_emit_interface_adapters()
+    # per-instance destructors for generic structs built through the struct
+    # literal path, after every body: a construction inside a specialization or
+    # a lambda registers its instance only as that body is emitted, and a
+    # destructor emitted before its registration is a reference to nothing.
+    ir_emit_generic_struct_instance_dtors()
+    ir_emit_generic_struct_instance_tracers()
+    # every tuple family last of all: a signature is only registered as the
+    # body that builds the tuple is emitted, and that includes specializations
+    # and lambda bodies. these used to run before those two, so a tuple whose
+    # shape appeared first inside a generic body or a lambda got no destructor
+    # and the program failed to compile, and whether it did depended on
+    # whether unrelated code elsewhere happened to register the same shape
+    # first. the cascade helpers and the optional-over-tuple walks were always
+    # here for this reason; the plain walks belong with them.
+    ir_emit_tuple_walks(false)
+    ir_emit_tuple_walks(true)
+    ir_emit_tuple_cascade_helpers()
+    ir_emit_kinded_release_helper()
+    ir_emit_result_arg_release_helpers()
+    ir_emit_result_unshare_helpers()
+    ir_emit_optional_tuple_walks()
+    # tracer registration after every destructor family above, so its pair
+    # list covers the tuple and generic-instance twins too.
+    ir_emit_cc_register_tracers()
+
+# --- main entry ---
+#
+# per module: intern every string first (the table heads the output),
+# collect import metadata so names resolve, then emit globals and
+# functions in declaration order.
+pub fn emit_ir(root_idx: Int) -> String:
+    ir_reset_module_state()
+    ir_tuple_walk_root = root_idx
+
+    root := get_node(root_idx)
+    mut preload_i := 0
+    while preload_i < ir_preloaded_import_roots.len():
+        ir_collect_strings(ir_preloaded_import_roots[preload_i])
+        ir_collect_struct_field_strings(ir_preloaded_import_roots[preload_i])
+        preload_i = preload_i + 1
+    ir_collect_strings(root_idx)
+    ir_collect_struct_field_strings(root_idx)
+    ir_preseed_synthesized_error_strings()
+    # the text an interpolated optional renders as when empty
+    # (ir_emit_optional_value_to_string) is no literal the collector sees,
+    # so it is interned here, ahead of the table like every other string a
+    # body refers to
+    _none_id := ir_str("none")
+    # test names live on the test_decl node, not in a string literal the collector
+    # would see, so intern them here (before the table is emitted) for the test
+    # main's per-test report line.
+    if ir_emit_tests:
+        _file_id := ir_str(ir_test_source_file)
+        for test_idx in ir_collect_test_decls(root_idx):
+            _name_id := ir_str(get_node(test_idx).value)
+            _tags_id := ir_str(ir_test_decl_tags(test_idx))
+    # the nested decode specs go last, so a program that never decodes keeps
+    # the table it always had and one that does only gains entries at the end
+    mut prepass_roots: List[Int] := []
+    for preload_root in ir_preloaded_import_roots:
+        prepass_roots.push(preload_root)
+    prepass_roots.push(root_idx)
+    ir_json_intern_nested_specs(prepass_roots)
+    ir_emit_string_table()
+
+    # collect aliases first so both type and callable metadata can resolve
+    # through the same table.
+    ir_collect_root_import_metadata(root_idx)
+    ir_collect_root_phase_one_metadata(root_idx)
+    ir_collect_root_phase_two_metadata(root_idx)
+
+    ir_lambda_count = 0
+    ir_lambda_bodies = []
+    ir_emit_root_module(root_idx, root)
+    lines := ir_builder_lines()
+    ir_finish_module_emit()
+    return lines.join(chr(10))

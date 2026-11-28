@@ -1,0 +1,1043 @@
+# ir_lower_data.pith: lowering for data constructors, literals, string
+# interpolation, select expressions, and interface value boxing.
+#
+# takes IrEmitHooks from ir_lower to evaluate nested expressions and blocks
+# without introducing an import cycle.
+
+from ast import Node, get_node
+from checker import c_argument_widens_to_optional, c_argument_widens_to_result, c_get_expr_type, c_interface_coercion
+from types import get_type_info
+from ir_common import ir_copy_var_regs, ir_copy_var_types
+from ir_builder import ir_emit, ir_label, ir_new_temp_name, ir_reg, ir_str, ir_zero_reg
+from ir_state import IrEmitHooks, ir_enum_payload_kinds, ir_getter_consumed_idx, ir_inflight_drop, ir_inflight_pop, ir_inflight_push, ir_interface_coercion_bypass, ir_kinded_rc_binds, ir_select_takes_counts, ir_tuple_dtor_sigs, ir_var_regs, ir_var_types
+from ir_types import ir_bytes_keyed_type, ir_checked_type, ir_is_declared_callable, ir_literal_expr_type, ir_lookup_name_type, ir_rc_kind, ir_struct_field_default_node, ir_type_from_tid
+from ir_primitives import ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_call_text, ir_emit_label, ir_emit_optional_attach_dtor, ir_emit_optional_none_value, ir_join_arg_regs, ir_kinded_rebind, ir_optional_flag_field, ir_optional_value_as, ir_rc_release_reg, ir_rc_retain_reg, ir_string_release_reg, ir_string_retain_reg
+from ir_collections_ops import ir_empty_collection_init_call_name, ir_for_iter_conversion_call, ir_map_uses_int_keys, ir_normalize_collection_target, ir_set_add_name, ir_set_new_name
+from ir_match_emit import ir_resolved_variant_kinds_for_tid
+from ir_type_infer import ir_bytes_keyed_target, ir_container_store_takes_count, ir_ctor_field_count, ir_ctor_field_inner_type_name, ir_ctor_field_name_at, ir_ctor_field_tid, ir_ctor_field_type_name, ir_element_tag_code, ir_emit_element_tag_const, ir_empty_literal_is_typed, ir_infer_type, ir_is_sync_primitive_name, ir_is_unsigned_word, ir_list_ctor_for_elem_kind, ir_map_kind_store_name, ir_method_call_arg_expr, ir_method_receiver_type, ir_optional_inner_type_of_tid, ir_owned_container_store_name, ir_store_learns_kind, ir_string_lit_single_byte, ir_struct_args_have_names, ir_struct_field_is_weak, ir_tuple_dtor_name, ir_tuple_elem_code, ir_tuple_sig_has_rc, ir_value_is_already_the_optional
+from ir_analysis import ir_later_operands_drop, ir_select_arm_returns_binding, ir_subtree_keeps_storage
+from ir_rc_lifecycle import ir_attach_result_box_dtor, ir_branches_take_counts, ir_expr_is_borrowed, ir_expr_is_fresh_string_index, ir_inflight_field_value, ir_inflight_operand, ir_inflight_pop_n, ir_optional_subject_is_owned, ir_pin_arg_inflight, ir_pin_operand, ir_release_fresh_result_arg, ir_release_owned_index_key, ir_release_owned_operand, ir_release_owned_optional_operand, ir_runtime_opt_producer_payload_kind, ir_string_interp_part_owned, ir_unpin_args, ir_unpin_operand
+from ir_synth_helpers import ir_collect_select_parts, ir_displayable_struct_name, ir_emit_attach_instance_dtor, ir_emit_attach_tuple_dtor, ir_emit_display_list, ir_emit_display_map, ir_emit_display_struct, ir_emit_ok_result_tuple, ir_emit_optional_value_to_string, ir_emit_result_value_to_string, ir_emit_select_offset, ir_emit_select_wait, ir_emit_share_expr, ir_emit_some_over, ir_emit_tuple_literal_stores, ir_emit_variant_alloc, ir_interface_methods, ir_interface_slot_target, ir_interface_type_id, ir_interp_spec_align, ir_interp_spec_fill, ir_interp_spec_precision, ir_interp_spec_width
+
+# lower a weak field's incoming value to the bare target pointer it should
+# store, taking a weak reference in the process. `none` collapses to 0; an
+# already-optional value is unwrapped to its payload (0 when none); a bare
+# struct value is the target directly. pith_struct_weak_retain(0) is a no-op,
+# so the null cases need no branch. the returned pointer is what the field
+# slot holds: no owning tuple, which is what keeps the ring from cycling.
+## lower weak payload.
+pub fn ir_emit_weak_payload_with(val_idx: Int, hooks: IrEmitHooks) -> Int:
+    vnode := get_node(val_idx)
+    if vnode.kind == "none_lit" or vnode.kind == "none":
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        return zero_r
+    val_r := hooks.emit_expr(val_idx)
+    mut payload_r := val_r
+    if ir_rc_kind(ir_infer_type(val_idx)) == "tuple":
+        # already an optional: its payload, or 0 when it is none
+        payload_r = ir_optional_value_as(val_r, "unknown")
+    retain_r := ir_reg()
+    ir_emit("call " + retain_r.to_string() + " pith_struct_weak_retain void 1 " + payload_r.to_string())
+    # a fresh optional (a call result, another weak read) has no other owner.
+    # the weak count above keeps the header readable after its release.
+    value_kind := ir_rc_kind(ir_infer_type(val_idx))
+    if value_kind == "tuple" and ir_optional_subject_is_owned(val_idx):
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
+    # so does a fresh struct (`h.w = Child(n: 1)`): nothing holds its strong
+    # count, so it is dropped here and the field reads back none, as for any
+    # target whose last strong reference is gone. kept, the count leaked the
+    # struct and the field read it back alive.
+    elif value_kind == "struct" and not ir_expr_is_borrowed(val_idx):
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
+    return payload_r
+
+# emit one call argument. a plain value the checker widened to an optional
+# parameter goes through the same target-shaped emitter every other widening
+# position already uses, so a `f(x: Int?)` body reads the Some(3) tuple it
+# expects rather than the bare integer. everything else emits unchanged.
+## lower call arg.
+pub fn ir_emit_call_arg_with(expr_idx: Int, hooks: IrEmitHooks) -> Int:
+    if c_argument_widens_to_optional(expr_idx):
+        return ir_emit_value_for_target_with(expr_idx, "tuple", hooks)
+    return hooks.emit_expr(expr_idx)
+
+# emit one branch value of a match or if expression whose branches all land
+# owned (see ir_branch_values_are_owned): a borrowed one takes its own count.
+## lower owned branch value.
+pub fn ir_emit_owned_branch_value_with(expr_idx: Int, hooks: IrEmitHooks) -> Int:
+    r := ir_emit_call_arg_with(expr_idx, hooks)
+    if not c_argument_widens_to_optional(expr_idx) and ir_expr_is_borrowed(expr_idx):
+        ir_rc_retain_reg(r, ir_rc_kind(ir_infer_type(expr_idx)))
+    return r
+
+# emit a value into a position whose target is an optional. `target_inner` is
+# the optional's inner type where the caller knows it, and "" where it does not;
+# the argument position has no target to consult and leans on the checker's
+# record instead.
+fn ir_emit_optional_for_target(val_idx: Int, vn: Node, target_inner: String, hooks: IrEmitHooks) -> Int:
+    if c_argument_widens_to_result(val_idx):
+        mut ok_r := 0
+        if vn.kind == "none_lit":
+            ok_r = ir_emit_optional_none_value()
+        elif c_argument_widens_to_optional(val_idx):
+            ok_r = ir_emit_some_over(hooks.emit_expr(val_idx), val_idx, true)
+        else:
+            ok_r = hooks.emit_expr(val_idx)
+            ok_kind := ir_rc_kind(ir_infer_type(val_idx))
+            if ok_kind.len() > 0 and ir_expr_is_borrowed(val_idx):
+                ir_rc_retain_reg(ok_r, ok_kind)
+        return ir_emit_ok_result_tuple(ok_r)
+    if vn.kind == "none_lit":
+        return ir_emit_optional_none_value()
+    value_r := hooks.emit_expr(val_idx)
+    actual_tid := c_get_expr_type(val_idx)
+    if actual_tid >= 0:
+        if ir_value_is_already_the_optional(val_idx, get_type_info(actual_tid), target_inner):
+            # owned at this position: take a count when it arrives borrowed so
+            # the holder can release it. a freshly wrapped optional below is
+            # already owned, and the struct-construction site no longer retains
+            # tuple-typed fields, so this is the single owning retain.
+            if ir_expr_is_borrowed(val_idx):
+                ir_rc_retain_reg(value_r, "tuple")
+            return value_r
+    return ir_emit_some_over(value_r, val_idx, true)
+
+## lower value for target inner.
+pub fn ir_emit_value_for_target_inner_with(val_idx: Int, target_type: String, target_inner: String, hooks: IrEmitHooks) -> Int:
+    vn := get_node(val_idx)
+    if target_type == "tuple":
+        return ir_emit_optional_for_target(val_idx, vn, target_inner, hooks)
+    # an empty literal the checker typed builds from that type, which knows
+    # the element and value types; the target name below is only the
+    # container kind. a `{}` field of a Map[String, String] built from the
+    # name alone was a map that owned none of the strings stored into it.
+    if ir_empty_literal_is_typed(val_idx, vn):
+        return hooks.emit_expr(val_idx)
+    empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), ir_bytes_keyed_target(val_idx, target_type))
+    if empty_init_call.len() > 0:
+        r := ir_reg()
+        ir_emit_call0(r, empty_init_call, ir_normalize_collection_target(target_type))
+        return r
+    return hooks.emit_expr(val_idx)
+
+## emit value for target.
+pub fn ir_emit_value_for_target_with(val_idx: Int, target_type: String, hooks: IrEmitHooks) -> Int:
+    return ir_emit_value_for_target_inner_with(val_idx, target_type, "", hooks)
+
+# emit a value bound for a holder: a struct field, or a list or map element.
+## lower holder value.
+pub fn ir_emit_holder_value_with(val_idx: Int, target_type: String, target_inner: String, hooks: IrEmitHooks) -> Int:
+    r := ir_emit_value_for_target_inner_with(val_idx, target_type, target_inner, hooks)
+    ir_attach_result_box_dtor(r, val_idx)
+    return r
+
+# a register holding one byte of string content as an integer, or -1
+# when the expression can't be read as a byte. covers s[i] on strings
+# (an allocation-free byte_at instead of a fresh one-char string),
+# single-character literals, and chr(n) with a literal argument.
+## lower byte operand.
+pub fn ir_emit_byte_operand_with(idx: Int, hooks: IrEmitHooks) -> Int:
+    node := get_node(idx)
+    if node.kind == "index" and node.children.len() >= 2:
+        if ir_expr_is_fresh_string_index(idx):
+            obj_r := hooks.emit_expr(node.children[0])
+            idx_r := hooks.emit_expr(node.children[1])
+            r := ir_reg()
+            # by its runtime symbol, not the short `byte_at` key: this is the
+            # emitter's own lowering of `ord(s[i])`, and a user function named
+            # `byte_at` must not be able to capture it, nor be captured by it.
+            ir_emit_call2(r, "pith_cstring_byte_at", "int", obj_r, idx_r)
+            return r
+        return 0 - 1
+    if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
+        b := ir_string_lit_single_byte(node.value)
+        if b >= 0:
+            r := ir_reg()
+            ir_emit("iconst " + r.to_string() + " " + b.to_string())
+            return r
+        return 0 - 1
+    if node.kind == "call" and node.children.len() >= 2:
+        callee := get_node(node.children[0])
+        arg := get_node(node.children[1])
+        if callee.kind == "ident" and callee.value == "chr" and arg.kind == "int_lit":
+            r := ir_reg()
+            ir_emit("iconst " + r.to_string() + " " + arg.value)
+            return r
+    return 0 - 1
+
+fn ir_emit_interp_spec_part(node: Node, hooks: IrEmitHooks) -> Int:
+    spec := node.value
+    expr_idx := node.children[0]
+    prec := ir_interp_spec_precision(spec)
+    part_type := ir_infer_type(expr_idx)
+    mut str_r := 0 - 1
+    if prec >= 0 and part_type == "float":
+        raw_r := hooks.emit_expr(expr_idx)
+        prec_r := ir_reg()
+        ir_emit("iconst " + prec_r.to_string() + " " + prec.to_string())
+        str_r = ir_reg()
+        ir_emit_call2(str_r, "float_format", "string", raw_r, prec_r)
+    else:
+        str_r = ir_string_interp_expr_part(expr_idx, hooks)
+    width := ir_interp_spec_width(spec)
+    if width <= 0:
+        # ir_string_interp_part_owned treats every interp_spec part as owned, so
+        # a borrowed string that bypasses format_pad (e.g. `{s:.2}`) must take a
+        # count of its own before the interpolation fold releases it.
+        if (prec < 0 or part_type != "float") and part_type == "string" and ir_expr_is_borrowed(expr_idx):
+            ir_string_retain_reg(str_r)
+        return str_r
+    w_r := ir_reg()
+    ir_emit("iconst " + w_r.to_string() + " " + width.to_string())
+    a_r := ir_reg()
+    ir_emit("iconst " + a_r.to_string() + " " + ir_interp_spec_align(spec).to_string())
+    f_r := ir_reg()
+    ir_emit("iconst " + f_r.to_string() + " " + ir_interp_spec_fill(spec).to_string())
+    padded_r := ir_reg()
+    ir_emit("call " + padded_r.to_string() + " format_pad string 4 " + str_r.to_string() + " " + w_r.to_string() + " " + a_r.to_string() + " " + f_r.to_string())
+    # the unpadded intermediate is garbage once copied, unless it was a
+    # borrowed string passed straight through
+    if ir_infer_type(node.children[0]) != "string" or not ir_expr_is_borrowed(node.children[0]):
+        ir_string_release_reg(str_r)
+    return padded_r
+
+fn ir_string_interp_expr_part(expr_idx: Int, hooks: IrEmitHooks) -> Int:
+    # an optional part is read once by the conversion below
+    ir_getter_consumed_idx = expr_idx
+    mut part_r := hooks.emit_expr(expr_idx)
+    part_tid := c_get_expr_type(expr_idx)
+    part_type := ir_infer_type(expr_idx)
+    if part_type == "string":
+        return part_r
+    if part_type == "bool":
+        converted := ir_reg()
+        ir_emit_call1(converted, "bool_to_string", "string", part_r)
+        return converted
+    if part_type == "float":
+        converted := ir_reg()
+        ir_emit_call1(converted, "float_to_string", "string", part_r)
+        return converted
+    if part_type == "int":
+        converted := ir_reg()
+        if ir_is_unsigned_word(part_tid):
+            ir_emit_call1(converted, "uint_to_string", "string", part_r)
+        else:
+            ir_emit_call1(converted, "int_to_string", "string", part_r)
+        return converted
+    if part_tid >= 0:
+        part_info := get_type_info(part_tid)
+        if part_info.kind == "result":
+            # a fresh result box (a call's) dies once rendered, its payload
+            # with it: `"{parse_int(s)}"` leaked the box every time
+            text_r := ir_emit_result_value_to_string(part_r, part_tid)
+            ir_release_fresh_result_arg(expr_idx, part_r)
+            return text_r
+        if part_info.kind == "optional":
+            text_r := ir_emit_optional_value_to_string(part_r, part_tid)
+            # a fresh shell (a call result, a weak read) is the part's own
+            ir_release_owned_optional_operand(expr_idx, part_r)
+            return text_r
+        # a collection or struct part dies once rendered when nothing else
+        # holds it, like a call result (`"{names()}"`): before this every such
+        # part leaked. a borrowed one is left alone.
+        if part_info.kind == "list":
+            text_r := ir_emit_display_list(part_r, ir_type_from_tid(part_info.inner), false)
+            ir_release_owned_operand(expr_idx, part_r, part_type)
+            return text_r
+        if part_info.kind == "map":
+            text_r := ir_emit_display_map(part_r, ir_type_from_tid(part_info.key_type), ir_type_from_tid(part_info.value_type))
+            ir_release_owned_operand(expr_idx, part_r, part_type)
+            return text_r
+        if part_info.kind == "set":
+            converted := ir_reg()
+            ir_emit_call1(converted, ir_for_iter_conversion_call(ir_bytes_keyed_type(expr_idx, "set")), "list", part_r)
+            text_r := ir_emit_display_list(converted, ir_type_from_tid(part_info.inner), true)
+            # the list a set is shown through is always fresh
+            ir_rc_release_reg(converted, "list")
+            ir_release_owned_operand(expr_idx, part_r, part_type)
+            return text_r
+    display_name := ir_displayable_struct_name(part_type)
+    if display_name.len() > 0:
+        text_r := ir_emit_display_struct(part_r, part_type, display_name, part_tid)
+        ir_release_owned_operand(expr_idx, part_r, part_type)
+        return text_r
+    return part_r
+
+# --- string interpolation ---
+fn ir_string_interp_part_reg(child: Int, hooks: IrEmitHooks) -> Int:
+    cn := get_node(child)
+    if cn.kind == "lit":
+        si := ir_str(cn.value)
+        part_r := ir_reg()
+        ir_emit("strref " + part_r.to_string() + " " + si)
+        return part_r
+    if cn.kind == "interp_spec":
+        return ir_emit_interp_spec_part(cn, hooks)
+    return ir_string_interp_expr_part(child, hooks)
+
+## lower string interp.
+pub fn ir_emit_string_interp(idx: Int, hooks: IrEmitHooks) -> Int:
+    node := get_node(idx)
+    # fold the parts left to right, releasing each intermediate the moment
+    # the next concat has copied it. the fold is straight-line code, so the
+    # releases stay in the same block as the values they drop.
+    mut result_r := 0 - 1
+    mut result_owned := false
+    mut _fi4 := 0
+    kids4_children := node.children
+    # a borrowed part is read by the concat that follows the next part, so a
+    # later part that can drop it pins it until the fold is done
+    later_drops := ir_later_operands_drop(kids4_children)
+    mut pinned_regs: List[Int] := []
+    mut pinned_kinds: List[String] := []
+    mut inflight := 0
+    while _fi4 < kids4_children.len():
+        child := kids4_children[_fi4]
+        if result_r >= 0 and result_owned:
+            ir_inflight_push(result_r, "string")
+            inflight = inflight + 1
+        part_r := ir_string_interp_part_reg(child, hooks)
+        if result_r >= 0 and result_owned:
+            ir_inflight_pop()
+            inflight = inflight - 1
+        part_owned := ir_string_interp_part_owned(child)
+        if not part_owned:
+            pin_kind := ir_pin_operand(child, part_r, later_drops[_fi4])
+            pinned_regs.push(part_r)
+            pinned_kinds.push(pin_kind)
+            if pin_kind.len() > 0:
+                ir_inflight_push(part_r, pin_kind)
+                inflight = inflight + 1
+        if result_r < 0:
+            result_r = part_r
+            result_owned = part_owned
+        else:
+            nr := ir_reg()
+            ir_emit("concat " + nr.to_string() + " " + result_r.to_string() + " " + part_r.to_string())
+            if result_owned:
+                ir_string_release_reg(result_r)
+            if part_owned:
+                ir_string_release_reg(part_r)
+            result_r = nr
+            result_owned = true
+        _fi4 = _fi4 + 1
+    if result_r < 0:
+        result_r = ir_reg()
+        ir_emit("strref " + result_r.to_string() + " " + ir_str(""))
+        result_owned = true
+    if not result_owned:
+        # single borrowed part ("{s}"): callers treat interpolation results
+        # as owned, so give this one its own count
+        ir_string_retain_reg(result_r)
+    while inflight > 0:
+        ir_inflight_pop()
+        inflight = inflight - 1
+    ir_unpin_args(pinned_regs, pinned_kinds)
+    return result_r
+
+# a field's `= {}` or `= []` default. the declaration is shared by every
+# instance of a generic struct, so the literal's own checked type can name a
+# type parameter (`m: Map[String, T] = {}`); the instance's field type is the
+# concrete one, and it picks the container, so a Bag[String] owns its strings.
+fn ir_emit_field_default(sname: String, tid: Int, field_name: String, default_idx: Int, hooks: IrEmitHooks) -> Int:
+    field_tid := ir_ctor_field_tid(sname, tid, field_name)
+    vn := get_node(default_idx)
+    if field_tid >= 0 and vn.children.len() == 0 and (vn.kind == "list" or vn.kind == "map"):
+        info := get_type_info(field_tid)
+        if vn.kind == "list" and info.kind == "list" and info.inner >= 0:
+            r := ir_reg()
+            ir_emit_call0(r, ir_list_ctor_for_elem_kind(ir_rc_kind(ir_type_from_tid(info.inner))), "list")
+            return r
+        if vn.kind == "map" and info.kind == "map" and info.value_type >= 0:
+            mut target := ir_type_from_tid(field_tid)
+            if info.key_type >= 0:
+                key_info := get_type_info(info.key_type)
+                if key_info.kind == "primitive" and key_info.name == "Bytes":
+                    target = "map_bytes"
+            if ir_rc_kind(ir_type_from_tid(info.value_type)) == "string":
+                target = target + "_str_val"
+            ctor := ir_empty_collection_init_call_name("map", 0, target)
+            if ctor.len() > 0:
+                r := ir_reg()
+                ir_emit_call0(r, ctor, ir_normalize_collection_target(target))
+                return r
+    return ir_emit_holder_value_with(default_idx, ir_ctor_field_type_name(sname, tid, field_name), ir_ctor_field_inner_type_name(sname, tid, field_name), hooks)
+
+# emit a struct built with named fields (`Point(x: 3, y: 4)`). fields can be
+# given in any order and any defaulted field may be omitted, so we walk the
+# struct's declaration order and pull each field's value by name, falling back
+# to its default. the checker has already validated names and required fields.
+# `tid` is the construction's checked type id (or -1), used to resolve the field
+# layout unambiguously across same-named structs.
+fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int, hooks: IrEmitHooks) -> Int:
+    total_fields := ir_ctor_field_count(sname, tid)
+    mut field_regs: List[Int] := []
+    mut field_idx := 0
+    mut inflight := 0
+    while field_idx < total_fields:
+        field_name := ir_ctor_field_name_at(sname, tid, field_idx)
+        field_type := ir_ctor_field_type_name(sname, tid, field_name)
+        mut value_node := 0 - 1
+        for an_idx in arg_nodes:
+            an := get_node(an_idx)
+            if an.kind == "arg" and an.value == field_name and an.children.len() > 0:
+                value_node = an.children[0]
+        if ir_struct_field_is_weak(sname, field_name):
+            # a weak field stores the bare target pointer (0 = none), not an
+            # owning tuple, so it never keeps the target alive.
+            mut init_node := value_node
+            if init_node < 0:
+                init_node = ir_struct_field_default_node(sname, field_name)
+            if init_node >= 0:
+                field_regs.push(ir_emit_weak_payload_with(init_node, hooks))
+            else:
+                field_regs.push(ir_zero_reg())
+        elif value_node >= 0:
+            fr := ir_emit_holder_value_with(value_node, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name), hooks)
+            named_field_kind := ir_rc_kind(field_type)
+            # tuple-typed (optional) field values arrive already owned from
+            # ir_emit_value_for_target_with, so they must not be retained again.
+            if named_field_kind.len() > 0 and named_field_kind != "tuple" and ir_expr_is_borrowed(value_node):
+                ir_rc_retain_reg(fr, named_field_kind)
+            inflight = inflight + ir_inflight_field_value(fr, named_field_kind)
+            field_regs.push(fr)
+        else:
+            default_idx := ir_struct_field_default_node(sname, field_name)
+            if default_idx >= 0:
+                field_regs.push(ir_emit_field_default(sname, tid, field_name, default_idx, hooks))
+            else:
+                field_regs.push(ir_zero_reg())
+        field_idx = field_idx + 1
+    ir_inflight_pop_n(inflight)
+
+    r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + total_fields.to_string())
+    ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit_attach_instance_dtor(r, sname, tid)
+    return r
+
+## lower struct positional init.
+pub fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int, hooks: IrEmitHooks) -> Int:
+    if ir_struct_args_have_names(arg_nodes):
+        return ir_emit_struct_named_init(sname, arg_nodes, tid, hooks)
+    mut field_regs: List[Int] := []
+    mut field_idx := 0
+    mut inflight := 0
+    while field_idx < arg_nodes.len():
+        child := arg_nodes[field_idx]
+        cn := get_node(child)
+        field_name := ir_ctor_field_name_at(sname, tid, field_idx)
+        ftype := ir_ctor_field_type_name(sname, tid, field_name)
+        mut value_idx := child
+        if cn.kind == "field_init" and cn.children.len() > 0:
+            value_idx = cn.children[0]
+        elif cn.kind == "arg" and cn.children.len() > 0:
+            value_idx = cn.children[0]
+        if ir_struct_field_is_weak(sname, field_name):
+            field_regs.push(ir_emit_weak_payload_with(value_idx, hooks))
+            field_idx = field_idx + 1
+            continue
+        fr := ir_emit_holder_value_with(value_idx, ftype, ir_ctor_field_inner_type_name(sname, tid, field_name), hooks)
+        pos_field_kind := ir_rc_kind(ftype)
+        # tuple-typed (optional) field values arrive already owned; don't retain.
+        if pos_field_kind.len() > 0 and pos_field_kind != "tuple" and ir_expr_is_borrowed(value_idx):
+            ir_rc_retain_reg(fr, pos_field_kind)
+        inflight = inflight + ir_inflight_field_value(fr, pos_field_kind)
+        field_regs.push(fr)
+        field_idx = field_idx + 1
+    ir_inflight_pop_n(inflight)
+    total_fields := ir_ctor_field_count(sname, tid)
+    while field_idx < total_fields:
+        field_name := ir_ctor_field_name_at(sname, tid, field_idx)
+        default_idx := ir_struct_field_default_node(sname, field_name)
+        if default_idx >= 0:
+            field_regs.push(ir_emit_field_default(sname, tid, field_name, default_idx, hooks))
+        else:
+            field_regs.push(ir_zero_reg())
+        field_idx = field_idx + 1
+
+    r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + total_fields.to_string())
+    ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit_attach_instance_dtor(r, sname, tid)
+    return r
+
+## lower struct init.
+pub fn ir_emit_struct_init(idx: Int, node: Node, hooks: IrEmitHooks) -> Int:
+    return ir_emit_struct_positional_init(node.value, node.children, c_get_expr_type(idx), hooks)
+
+## lower static struct init call.
+pub fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String, hooks: IrEmitHooks) -> Int:
+    expr_tid := c_get_expr_type(idx)
+    mut checked_kind := ""
+    if expr_tid >= 0:
+        checked_kind = get_type_info(expr_tid).kind
+    mut init_name := callee_name
+    mut init_tid := 0 - 1
+    if checked_kind == "struct":
+        init_name = get_type_info(expr_tid).name
+        init_tid = expr_tid
+    else:
+        return 0 - 1
+    if ir_is_declared_callable(callee_name) or ir_is_sync_primitive_name(callee_name):
+        return 0 - 1
+    # a closure-typed variable or parameter is an indirect call, not a
+    # construction: the consumer dispatches through the closure handle
+    if ir_lookup_name_type(callee_name) == "closure":
+        return 0 - 1
+    # the scope check above reads ir_var_types, which only tracks the current
+    # scope's locals. a captured fn-value read inside a closure body isn't in
+    # there (captures are borrowed from the env, so they're deliberately left
+    # out of the type map), so its call would slip through and be miscompiled
+    # as a construction of its struct return type. consult the checker's type
+    # for the callee instead: any function-typed callee is an indirect call.
+    if node.children.len() > 0:
+        callee_tid := c_get_expr_type(node.children[0])
+        if callee_tid >= 0 and get_type_info(callee_tid).kind == "function":
+            return 0 - 1
+    mut arg_nodes: List[Int] := []
+    for child, i in node.children:
+        if i == 0:
+            continue
+        arg_nodes.push(child)
+    return ir_emit_struct_positional_init(init_name, arg_nodes, init_tid, hooks)
+
+# Shape.Circle(2.5): build the boxed value and store each payload argument.
+## lower variant construction.
+pub fn ir_emit_variant_construction(idx: Int, node: Node, enum_name: String, variant_key: String, hooks: IrEmitHooks) -> Int:
+    mut kinds: List[String] := []
+    if ir_enum_payload_kinds.contains_key(variant_key):
+        # a generic enum's declaration records parameter names as its payload
+        # kinds; the construction expression's checked type names the
+        # instance whose concrete types decide whether a payload is retained.
+        kinds = ir_resolved_variant_kinds_for_tid(c_get_expr_type(idx), variant_key, ir_enum_payload_kinds[variant_key].split(","))
+    r := ir_emit_variant_alloc(enum_name, variant_key, kinds.len(), c_get_expr_type(idx))
+    # the box is built before its payloads, so it is in flight while they
+    # are: `Reply.Integer(parse_int(body)!)` leaked the box when the parse
+    # failed. its destructor releases the payloads stored so far, and the
+    # slots not stored yet are still zero.
+    ir_inflight_push(r, "struct")
+    mut i := 0
+    while i < kinds.len():
+        arg_idx := ir_method_call_arg_expr(node, i)
+        if arg_idx >= 0:
+            # a plain value the checker widened into an optional payload goes
+            # through the same target-shaped emitter every other widening
+            # position uses, so `Probe.Alpha(3)` stores the Some(3) a match
+            # binding on that payload reads back.
+            arg_r := ir_emit_call_arg_with(arg_idx, hooks)
+            # the enum value owns a count on rc payloads, same as any
+            # other struct-shaped store. a widened payload's register is the
+            # shell this construction just built rather than the value the
+            # expression names, so it is already owned however the value
+            # arrived; retaining it there would strand the shell.
+            payload_kind := ir_rc_kind(kinds[i])
+            if payload_kind.len() > 0 and ir_expr_is_borrowed(arg_idx) and not c_argument_widens_to_optional(arg_idx):
+                ir_rc_retain_reg(arg_r, payload_kind)
+            ir_emit("sstore " + r.to_string() + " " + (i + 1).to_string() + " " + arg_r.to_string())
+        i = i + 1
+    ir_inflight_drop(r)
+    return r
+
+# a literal of one to eight elements is a single `pith_list_of` call: the
+# runtime allocates the storage once at its final size instead of growing it
+# under a push per element. the call takes over the count on each element of
+# a counted kind, so a borrowed element is retained first and a fresh one is
+# left alone. the elements are built before the list exists, so each one is
+# in flight until the call: `[a()!, b()!]` must not strand a's value when b
+# fails. the retain is taken when the element is read and not at the call,
+# because a later element may be a call that drops the owner's count.
+IR_LIST_OF_MAX := 8
+
+# store_name is the plain store for the literal's key flavor (map_insert,
+# map_insert_ikey, map_insert_bkey); the value's kind and ownership may
+# rewrite it into the kind-carrying or transferring variant below.
+fn ir_emit_map_entry_insert(map_r: Int, store_name: String, entry: Node, val_target: String, val_inner: String, hooks: IrEmitHooks):
+    if entry.kind != "entry" or entry.children.len() < 2:
+        return
+    k_r := hooks.emit_expr(entry.children[0])
+    k_pin := ir_pin_operand(entry.children[0], k_r, not ir_subtree_keeps_storage(entry.children[1], 0 - 1, 0 - 1))
+    key_inflight := ir_inflight_operand(entry.children[0], k_r, k_pin)
+    # wrap the value to its declared kind so an optional value type
+    # stores Some(v), not the raw v, the same fix collection element
+    # literals need (a map literal typed Map[K, Int?] otherwise stored
+    # bare ints and a later .value() dereferenced one as a heap tuple).
+    v_r := ir_emit_holder_value_with(entry.children[1], val_target, val_inner, hooks)
+    if key_inflight:
+        ir_inflight_drop(k_r)
+    # a heap value written straight into a literal is stored the same way one
+    # written into `m[k]` is: the kind travels with it so the map owns what it
+    # holds. without this `{k: inner}` left the map a bare handle whose only
+    # count belonged to `inner`, and reading the entry after `inner` died read
+    # freed memory.
+    mut entry_kind := ir_rc_kind(val_target)
+    if val_target.len() == 0:
+        entry_kind = ir_rc_kind(ir_infer_type(entry.children[1]))
+    mut entry_owned := not ir_expr_is_borrowed(entry.children[1])
+    # an optional value's register is a wrapper this literal owns (see the
+    # list literal), so the owned store transfers it whatever the child was
+    if entry_kind == "tuple":
+        entry_owned = true
+    kind_store := ir_map_kind_store_name(store_name, entry_owned)
+    if kind_store.len() > 0 and ir_store_learns_kind(entry_kind):
+        tag_r := ir_emit_element_tag_const(entry_kind)
+        ir_emit_call4(ir_reg(), kind_store, "void", map_r, k_r, v_r, tag_r)
+        ir_release_owned_index_key(entry.children[0], k_r)
+        ir_unpin_operand(k_r, k_pin)
+        return
+    # both halves of a literal entry follow the rules `m[k] = v` already
+    # follows. the runtime copies the key bytes into the map's own storage, so
+    # a freshly built key dies at the store; and a value the store would take
+    # its own count for goes through the transferring variant, or the entry
+    # ends up with two counts and one release. neither was wired here, so a
+    # literal whose key or value was built on the spot stranded them both,
+    # while the same map filled by index assignment was flat.
+    mut plain_store := store_name
+    if entry_owned and ir_container_store_takes_count(entry_kind):
+        owned_store := ir_owned_container_store_name(store_name)
+        if owned_store.len() > 0:
+            plain_store = owned_store
+    ir_emit_call3(ir_reg(), plain_store, "void", map_r, k_r, v_r)
+    ir_release_owned_index_key(entry.children[0], k_r)
+    ir_unpin_operand(k_r, k_pin)
+
+## lower map literal.
+pub fn ir_emit_map_literal(idx: Int, node: Node, hooks: IrEmitHooks) -> Int:
+    map_r := ir_reg()
+    # the syntactic probe only recognizes an int *literal* key, so a literal
+    # whose key is any other int expression ({i: 1}) looked string-keyed and
+    # built a string-keyed map, then handed map_insert a raw integer where a
+    # cstring pointer was expected. the checked type already knows the key
+    # kind, so let it decide, the same way ir_emit_set_literal does. the
+    # probe stays as the fallback for a literal the checker left untyped.
+    mut has_int_keys := ir_map_uses_int_keys(node)
+    if ir_checked_type(idx) == "map_int":
+        has_int_keys = true
+    # a bytes-keyed literal has no syntactic tell at all: only the checked
+    # type says so, and it picks the constructor and the store together
+    has_bytes_keys := ir_bytes_keyed_type(idx, "map") == "map_bytes"
+    mut val_target := ""
+    mut val_inner := ""
+    tid := c_get_expr_type(idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "map" and info.value_type >= 0:
+            val_target = ir_type_from_tid(info.value_type)
+            val_inner = ir_optional_inner_type_of_tid(info.value_type)
+    # the value flavor comes from the checked value type where there is one:
+    # an empty literal has no first entry to read it off, which is why `f({})`
+    # for a Map[String, String] built a map that owned none of the strings put
+    # into it. the first-entry probe stays as the fallback for a literal the
+    # checker left untyped.
+    mut val_is_string := false
+    if val_target.len() > 0:
+        val_is_string = ir_rc_kind(val_target) == "string"
+    elif node.children.len() > 0:
+        entry0 := get_node(node.children[0])
+        if entry0.kind == "entry" and entry0.children.len() >= 2:
+            val_is_string = ir_infer_type(entry0.children[1]) == "string"
+    mut store_name := "map_insert"
+    if has_int_keys:
+        store_name = "map_insert_ikey"
+        if val_is_string:
+            ir_emit_call0(map_r, "__map_new_int_str_val", "map_int")
+        else:
+            ir_emit_call0(map_r, "__map_new_int", "map_int")
+    elif has_bytes_keys:
+        store_name = "map_insert_bkey"
+        if val_is_string:
+            ir_emit_call0(map_r, "__map_new_bytes_str_val", "map")
+        else:
+            ir_emit_call0(map_r, "__map_new_bytes", "map")
+    elif val_is_string:
+        ir_emit_call0(map_r, "__map_new_str_val", "map")
+    else:
+        ir_emit_call0(map_r, "__map_new", "map")
+    ir_inflight_push(map_r, "map")
+    for child in node.children:
+        ir_emit_map_entry_insert(map_r, store_name, get_node(child), val_target, val_inner, hooks)
+    ir_inflight_drop(map_r)
+    return map_r
+
+## lower set literal.
+pub fn ir_emit_set_literal(idx: Int, node: Node, hooks: IrEmitHooks) -> Int:
+    set_r := ir_reg()
+    # an empty literal carries no element evidence; the checked type
+    # decides between the string and int constructors
+    mut literal_type := ir_literal_expr_type(node, "set")
+    checked := ir_checked_type(idx)
+    if checked == "set_int" or checked == "set":
+        literal_type = ir_bytes_keyed_type(idx, checked)
+    ir_emit_call0(set_r, ir_set_new_name(literal_type), ir_normalize_collection_target(literal_type))
+    ir_inflight_push(set_r, "set")
+    for child in node.children:
+        elem_r := hooks.emit_expr(child)
+        ir_emit_call2(ir_reg(), ir_set_add_name(literal_type), "void", set_r, elem_r)
+        # a set copies the element bytes into its own storage rather than
+        # keeping the caller's value, so a freshly built element dies right
+        # here. `s.add("s-" + tag)` gets that release from the general call
+        # path; the literal had no such path and stranded one element per
+        # entry, which is why the same set built by adding was flat.
+        ir_release_owned_operand(child, elem_r, ir_infer_type(child))
+    ir_inflight_drop(set_r)
+    return set_r
+
+fn ir_emit_small_list_literal(node: Node, elem_kind: String, elem_target: String, elem_inner: String, hooks: IrEmitHooks) -> Int:
+    tag := ir_element_tag_code(elem_kind)
+    mut arg_regs: List[Int] := []
+    for child in node.children:
+        elem_r := ir_emit_holder_value_with(child, elem_target, elem_inner, hooks)
+        if tag != 0:
+            if ir_expr_is_borrowed(child):
+                ir_rc_retain_reg(elem_r, elem_kind)
+            ir_inflight_push(elem_r, elem_kind)
+        arg_regs.push(elem_r)
+    if tag != 0:
+        ir_inflight_pop_n(arg_regs.len())
+    tag_r := ir_reg()
+    ir_emit("iconst " + tag_r.to_string() + " " + tag.to_string())
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " " + arg_regs.len().to_string())
+    if arg_regs.len() < IR_LIST_OF_MAX:
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        while arg_regs.len() < IR_LIST_OF_MAX:
+            arg_regs.push(zero_r)
+    list_r := ir_reg()
+    ir_emit_call_text(list_r, "pith_list_of", "list", IR_LIST_OF_MAX + 2, " " + tag_r.to_string() + " " + count_r.to_string() + ir_join_arg_regs(arg_regs))
+    return list_r
+
+## lower list literal.
+pub fn ir_emit_list_literal(idx: Int, node: Node, hooks: IrEmitHooks) -> Int:
+    # a tagged list owns its heap elements: the runtime push retains, and
+    # release cascades. the checker's type covers empty literals in any
+    # position (a bare `return []` was creating untagged List[String]
+    # buffers whose elements nothing owned); the first element is the
+    # fallback when no checked type exists.
+    mut elem_kind := ""
+    # the element's own emission kind: for an optional element it is
+    # "tuple", which tells ir_emit_value_for_target_with to wrap each value as
+    # Some. without this, `[1, none, 3]` typed List[Int?] pushed raw ints
+    # and a later .value() dereferenced an integer as a heap tuple.
+    mut elem_target := ""
+    mut elem_inner := ""
+    tid := c_get_expr_type(idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "list" and info.inner >= 0:
+            elem_target = ir_type_from_tid(info.inner)
+            elem_kind = ir_rc_kind(elem_target)
+            elem_inner = ir_optional_inner_type_of_tid(info.inner)
+    if elem_kind.len() == 0 and node.children.len() > 0:
+        elem_kind = ir_rc_kind(ir_infer_type(node.children[0]))
+    # an optional element is a wrapper with its own release rule, so a
+    # literal of those keeps the push per element below
+    if node.children.len() > 0 and node.children.len() <= IR_LIST_OF_MAX and elem_kind != "tuple":
+        return ir_emit_small_list_literal(node, elem_kind, elem_target, elem_inner, hooks)
+    list_r := ir_reg()
+    ctor := ir_list_ctor_for_elem_kind(elem_kind)
+    ir_emit_call0(list_r, ctor, "list")
+    # a retaining ctor (string/list/map/struct) makes __list_push retain the
+    # element, so a freshly built element carries a count the list now also
+    # holds. drop the fresh temp's count so the list owns exactly one, and the
+    # free-time cascade balances it. a borrow keeps its owner's count (released
+    # at that owner's scope), so only release non-borrowed elements. untagged
+    # (primitive) lists don't retain, so nothing to drop.
+    retaining := ctor != "__list_new"
+    # the list is in flight while its elements are built: `[a()!, b()!]`
+    # leaked the list holding a's value when b failed
+    ir_inflight_push(list_r, "list")
+    for child in node.children:
+        elem_r := ir_emit_holder_value_with(child, elem_target, elem_inner, hooks)
+        ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
+        # an optional element's register is the wrapper ir_emit_value_for_target_with
+        # built (or retained, for a passed-through optional), owned by this
+        # literal whatever the child expression was, so it is always dropped
+        # once the list holds its own count.
+        if retaining and (elem_kind == "tuple" or not ir_expr_is_borrowed(child)):
+            ir_rc_release_reg(elem_r, elem_kind)
+    ir_inflight_drop(list_r)
+    return list_r
+
+## lower tuple literal.
+pub fn ir_emit_tuple_literal(node: Node, hooks: IrEmitHooks) -> Int:
+    mut elem_regs: List[Int] := []
+    mut elem_nodes: List[Int] := []
+    # every element is evaluated before the stores take their counts
+    later_drops := ir_later_operands_drop(node.children)
+    mut elem_pins: List[String] := []
+    mut inflight := 0
+    for child, ci in node.children:
+        cn := get_node(child)
+        if cn.kind == "none_lit":
+            # a none element can only be an optional; build the canonical
+            # optional none rather than a bare zero, so element reads go
+            # through the optional machinery.
+            elem_regs.push(ir_emit_optional_none_value())
+            elem_pins.push("")
+        elif c_argument_widens_to_optional(child):
+            # a plain value stored into an optional slot is wrapped in its
+            # Some, as an argument to an optional parameter is
+            elem_regs.push(ir_emit_value_for_target_with(child, "tuple", hooks))
+            elem_pins.push("")
+        else:
+            elem_r := hooks.emit_expr(child)
+            elem_regs.push(elem_r)
+            inflight = inflight + ir_pin_arg_inflight(child, elem_r, elem_pins, later_drops[ci])
+        elem_nodes.push(child)
+    ir_inflight_pop_n(inflight)
+    r := ir_reg()
+    nf := ir_reg()
+    ir_emit("iconst " + nf.to_string() + " " + elem_regs.len().to_string())
+    ir_emit_call1(r, "__struct_alloc", "struct:tuple", nf)
+    ir_emit_tuple_literal_stores(r, elem_regs, elem_nodes)
+    ir_unpin_args(elem_regs, elem_pins)
+    ir_emit_attach_tuple_dtor(r, elem_nodes)
+    return r
+
+fn ir_emit_select_recv_probe(recv_idx: Int, hooks: IrEmitHooks) -> Int:
+    recv_node := get_node(recv_idx)
+    if recv_node.kind != "method_call" or recv_node.children.len() == 0:
+        return ir_zero_reg()
+    ch_r := hooks.emit_expr(recv_node.children[0])
+    r := ir_reg()
+    ir_emit_call1(r, "pith_channel_try_recv", "tuple", ch_r)
+    # the runtime builds the shell without a destructor, as it does for a
+    # plain receive (ir_runtime_opt_producer_payload_kind)
+    payload_kind := ir_runtime_opt_producer_payload_kind("pith_channel_try_recv", ir_method_receiver_type(recv_node))
+    if payload_kind.len() > 0:
+        ir_emit_optional_attach_dtor(r, payload_kind)
+    return r
+
+fn ir_emit_select_send_probe(send_idx: Int, hooks: IrEmitHooks) -> Int:
+    send_node := get_node(send_idx)
+    if send_node.kind != "method_call" or send_node.children.len() == 0:
+        return ir_zero_reg()
+    ch_r := hooks.emit_expr(send_node.children[0])
+    arg_idx := ir_method_call_arg_expr(send_node, 0)
+    if arg_idx < 0:
+        return ir_zero_reg()
+    val_r := hooks.emit_expr(arg_idx)
+    # a send that lands hands the channel one count, the same as `ch.send(v)`:
+    # a borrowed value takes it here first. a probe that fails keeps the value,
+    # so that count, or an owned value's own, is dropped again; the probe is
+    # tried once per pass, and its value is evaluated afresh each time.
+    kind := ir_rc_kind(ir_infer_type(arg_idx))
+    if kind.len() > 0 and ir_expr_is_borrowed(arg_idx):
+        ir_rc_retain_reg(val_r, kind)
+    ir_emit_share_expr(val_r, arg_idx)
+    r := ir_reg()
+    ir_emit_call2(r, "pith_channel_try_send", "bool", ch_r, val_r)
+    if kind.len() > 0:
+        sent_l := ir_label()
+        failed_l := ir_label()
+        ir_emit("brif " + r.to_string() + " " + sent_l + " " + failed_l)
+        ir_emit_label(failed_l)
+        ir_rc_release_reg(val_r, kind)
+        ir_emit("jmp " + sent_l)
+        ir_emit_label(sent_l)
+    return r
+
+fn ir_emit_select_arm_body(body_idx: Int, bind_name: String, bind_r: Int, bind_type: String, hooks: IrEmitHooks) -> Int:
+    saved_vars := ir_copy_var_regs(ir_var_regs)
+    saved_types := ir_copy_var_types(ir_var_types)
+    if bind_name.len() > 0:
+        if bind_type.len() > 0:
+            ir_var_types.insert(bind_name, bind_type)
+        if ir_kinded_rc_binds.contains(bind_name):
+            ir_kinded_rebind(bind_name, "")
+        ir_emit("store " + bind_name + " " + bind_r.to_string())
+    body_node := get_node(body_idx)
+    mut body_r := ir_zero_reg()
+    # through the call-argument emitter, so an arm value the checker settled
+    # on an optional beside a `none` arm is built as the Some it widens to
+    if body_node.kind == "body":
+        if body_node.children.len() > 0:
+            body_r = ir_emit_select_arm_value(body_node.children[0], hooks)
+    elif body_node.kind == "block":
+        hooks.emit_block(body_idx)
+    else:
+        body_r = ir_emit_select_arm_value(body_idx, hooks)
+    ir_var_regs = saved_vars
+    ir_var_types = saved_types
+    return body_r
+
+fn ir_emit_select_arm_value(expr_idx: Int, hooks: IrEmitHooks) -> Int:
+    if ir_select_takes_counts:
+        return ir_emit_owned_branch_value_with(expr_idx, hooks)
+    return ir_emit_call_arg_with(expr_idx, hooks)
+
+fn ir_emit_select_probe_arm(arm_idx: Int, result_temp: String, end_l: String, hooks: IrEmitHooks):
+    arm_node := get_node(arm_idx)
+    if arm_node.kind == "select_recv_arm" and arm_node.children.len() >= 2:
+        maybe_r := ir_emit_select_recv_probe(arm_node.children[0], hooks)
+        ready_r := ir_optional_flag_field(maybe_r)
+        hit_l := ir_label()
+        next_l := ir_label()
+        ir_emit("brif " + ready_r.to_string() + " " + hit_l + " " + next_l)
+        ir_emit_label(hit_l)
+        body_r := ir_emit_select_arm_body(arm_node.children[1], arm_node.value, maybe_r, ir_checked_type(arm_node.children[0]), hooks)
+        # the arm's binding is a local of the arm: the shell the receive
+        # handed over is released when the arm is done with it, unless the
+        # arm's value is the binding, which keeps that count. every other
+        # use that keeps the value took a count of its own.
+        if not ir_select_arm_returns_binding(arm_node.children[1], arm_node.value):
+            ir_emit_call1(ir_reg(), "pith_struct_release", "void", maybe_r)
+        ir_emit("store " + result_temp + " " + body_r.to_string())
+        ir_emit("jmp " + end_l)
+        ir_emit_label(next_l)
+    elif arm_node.kind == "select_send_arm" and arm_node.children.len() >= 2:
+        ready_r := ir_emit_select_send_probe(arm_node.children[0], hooks)
+        hit_l := ir_label()
+        next_l := ir_label()
+        ir_emit("brif " + ready_r.to_string() + " " + hit_l + " " + next_l)
+        ir_emit_label(hit_l)
+        body_r := ir_emit_select_arm_body(arm_node.children[1], "", 0, "", hooks)
+        ir_emit("store " + result_temp + " " + body_r.to_string())
+        ir_emit("jmp " + end_l)
+        ir_emit_label(next_l)
+
+fn ir_emit_select_deadline(timeout_idx: Int, hooks: IrEmitHooks) -> String:
+    if timeout_idx < 0:
+        return ""
+    deadline_name := ir_new_temp_name("select_deadline")
+    timeout_node := get_node(timeout_idx)
+    timeout_r := hooks.emit_expr(timeout_node.children[0])
+    now_r := ir_reg()
+    ir_emit_call0(now_r, "time", "int")
+    deadline_r := ir_reg()
+    ir_emit("add " + deadline_r.to_string() + " " + now_r.to_string() + " " + timeout_r.to_string())
+    ir_emit("store " + deadline_name + " " + deadline_r.to_string())
+    return deadline_name
+
+fn ir_emit_rotated_select_probes(probe_arms: List[Int], offset_name: String, result_temp: String, end_l: String, hooks: IrEmitHooks):
+    probe_count := probe_arms.len()
+    probe_done_l := ir_label()
+    offset_r := ir_reg()
+    ir_emit("load " + offset_r.to_string() + " " + offset_name)
+    mut i := 0
+    while i < probe_count:
+        case_l := ir_label()
+        next_case_l := ir_label()
+        match_r := ir_reg()
+        case_r := ir_reg()
+        ir_emit("iconst " + case_r.to_string() + " " + i.to_string())
+        ir_emit("eq " + match_r.to_string() + " " + offset_r.to_string() + " " + case_r.to_string())
+        ir_emit("brif " + match_r.to_string() + " " + case_l + " " + next_case_l)
+        ir_emit_label(case_l)
+        mut j := 0
+        while j < probe_count:
+            probe_idx := (i + j) % probe_count
+            ir_emit_select_probe_arm(probe_arms[probe_idx], result_temp, end_l, hooks)
+            j = j + 1
+        ir_emit("jmp " + probe_done_l)
+        ir_emit_label(next_case_l)
+        i = i + 1
+    ir_emit_label(probe_done_l)
+
+fn ir_emit_select_probes(probe_arms: List[Int], offset_name: String, result_temp: String, end_l: String, hooks: IrEmitHooks):
+    probe_count := probe_arms.len()
+    if probe_count == 0:
+        return
+    if probe_count == 1:
+        ir_emit_select_probe_arm(probe_arms[0], result_temp, end_l, hooks)
+        return
+    ir_emit_rotated_select_probes(probe_arms, offset_name, result_temp, end_l, hooks)
+
+fn ir_emit_select_default(default_idx: Int, result_temp: String, end_l: String, hooks: IrEmitHooks):
+    if default_idx < 0:
+        return
+    default_node := get_node(default_idx)
+    if default_node.children.len() == 0:
+        return
+    body_r := ir_emit_select_arm_body(default_node.children[0], "", 0, "", hooks)
+    ir_emit("store " + result_temp + " " + body_r.to_string())
+    ir_emit("jmp " + end_l)
+
+fn ir_emit_select_timeout(timeout_idx: Int, deadline_name: String, result_temp: String, end_l: String, hooks: IrEmitHooks):
+    if timeout_idx < 0:
+        return
+    now_r := ir_reg()
+    ir_emit_call0(now_r, "time", "int")
+    deadline_r := ir_reg()
+    ir_emit("load " + deadline_r.to_string() + " " + deadline_name)
+    expired_r := ir_reg()
+    ir_emit("gte " + expired_r.to_string() + " " + now_r.to_string() + " " + deadline_r.to_string())
+    timeout_l := ir_label()
+    wait_l := ir_label()
+    ir_emit("brif " + expired_r.to_string() + " " + timeout_l + " " + wait_l)
+    ir_emit_label(timeout_l)
+    timeout_node := get_node(timeout_idx)
+    body_r := ir_emit_select_arm_body(timeout_node.children[1], "", 0, "", hooks)
+    ir_emit("store " + result_temp + " " + body_r.to_string())
+    ir_emit("jmp " + end_l)
+    ir_emit_label(wait_l)
+
+## lower select expr.
+pub fn ir_emit_select_expr(idx: Int, hooks: IrEmitHooks) -> Int:
+    node := get_node(idx)
+    saved_takes := ir_select_takes_counts
+    ir_select_takes_counts = ir_branches_take_counts(idx)
+    result_temp := ir_new_temp_name("select")
+    parts := ir_collect_select_parts(node)
+    probe_count := parts.probe_arms.len()
+    deadline_name := ir_emit_select_deadline(parts.timeout_idx, hooks)
+
+    loop_l := ir_label()
+    end_l := ir_label()
+    ir_emit_label(loop_l)
+
+    offset_name := ir_emit_select_offset(probe_count)
+    ir_emit_select_probes(parts.probe_arms, offset_name, result_temp, end_l, hooks)
+    ir_emit_select_default(parts.default_idx, result_temp, end_l, hooks)
+    ir_emit_select_timeout(parts.timeout_idx, deadline_name, result_temp, end_l, hooks)
+    ir_emit_select_wait(loop_l, probe_count, offset_name)
+    ir_emit_label(end_l)
+    ir_select_takes_counts = saved_takes
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + result_temp)
+    return r
+
+# build the interface value for the expression at idx, which the checker
+# recorded as a conversion. the concrete value moves into slot 1 when the
+# expression owns it and is retained when it is a borrow.
+## lower interface value.
+pub fn ir_emit_interface_value(idx: Int, hooks: IrEmitHooks) -> Int:
+    iface_name := get_type_info(c_interface_coercion(idx)).name
+    concrete := get_type_info(c_get_expr_type(idx)).name
+    ir_interface_coercion_bypass.insert(idx, true)
+    inner_r := hooks.emit_expr(idx)
+    inner_kind := ir_rc_kind(ir_infer_type(idx))
+    borrowed := ir_expr_is_borrowed(idx)
+    ir_interface_coercion_bypass.remove(idx)
+    if inner_kind.len() > 0 and borrowed:
+        ir_rc_retain_reg(inner_r, inner_kind)
+    methods := ir_interface_methods(iface_name)
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " " + (methods.len() + 2).to_string())
+    r := ir_reg()
+    ir_emit_call1(r, "__struct_alloc", "struct:tuple", count_r)
+    id_r := ir_reg()
+    ir_emit("iconst " + id_r.to_string() + " " + ir_interface_type_id(concrete).to_string())
+    ir_emit("sstore " + r.to_string() + " 0 " + id_r.to_string())
+    ir_emit("sstore " + r.to_string() + " 1 " + inner_r.to_string())
+    mut sig := "0" + ir_tuple_elem_code(inner_kind)
+    for method_idx, i in methods:
+        fr := ir_reg()
+        ir_emit("funcref " + fr.to_string() + " " + ir_interface_slot_target(concrete, method_idx))
+        ir_emit("sstore " + r.to_string() + " " + (i + 2).to_string() + " " + fr.to_string())
+        sig = sig + "0"
+    if ir_tuple_sig_has_rc(sig):
+        if not ir_tuple_dtor_sigs.contains(sig):
+            ir_tuple_dtor_sigs.push(sig)
+        dtor_r := ir_reg()
+        ir_emit("funcref " + dtor_r.to_string() + " " + ir_tuple_dtor_name(sig))
+        ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + r.to_string() + " " + dtor_r.to_string())
+    return r

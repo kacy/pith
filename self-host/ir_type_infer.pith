@@ -1,0 +1,2127 @@
+# ir_type_infer.pith: AST type inference, return-kind resolution, storage/TLS
+# helpers, container element tags, sized-int rules, and generic/impl queries.
+
+from ast import Node, get_node, node_kind, node_value
+from checker import c_argument_widens_to_optional, c_generic_call_subst, c_get_expr_type, c_interface_coercion, c_is_interface_value_type, collect_generic_parameter_names, decode_tid_list, generic_base_identity, get_generic_declaration_index, has_generic_declaration, struct_instance_base_name, struct_instance_tids, struct_instance_type_args
+from types import TID_ERR, TID_NONE, TypeInfo, get_type_info, get_type_name
+from ir_ast_helpers import ir_binding_name, ir_is_binding_kind, ir_unwrap_pub_child, ir_unwrap_pub_node
+from ir_common import ir_base_decl_name, ir_global_storage_symbol, ir_import_target_name
+from ir_metadata import ir_builtin_result_ok_kind, ir_builtin_result_retkind, ir_is_bool_returning_method, ir_is_pair_builtin_name, ir_method_emit_name
+from ir_builder import ir_emit, ir_label, ir_reg
+from ir_state import ir_active_fn_bindings, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_params, ir_all_module_paths, ir_all_module_roots, ir_assoc_bindings, ir_closure_return_kinds, ir_current_arc_func, ir_current_impl_subst_args, ir_current_impl_subst_params, ir_current_impl_type, ir_current_module_path, ir_enum_payload_kinds, ir_enum_variant_lists, ir_exact_int_arith, ir_func_local_names, ir_func_result_ok_kinds, ir_func_returns, ir_generic_decl_indices, ir_generic_method_owners, ir_global_map_value_types, ir_global_slot_names, ir_impl_method_owner, ir_impl_methods, ir_import_renames, ir_interface_coercion_bypass, ir_interface_decl_index, ir_local_lambda_targets, ir_loop_var_slot, ir_map_value_types, ir_module_aliases, ir_module_count, ir_plain_int_arith, ir_preloaded_import_paths, ir_preloaded_import_roots, ir_result_reg_flag, ir_result_reg_funcs, ir_struct_decl_nodes, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_struct_names, ir_threadlocal_kinds, ir_threadlocal_slots, ir_type_alias_nodes, ir_var_regs
+from ir_types import ir_alias_target_node, ir_bytes_keyed_type, ir_checked_index_type, ir_checked_result_kind, ir_checked_type, ir_declared_callable_ir_retkind, ir_declared_callable_return_type, ir_impl_method_key, ir_impl_tid_key, ir_is_declared_callable, ir_known_collection_method_return_type, ir_known_collection_return_type, ir_known_scalar_return_type, ir_known_string_method_return_type, ir_known_struct_return_type, ir_literal_expr_type, ir_lookup_name_type, ir_rc_kind, ir_resolve_assoc_type, ir_resolve_type_hint, ir_retkind, ir_strip_type_args, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_layout_name, ir_type_from_tid, ir_unary_expr_type
+from ir_symbols import ResolvedCallee, ir_collect_generic_param_names, ir_generic_owner_param_count, ir_has_generic_params, ir_import_declares_global, ir_is_fn_decl_kind, ir_is_generic_function_name, ir_is_generic_method_name, ir_param_name_at, ir_plain_method_name, ir_queue_generic_specialization, ir_queue_generic_specialization_for_tids, ir_resolve_module_alias_method_call_name, ir_resolve_static_callee, ir_resolve_type_node, ir_resolve_type_node_with_subst, ir_specialize_type_name
+from ir_primitives import ir_emit_call1, ir_kind_is_struct_header, ir_result_field_kind
+from ir_collections_ops import ir_lookup_map_value_type_for_expr
+
+fn ir_lookup_map_value_type(name: String) -> String:
+    if ir_map_value_types.contains_key(name):
+        return ir_map_value_types[name]
+    return ""
+
+# the ir return kind of a struct's fn-value field (e.g. `make: fn() -> T!`),
+# or "" when the field isn't a fn_type. a `self.make()` call is a closure-field
+# call, not a method, so this lets its result kind be reported correctly: a
+# Result-returning factory forwards its result instead of being re-wrapped.
+pub fn ir_struct_fn_field_return_kind(struct_name: String, field_name: String) -> String:
+    if not ir_struct_decl_nodes.contains_key(struct_name):
+        return ""
+    decl := get_node(ir_struct_decl_nodes[struct_name])
+    for child in decl.children:
+        field_node := ir_unwrap_pub_node(child)
+        if field_node.kind == "field" and ir_struct_field_name(field_node) == field_name:
+            if field_node.children.len() > 0:
+                tn := get_node(ir_alias_target_node(field_node.children[0]))
+                if tn.kind == "fn_type" and tn.children.len() > 0:
+                    last := get_node(tn.children[tn.children.len() - 1])
+                    if last.kind == "returns" and last.children.len() > 0:
+                        return ir_resolve_type_node(last.children[0])
+    return ""
+
+## expr result kind.
+pub fn ir_expr_result_kind(idx: Int) -> String:
+    # prefer the kind the checker already recorded; otherwise recover it from
+    # the callee. calls and method calls each resolve their callee differently,
+    # so they get a helper apiece; anything else falls back to legacy inference.
+    checked_kind := ir_checked_result_kind(idx)
+    if checked_kind.len() > 0:
+        return checked_kind
+    node := get_node(idx)
+    if node.kind == "call" and node.children.len() > 0:
+        return ir_call_result_kind(idx, node)
+    if node.kind == "method_call":
+        return ir_method_call_result_kind(idx, node)
+    return ir_expr_legacy_result_kind(idx)
+
+# the ir result kind (how a Result is carried in the abi) of a plain call.
+# a call through a fn-value local forwards that local's recorded closure return
+# kind; a generic callee is specialized first; then the callee's declared kind
+# wins over the builtin table, with legacy inference as the fallback.
+fn ir_call_result_kind(idx: Int, node: Node) -> String:
+    # a call through a fn-value local (`f()` where `f := self.make`) carries
+    # its recorded closure return kind, so a `fn() -> T!` factory forwards
+    # its Result rather than getting re-wrapped.
+    fn_local := get_node(node.children[0])
+    if fn_local.kind == "ident" and ir_closure_return_kinds.contains_key(fn_local.value):
+        return ir_closure_return_kinds[fn_local.value]
+    mut callee := ir_resolve_static_callee(node.children[0])
+    if callee.name.len() > 0:
+        if ir_is_generic_function_name(callee.name):
+            mut explicit_generic_types: List[String] := []
+            callee_node := get_node(node.children[0])
+            if callee_node.kind == "index":
+                explicit_generic_types = ir_explicit_generic_concrete_types(callee_node)
+            generic_ret_type := ir_infer_type(idx)
+            callee = ResolvedCallee(ir_queue_generic_call(callee.name, idx, explicit_generic_types, generic_ret_type), false)
+        declared_kind := ir_declared_callable_ir_retkind(callee.name)
+        if declared_kind.len() > 0:
+            return declared_kind
+        builtin_kind := ir_builtin_result_retkind(callee.name)
+        if builtin_kind.len() > 0:
+            return builtin_kind
+    return ir_expr_legacy_result_kind(idx)
+
+# the ir result kind of a method call. a module-qualified call (`mod.fn(...)`)
+# resolves like a static call; otherwise dispatch to the impl method, then to a
+# `self.make()` closure field inside a generic impl, then the builtin table,
+# with legacy inference as the fallback.
+fn ir_method_call_result_kind(idx: Int, node: Node) -> String:
+    mut call_name := ir_resolve_module_alias_method_call_name(idx)
+    if call_name.len() > 0:
+        if ir_is_generic_function_name(call_name):
+            generic_ret_type := ir_infer_type(idx)
+            mut no_explicit_types: List[String] := []
+            call_name = ir_queue_generic_call(call_name, idx, no_explicit_types, generic_ret_type)
+        declared_kind := ir_declared_callable_ir_retkind(call_name)
+        if declared_kind.len() > 0:
+            return declared_kind
+        builtin_kind := ir_builtin_result_retkind(call_name)
+        if builtin_kind.len() > 0:
+            return builtin_kind
+        return ir_expr_legacy_result_kind(idx)
+    obj_type := ir_method_receiver_type(node)
+    method_name := ir_plain_method_name(node.value)
+    mut impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
+    if impl_name.len() > 0:
+        # a generic method's declared return kind lives on the specialization,
+        # not on the base name; the base's may still be a type parameter
+        if ir_is_generic_method_name(impl_name):
+            impl_name = ir_queue_generic_method_call(idx, node, impl_name)
+        declared_kind := ir_declared_callable_ir_retkind(impl_name)
+        if declared_kind.len() > 0:
+            return declared_kind
+    # `self.make()` inside a generic impl where `make` is a closure field:
+    # no method of that name, so the result kind is the field's declared
+    # fn_type return kind. without this a `fn() -> T!` factory reads back as
+    # "unknown" and its Result gets wrapped in a second Result.
+    if impl_name.len() == 0 and ir_current_impl_type.len() > 0:
+        recv_node := get_node(node.children[0])
+        if recv_node.kind == "self":
+            field_kind := ir_struct_fn_field_return_kind(ir_strip_type_args(ir_current_impl_type), method_name)
+            if field_kind.len() > 0:
+                return field_kind
+    emit_name := ir_method_emit_name(method_name, obj_type)
+    declared_kind := ir_declared_callable_ir_retkind(emit_name)
+    if declared_kind.len() > 0:
+        return declared_kind
+    builtin_kind := ir_builtin_result_retkind(emit_name)
+    if builtin_kind.len() > 0:
+        return builtin_kind
+    return ir_expr_legacy_result_kind(idx)
+
+fn ir_generic_result_ok_kind(name: String, concrete_types: List[String]) -> String:
+    if not ir_generic_decl_indices.contains_key(name):
+        return ""
+    decl_idx := ir_generic_decl_indices[name]
+    decl_node := get_node(decl_idx)
+    generic_params := ir_generic_subst_params(name)
+    for child in decl_node.children:
+        returns_node := get_node(child)
+        if returns_node.kind != "returns":
+            continue
+        for type_idx in returns_node.children:
+            type_node := get_node(ir_alias_target_node(type_idx))
+            if type_node.kind == "result" or type_node.kind == "result_type":
+                if type_node.children.len() > 0:
+                    return ir_retkind(ir_resolve_type_node_with_subst(type_node.children[0], generic_params, concrete_types))
+    return ""
+
+# the ir kind of the ok payload of the result `idx` evaluates to, or "" when
+# it cannot be resolved. the checker's recorded type answers first; failing
+# that, the callee's declaration (a generic one read under this call's type
+# arguments), then the builtin table.
+pub fn ir_result_ok_kind_for_expr(idx: Int) -> String:
+    tid := c_get_expr_type(idx)
+    if tid >= 0:
+        field_kind := ir_result_field_kind(tid, "ok")
+        if field_kind != "unknown":
+            return field_kind
+    node := get_node(idx)
+    if node.kind == "call" and node.children.len() > 0:
+        mut callee := ir_resolve_static_callee(node.children[0])
+        if callee.name.len() == 0:
+            return ""
+        if ir_is_generic_function_name(callee.name):
+            mut explicit_generic_types: List[String] := []
+            callee_node := get_node(node.children[0])
+            if callee_node.kind == "index":
+                explicit_generic_types = ir_explicit_generic_concrete_types(callee_node)
+            mut concrete_types := explicit_generic_types
+            if concrete_types.len() == 0:
+                concrete_types = ir_generic_kinds_from_subst(idx)
+            result_ok_kind := ir_generic_result_ok_kind(callee.name, concrete_types)
+            if result_ok_kind.len() > 0:
+                return result_ok_kind
+        if ir_func_result_ok_kinds.contains_key(callee.name):
+            return ir_retkind(ir_func_result_ok_kinds[callee.name])
+        return ir_builtin_result_ok_kind(callee.name)
+    if node.kind == "method_call":
+        call_name := ir_resolve_module_alias_method_call_name(idx)
+        if call_name.len() > 0:
+            if ir_func_result_ok_kinds.contains_key(call_name):
+                return ir_retkind(ir_func_result_ok_kinds[call_name])
+            return ir_builtin_result_ok_kind(call_name)
+        obj_type := ir_method_receiver_type(node)
+        method_name := ir_plain_method_name(node.value)
+        impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
+        if impl_name.len() > 0 and ir_is_generic_method_name(impl_name):
+            # the ok payload of a `T!` return is only concrete under this call's
+            # substitution, so read it off the declaration with the checker's
+            # types rather than from a registry keyed on the base name
+            generic_ok_kind := ir_generic_result_ok_kind(impl_name, ir_generic_kinds_from_subst(idx))
+            if generic_ok_kind.len() > 0:
+                return generic_ok_kind
+        if impl_name.len() > 0 and ir_func_result_ok_kinds.contains_key(impl_name):
+            return ir_retkind(ir_func_result_ok_kinds[impl_name])
+        emit_name := ir_method_emit_name(method_name, obj_type)
+        if ir_func_result_ok_kinds.contains_key(emit_name):
+            return ir_retkind(ir_func_result_ok_kinds[emit_name])
+        return ir_builtin_result_ok_kind(emit_name)
+    return ""
+
+## emit result ok field for expr.
+pub fn ir_emit_result_ok_field_for_expr(obj_r: Int, expr_idx: Int) -> Int:
+    mut field_kind := ir_result_ok_kind_for_expr(expr_idx)
+    if field_kind.len() == 0:
+        field_kind = "unknown"
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 " + field_kind + " ok")
+    return r
+
+## struct field name.
+pub fn ir_struct_field_name(field_node: Node) -> String:
+    mut field_name := field_node.value
+    if field_name.contains(" "):
+        field_name = field_name.split(" ")[0]
+    return field_name
+
+# a `weak` field holds its optional target without keeping it alive, so a
+# parent<->child ring reclaims instead of leaking. the parser stashes the
+# modifier in the field node's value ("parent weak"), which is where the
+# checker's E249 validation reads it from too.
+pub fn ir_struct_field_is_weak(struct_name: String, field_name: String) -> Bool:
+    layout_name := ir_struct_layout_name(struct_name)
+    if not ir_struct_decl_nodes.contains_key(layout_name):
+        return false
+    decl := get_node(ir_struct_decl_nodes[layout_name])
+    for child in decl.children:
+        field_node := ir_unwrap_pub_node(child)
+        if field_node.kind != "field":
+            continue
+        if ir_struct_field_name(field_node) == field_name:
+            return field_node.value.contains(" weak")
+    return false
+
+## is sync primitive name.
+pub fn ir_is_sync_primitive_name(name: String) -> Bool:
+    return name == "Mutex" or name == "WaitGroup" or name == "Semaphore" or name == "AtomicInt"
+
+## emit func header.
+pub fn ir_emit_func_header(name: String, param_count: Int, ret_type: String):
+    ir_emit("func " + name + " " + param_count.to_string() + " " + ir_retkind(ret_type))
+
+# close a body whose return value nobody reads: the backend still wants a
+# register returned, so hand it a zero.
+pub fn ir_emit_zero_ret_endfunc():
+    end_r := ir_reg()
+    ir_emit("iconst " + end_r.to_string() + " 0")
+    ir_emit("ret " + end_r.to_string())
+    ir_emit("endfunc")
+
+# a map target whose value type is string picks the heap-value
+# constructor for empty literals, so runtime inserts retain
+pub fn ir_map_init_target(name: String, target_type: String) -> String:
+    mut val_type := ir_lookup_map_value_type(name)
+    if val_type.len() == 0 and ir_global_map_value_types.contains_key(name):
+        val_type = ir_global_map_value_types[name]
+    if val_type == "string":
+        if target_type == "map":
+            return "map_str_val"
+        if target_type == "map_int":
+            return "map_int_str_val"
+    return target_type
+
+## is local generic callee.
+pub fn ir_is_local_generic_callee(index_idx: Int, member_name: String, first_param_name: String) -> Bool:
+    index_node := get_node(index_idx)
+    if index_node.kind != "index" or index_node.children.len() < 2:
+        return false
+    base_node := get_node(index_node.children[0])
+    if base_node.kind != "ident" or base_node.value != member_name:
+        return false
+    if not ir_generic_decl_indices.contains_key(member_name):
+        return false
+    return ir_param_name_at(ir_generic_decl_indices[member_name], 0) == first_param_name
+
+## callee uses result abi.
+pub fn ir_callee_uses_result_abi(callee: ResolvedCallee, idx: Int) -> Bool:
+    raw_kind := ir_declared_callable_ir_retkind(callee.name)
+    if raw_kind == "tuple" or raw_kind == "result_int" or raw_kind == "result_bool":
+        return true
+    return ir_builtin_result_retkind(callee.name).len() > 0
+
+## temp name.
+pub fn ir_temp_name(prefix: String) -> String:
+    return prefix + "_" + ir_label()
+
+# substitute a type-name string using the active impl substitution map. if the
+# name is one of the struct's generic parameters (ir_current_impl_subst_params)
+# the matching concrete type name is returned; otherwise the input comes back
+# unchanged. used when emitting specialized impl method bodies.
+pub fn ir_substitute_type_name(name: String) -> String:
+    mut i := 0
+    while i < ir_current_impl_subst_params.len():
+        if ir_current_impl_subst_params[i] == name and i < ir_current_impl_subst_args.len():
+            return ir_current_impl_subst_args[i]
+        i = i + 1
+    return name
+
+## impl target type.
+pub fn ir_impl_target_type(node: Node) -> String:
+    mut impl_type := ""
+    for child in node.children:
+        child_node := get_node(child)
+        if child_node.kind == "type":
+            impl_type = child_node.value
+        elif child_node.kind == "for_type":
+            for type_idx in child_node.children:
+                type_child := get_node(type_idx)
+                if type_child.kind == "type":
+                    impl_type = type_child.value
+        elif child_node.kind == "generic_type" and impl_type == "":
+            impl_type = child_node.value
+    return impl_type
+
+# the impl target's identity name: ir_impl_target_type, with a generic base
+# whose bare name a second module also declares replaced by its declaring
+# module's key. every table the emitter keys by an impl target goes through
+# this, so two modules' `impl Box:` never write over each other's methods,
+# specializations or associated types. an unambiguous name comes back
+# unchanged, which is every name in a program with no such clash.
+pub fn ir_impl_identity_type(node: Node, module_path: String) -> String:
+    impl_type := ir_impl_target_type(node)
+    if impl_type.len() == 0:
+        return impl_type
+    return generic_base_identity(module_path, impl_type)
+
+# the identity of a generic base named through a module alias, for a
+# `mod.Box(...)` call node. the alias says which module's declaration the call
+# means, which is exactly what the bare written name cannot. an alias that
+# names no module, or a name no second module declares generically, gives the
+# name back unchanged.
+pub fn ir_alias_generic_base_identity(idx: Int, name: String) -> String:
+    node := get_node(idx)
+    if node.children.len() == 0:
+        return name
+    recv := get_node(node.children[0])
+    if recv.kind != "ident":
+        return name
+    if not ir_module_aliases.contains_key(recv.value):
+        return name
+    return generic_base_identity(ir_module_aliases[recv.value], name)
+
+# for `impl Iface for Concrete`, the interface's base name; "" for a plain
+# `impl T:` block. the first type child is the interface, a for_type follows.
+pub fn ir_impl_interface_base(node: Node) -> String:
+    mut has_for := false
+    mut first_type := ""
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "type" and first_type == "":
+            first_type = cn.value
+        elif cn.kind == "generic_type" and first_type == "":
+            first_type = cn.value
+        elif cn.kind == "for_type":
+            has_for = true
+    if has_for == false:
+        return ""
+    return ir_strip_type_args(first_type)
+
+## impl defines method.
+pub fn ir_impl_defines_method(node: Node, method_name: String) -> Bool:
+    for child in node.children:
+        mn := get_node(ir_unwrap_pub_child(child))
+        if ir_is_fn_decl_kind(mn.kind) and mn.value == method_name:
+            return true
+    return false
+
+# the interface-default fn_decl nodes an impl inherits: each default method on
+# the interface (a fn_decl member) that the impl did not override itself.
+pub fn ir_inherited_default_indices(node: Node) -> List[Int]:
+    mut result: List[Int] := []
+    iface_base := ir_impl_interface_base(node)
+    if iface_base.len() == 0:
+        return result
+    if ir_interface_decl_index.contains_key(iface_base) == false:
+        return result
+    iface_node := get_node(ir_interface_decl_index[iface_base])
+    for member in iface_node.children:
+        mn := get_node(member)
+        if ir_is_fn_decl_kind(mn.kind):
+            if ir_impl_defines_method(node, mn.value) == false:
+                result.push(member)
+    return result
+
+# the payload type of a `T?` return in one instance of a generic impl. the
+# written name is the impl's own associated type (`Item`), a type parameter
+# (`U`) or a parameter's associated type (`I.Item`), and each is replaced
+# through the instance's type arguments. left unsubstituted it has no rc
+# kind, so a returned Some carried no payload destructor and
+# `MapIter[Range, String].next` leaked every string it yielded.
+pub fn ir_specialized_optional_inner(idx: Int, inst_tid: Int) -> String:
+    return ir_instance_type_name(inst_tid, ir_extract_optional_inner_type(idx))
+
+# `name` as written inside the impl of a generic struct, resolved for the
+# instance `inst_tid`. a parameter's associated type recurses into the type
+# argument, so `I.Item` over `MapIter[Range, String]` answers String.
+fn ir_instance_type_name(inst_tid: Int, name: String) -> String:
+    if not struct_instance_base_name.contains_key(inst_tid) or not struct_instance_type_args.contains_key(inst_tid):
+        return name
+    base := struct_instance_base_name[inst_tid]
+    resolved := ir_resolve_assoc_type(base, name)
+    if not has_generic_declaration(base):
+        return resolved
+    params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
+    arg_tids := decode_tid_list(struct_instance_type_args[inst_tid])
+    parts := resolved.split(".")
+    for p, i in params:
+        if i >= arg_tids.len():
+            break
+        if resolved == p:
+            return ir_type_from_tid(arg_tids[i])
+        if parts.len() == 2 and parts[0] == p:
+            arg_tid := arg_tids[i]
+            if struct_instance_base_name.contains_key(arg_tid):
+                return ir_instance_type_name(arg_tid, parts[1])
+            return ir_resolve_assoc_type(ir_strip_type_args(get_type_name(arg_tid)), parts[1])
+    return resolved
+
+fn ir_expr_legacy_result_kind(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "call" and node.children.len() > 0:
+        callee := ir_resolve_static_callee(node.children[0])
+        if ir_declared_callable_ir_retkind(callee.name).len() > 0:
+            return ""
+        return ir_builtin_result_retkind(callee.name)
+    if node.kind == "method_call":
+        alias_name := ir_resolve_module_alias_method_call_name(idx)
+        if alias_name.len() > 0:
+            if ir_declared_callable_ir_retkind(alias_name).len() > 0:
+                return ""
+            return ir_builtin_result_retkind(alias_name)
+        obj_type := ir_method_receiver_type(node)
+        emit_name := ir_method_emit_name(ir_plain_method_name(node.value), obj_type)
+        if ir_declared_callable_ir_retkind(emit_name).len() > 0:
+            return ""
+        return ir_builtin_result_retkind(emit_name)
+    return ""
+
+fn ir_call_retkind(idx: Int, uses_result_abi: Bool) -> String:
+    if uses_result_abi:
+        node := get_node(idx)
+        if node.kind == "call" and node.children.len() > 0:
+            callee := ir_resolve_static_callee(node.children[0])
+            declared_kind := ir_declared_callable_ir_retkind(callee.name)
+            if declared_kind.len() > 0:
+                return declared_kind
+        if node.kind == "method_call":
+            alias_name := ir_resolve_module_alias_method_call_name(idx)
+            if alias_name.len() > 0:
+                declared_kind := ir_declared_callable_ir_retkind(alias_name)
+                if declared_kind.len() > 0:
+                    return declared_kind
+            obj_type := ir_method_receiver_type(node)
+            method_name := ir_plain_method_name(node.value)
+            impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
+            if impl_name.len() > 0:
+                declared_kind := ir_declared_callable_ir_retkind(impl_name)
+                if declared_kind.len() > 0:
+                    return declared_kind
+            emit_name := ir_method_emit_name(method_name, obj_type)
+            declared_kind := ir_declared_callable_ir_retkind(emit_name)
+            if declared_kind.len() > 0:
+                return declared_kind
+        legacy_kind := ir_expr_legacy_result_kind(idx)
+        if legacy_kind.len() > 0:
+            return legacy_kind
+        result_kind := ir_checked_result_kind(idx)
+        if result_kind.len() > 0:
+            return result_kind
+    return ir_infer_type(idx)
+
+## call retkind for name.
+pub fn ir_call_retkind_for_name(idx: Int, uses_result_abi: Bool, callee_name: String) -> String:
+    if uses_result_abi:
+        declared_kind := ir_declared_callable_ir_retkind(callee_name)
+        if declared_kind.len() > 0:
+            return declared_kind
+    return ir_call_retkind(idx, uses_result_abi)
+
+fn ir_known_callable_return_type(fname: String) -> String:
+    struct_type := ir_known_struct_return_type(fname)
+    if struct_type.len() > 0:
+        return struct_type
+    scalar_type := ir_known_scalar_return_type(fname)
+    if scalar_type.len() > 0:
+        return scalar_type
+    collection_type := ir_known_collection_return_type(fname)
+    if collection_type.len() > 0:
+        return collection_type
+    return ir_declared_callable_return_type(fname)
+
+fn ir_field_receiver_type(recv_idx: Int) -> String:
+    mut obj_type := ir_infer_type(recv_idx)
+    if obj_type.contains("["):
+        base := obj_type.substring(0, obj_type.index_of("["))
+        if ir_struct_names.contains_key(base):
+            obj_type = base
+    if obj_type.len() == 0:
+        recv := get_node(recv_idx)
+        if recv.kind == "ident" and ir_struct_names.contains_key(recv.value):
+            obj_type = recv.value
+        # `self` inside a method body resolves to the impl block's target type
+        elif recv.kind == "self" and ir_current_impl_type.len() > 0:
+            obj_type = ir_current_impl_type
+    return obj_type
+
+# emit a struct field read using the checker's authoritative layout: the field's
+# position in the struct type gives the offset, its declared type gives the kind.
+# this is independent of module emission order, unlike the name-keyed lookup map
+# (which is filled as each module is emitted). a struct reached only through
+# another module's return type (one the current module never imports) is
+# emitted after its user, so it is absent from the map when the user's field
+# access is lowered, and the offset falls back to an unsound name-based guess: a
+# String field read lands on the wrong slot, silently corrupting the value.
+# returns the result register, or -1 when the checker does not type the receiver
+# as a plain (non-weak) struct, so the caller falls back to the map path.
+pub fn ir_try_checked_field_read(obj_r: Int, recv_idx: Int, field_name: String) -> Int:
+    recv_tid := c_get_expr_type(recv_idx)
+    if recv_tid < 0:
+        return 0 - 1
+    recv_info := get_type_info(recv_tid)
+    if recv_info.kind != "struct":
+        return 0 - 1
+    mut field_index := 0 - 1
+    for name, i in recv_info.fields:
+        if name == field_name:
+            field_index = i
+    if field_index < 0 or field_index >= recv_info.field_types.len():
+        return 0 - 1
+    # a weak field needs the optional-synthesizing read path; leave those to the
+    # map path, which already handles them.
+    if ir_struct_field_is_weak(recv_info.name, field_name):
+        return 0 - 1
+    field_offset := field_index * 8
+    field_kind := ir_type_from_tid(recv_info.field_types[field_index])
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + field_offset.to_string() + " " + field_kind + " " + field_name)
+    return r
+
+fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
+    impl_name := ir_lookup_impl_method_name(obj_type, meth)
+    if impl_name.len() > 0:
+        declared := ir_declared_callable_return_type(impl_name)
+        if declared.len() > 0:
+            return declared
+    if ir_is_bool_returning_method(meth):
+        return "bool"
+    # `to_string` on a scalar kind mints a fresh string. this is the emitter's
+    # own inference, consulted only where the checked type is absent, and the
+    # retkind is what pairs the fresh buffer with a release: "unknown" here
+    # leaked every such temporary (issue #949). gated on the scalar kinds only: a string
+    # receiver lowers to identity (no fresh buffer, the receiver register
+    # itself), so kinding it would hand the borrow classifier a value it
+    # releases out from under the receiver's owner; an unresolved receiver
+    # stays unknown rather than guessed at.
+    if meth == "to_string" and (obj_type == "int" or obj_type == "float" or obj_type == "bool"):
+        return "string"
+    string_type := ir_known_string_method_return_type(meth)
+    if string_type.len() > 0:
+        return string_type
+    if meth == "to_float":
+        return "float"
+    if meth == "len" or meth == "cap":
+        return "int"
+    if (meth == "slice" or meth == "concat") and obj_type == "bytes":
+        return "bytes"
+    collection_type := ir_known_collection_method_return_type(obj_type, meth)
+    if collection_type.len() > 0:
+        return collection_type
+    return ""
+
+fn ir_binary_expr_type(node: Node) -> String:
+    op := node.value
+    if op == "eq" or op == "neq" or op == "lt" or op == "gt" or op == "lte" or op == "gte" or op == "and" or op == "or":
+        return "bool"
+    if op == "add" or op == "sub" or op == "mul" or op == "div" or op == "mod":
+        if node.children.len() >= 2:
+            lt := ir_infer_type(node.children[0])
+            rt := ir_infer_type(node.children[1])
+            if lt == "float" or rt == "float":
+                return "float"
+            if lt == "string" or rt == "string":
+                return "string"
+        return "int"
+    return "int"
+
+fn ir_index_expr_type(idx: Int, node: Node) -> String:
+    checked_index := ir_checked_index_type(idx)
+    if checked_index.len() > 0:
+        return checked_index
+    if node.children.len() == 0:
+        return ""
+    coll_type := ir_infer_type(node.children[0])
+    if coll_type == "string":
+        return "string"
+    if coll_type == "bytes":
+        return "int"
+    if coll_type == "list_string":
+        return "string"
+    if coll_type == "map" or coll_type == "map_int":
+        return ir_lookup_map_value_type_for_expr(node.children[0])
+    return ""
+
+fn ir_call_expr_type(idx: Int, node: Node) -> String:
+    if node.children.len() == 0:
+        return ""
+    callee_node := get_node(node.children[0])
+    if callee_node.kind == "ident" and ir_closure_return_kinds.contains_key(callee_node.value):
+        return ir_closure_return_kinds[callee_node.value]
+    callee := ir_resolve_static_callee(node.children[0])
+    if callee.name.len() == 0:
+        return ""
+    return ir_known_callable_return_type(callee.name)
+
+fn ir_method_expr_type(idx: Int, node: Node) -> String:
+    alias_fname := ir_resolve_module_alias_method_call_name(idx)
+    if alias_fname.len() > 0:
+        return ir_known_callable_return_type(alias_fname)
+    mname := ir_plain_method_name(node_value(idx))
+    mut obj_type := ""
+    if node.children.len() > 0:
+        obj_type = ir_infer_type(node.children[0])
+    return ir_known_method_return_type(obj_type, mname)
+
+## checked struct field type.
+pub fn ir_checked_struct_field_type(recv_idx: Int, field_name: String) -> String:
+    recv_tid := c_get_expr_type(recv_idx)
+    if recv_tid < 0:
+        return ""
+    recv_info := get_type_info(recv_tid)
+    if recv_info.kind != "struct":
+        return ""
+    for name, i in recv_info.fields:
+        if name == field_name and i < recv_info.field_types.len():
+            return ir_type_from_tid(recv_info.field_types[i])
+    return ""
+
+fn ir_field_expr_type(node: Node) -> String:
+    if node.children.len() == 0:
+        return ""
+    fname := node.value
+    if fname == "is_ok" or fname == "is_err":
+        return "bool"
+    if fname == "ok":
+        obj_tid := c_get_expr_type(node.children[0])
+        if obj_tid >= 0:
+            obj_info := get_type_info(obj_tid)
+            if obj_info.kind == "result":
+                return ir_type_from_tid(obj_info.inner)
+    if fname == "err":
+        obj_tid := c_get_expr_type(node.children[0])
+        if obj_tid >= 0:
+            obj_info := get_type_info(obj_tid)
+            if obj_info.kind == "result":
+                return ir_type_from_tid(obj_info.value_type)
+    concrete_field_type := ir_checked_struct_field_type(node.children[0], fname)
+    if concrete_field_type.len() > 0:
+        return concrete_field_type
+    obj_type := ir_field_receiver_type(node.children[0])
+    if obj_type.len() == 0:
+        return ""
+    lookup_key := obj_type + "." + fname
+    if ir_struct_field_lookup.contains_key(lookup_key):
+        return ir_struct_field_lookup[lookup_key]
+    return ""
+
+# --- centralized type inference for AST nodes ---
+# Returns: "int", "float", "bool", "string", "list", "list_string",
+#          "map", "map_int", "set", "set_int", or "" (unknown)
+pub fn ir_infer_type(idx: Int) -> String:
+    # a missing child (an absent optional argument) has index -1;
+    # asking its type is a normal question with an unknown answer
+    if idx < 0:
+        return ""
+    iface := ir_interface_coercion(idx)
+    if iface >= 0:
+        return "struct:" + get_type_info(iface).name
+    checked := ir_checked_type(idx)
+    if checked.len() > 0:
+        return checked
+    node := get_node(idx)
+    kind := node_kind(idx)
+    literal_type := ir_literal_expr_type(node, kind)
+    if literal_type.len() > 0:
+        return literal_type
+    # identifiers: look up tracked type
+    if kind == "ident":
+        return ir_lookup_name_type(node.value)
+    if kind == "self":
+        # use the current impl block's target type so field lookups resolve
+        # to the right struct; "struct" is a generic placeholder fallback
+        if ir_current_impl_type.len() > 0:
+            return ir_current_impl_type
+        return "struct"
+    # grouped expression: infer inner
+    if kind == "grouped" and node.children.len() > 0:
+        return ir_infer_type(node.children[0])
+    # binary ops
+    if kind == "binary":
+        return ir_binary_expr_type(node)
+    # unary
+    if kind == "unary":
+        return ir_unary_expr_type(node)
+    # function calls
+    if kind == "call":
+        return ir_call_expr_type(idx, node)
+    # method calls
+    if kind == "method_call":
+        return ir_method_expr_type(idx, node)
+    if kind == "field_access":
+        return ir_field_expr_type(node)
+    if kind == "struct_init":
+        return ir_resolve_type_hint(node.value)
+    # index: depends on collection type
+    if kind == "index" and node.children.len() > 0:
+        return ir_index_expr_type(idx, node)
+    return ""
+
+# `target_inner` is the optional's inner type when the caller knows it, and ""
+# when it does not. it exists for one case: an optional lowers to the same
+# tuple-shaped allocation a tuple literal produces, so a genuine tuple payload
+# and an already-built shell are the same shape here. without the target's own
+# word for which it wants, a `(Int, String)?` target takes the pass-through
+# path and stores the payload raw, and the extraction then reads the shell's
+# slots. the return site has always consulted the inner type for this reason.
+## the payload kinds an optional takes ownership of: it retains a borrowed one
+## and attaches the destructor that releases it when the shell dies.
+##
+## a string is in the set, and was left out for a long time on the grounds that
+## an optional over a string only ever borrowed one. a wrap builds a Some over
+## a fresh string too (`["a-{i}", none]`, `v: String? := "a-{i}"`), and the
+## borrowing convention left that string with a count nobody would drop once
+## the shell reached a container or a field.
+##
+## a tuple payload is deliberately absent: its elements are heterogeneous, so
+## it needs the destructor emitted for its own signature rather than one of
+## these uniform walks. see ir_optional_tuple_payload_kind.
+pub fn ir_kind_is_owned_optional_payload(kind: String) -> Bool:
+    if kind == "struct" or kind == "list" or kind == "map" or kind == "set":
+        return true
+    return kind == "bytes" or kind == "closure" or kind == "string" or kind == "channel" or kind == "sync"
+
+# true when the value is already the optional, result or tuple this position
+# wants, so it needs no shell built around it.
+#
+# the checker settles the question when it can: it records the values that need
+# a Some built, having excluded `none`, an already-optional value and the error
+# type. that record is authoritative because the shapes are otherwise
+# indistinguishable here: an optional lowers to the same tuple-shaped
+# allocation a tuple literal produces, so a tuple payload and a built shell look
+# alike, and only the target's own inner type separates them.
+pub fn ir_value_is_already_the_optional(val_idx: Int, actual_info: TypeInfo, target_inner: String) -> Bool:
+    if c_argument_widens_to_optional(val_idx):
+        return false
+    if actual_info.kind == "optional" or actual_info.kind == "result":
+        return true
+    return actual_info.kind == "tuple" and target_inner != "tuple"
+
+# true when val_idx is an empty collection literal the checker gave a
+# collection type, so its own emission picks the tagged constructor.
+pub fn ir_empty_literal_is_typed(val_idx: Int, vn: Node) -> Bool:
+    if vn.children.len() != 0:
+        return false
+    if vn.kind != "list" and vn.kind != "map" and vn.kind != "set":
+        return false
+    checked := ir_checked_type(val_idx)
+    return checked.starts_with("list") or checked.starts_with("map") or checked.starts_with("set")
+
+# the empty-init target with the literal's key flavor applied: "set" becomes
+# "set_bytes" and "map" or "map_str_val" becomes "map_bytes" or
+# "map_bytes_str_val" when the checker typed the literal at val_idx as
+# bytes-keyed. every other target passes through.
+pub fn ir_bytes_keyed_target(val_idx: Int, target_type: String) -> String:
+    if target_type == "set" or target_type == "map":
+        return ir_bytes_keyed_type(val_idx, target_type)
+    if target_type == "map_str_val" and ir_bytes_keyed_type(val_idx, "map") == "map_bytes":
+        return "map_bytes_str_val"
+    return target_type
+
+## checked target type.
+pub fn ir_checked_target_type(target_idx: Int, fallback_name: String) -> String:
+    checked := ir_checked_type(target_idx)
+    if checked.len() > 0:
+        return checked
+    if fallback_name.len() > 0:
+        return ir_lookup_name_type(fallback_name)
+    return ""
+
+## method receiver type.
+pub fn ir_method_receiver_type(node: Node) -> String:
+    if node.children.len() == 0:
+        return ""
+    # `self` is always the impl type currently being emitted. reading the
+    # checker's recorded type would be wrong for a shared interface-default
+    # body, which is type-checked once per implementing type. the last one
+    # wins and would misroute self.method() to that type.
+    recv0 := get_node(node.children[0])
+    if recv0.kind == "self" and ir_current_impl_type.len() > 0:
+        return ir_current_impl_type
+    recv_tid := c_get_expr_type(node.children[0])
+    if recv_tid >= 0:
+        recv_info := get_type_info(recv_tid)
+        if recv_info.kind == "channel" and recv_info.inner >= 0:
+            return "channel:" + ir_type_from_tid(recv_info.inner)
+        if recv_info.kind == "task" and recv_info.inner >= 0:
+            return "task:" + ir_type_from_tid(recv_info.inner)
+        # a tag-only enum is an integer to the emitter, so its type name is
+        # lost in the conversion below and a method from its impl block would
+        # be emitted as a call to the bare method name.
+        if recv_info.kind == "enum" and ir_type_from_tid(recv_tid) == "int":
+            if ir_lookup_impl_method_name(recv_info.name, ir_plain_method_name(node.value)).len() > 0:
+                return recv_info.name
+        # a bytes-keyed set or map dispatches to its own runtime entry
+        # points; the flavor rides on the receiver type only here, where
+        # the method name is picked, and is never a tracked kind
+        known := ir_bytes_keyed_type(node.children[0], ir_type_from_tid(recv_tid))
+        if known.len() > 0:
+            return ir_substitute_type_name(known)
+    checked := ir_checked_type(node.children[0])
+    if checked.len() > 0:
+        return ir_substitute_type_name(checked)
+    inferred := ir_infer_type(node.children[0])
+    if inferred.len() > 0:
+        return ir_substitute_type_name(inferred)
+    # fallback: if the receiver is `self.field` inside an impl method, look
+    # up the field's declared type from the impl struct and substitute. this
+    # is what lets a specialized MapIter[Range,_,_]_next route self.src.next()
+    # to Range_next when the checker recorded self.src as TID_ERR
+    recv_node := get_node(node.children[0])
+    if recv_node.kind == "field_access" and recv_node.children.len() > 0 and ir_current_impl_type.len() > 0:
+        inner := get_node(recv_node.children[0])
+        if inner.kind == "self":
+            fname := node_value(node.children[0])
+            base_struct := ir_strip_type_args(ir_current_impl_type)
+            field_key := base_struct + "." + fname
+            if ir_struct_field_lookup.contains_key(field_key):
+                return ir_substitute_type_name(ir_struct_field_lookup[field_key])
+    return ""
+
+# the rc kind of an optional type's payload, or "" for a plain one
+pub fn ir_optional_payload_rc_kind(opt_tid: Int) -> String:
+    if opt_tid < 0:
+        return ""
+    info := get_type_info(opt_tid)
+    if info.kind != "optional" or info.inner < 0:
+        return ""
+    return ir_rc_kind(ir_type_from_tid(info.inner))
+
+# the conversion that checks a value against a narrow integer type's range,
+# or "" for a type whose arithmetic needs none. the ir computes in 64 bits, so
+# `Int8(127) + Int8(1)` holds 128 until the conversion stops the program. the
+# 64-bit types check their own arithmetic.
+fn ir_sized_int_narrow_fn(tid: Int) -> String:
+    if tid < 0:
+        return ""
+    name := get_type_name(tid)
+    if name == "Int8" or name == "Int16" or name == "Int32" or name == "UInt8" or name == "UInt16" or name == "UInt32":
+        return name
+    return ""
+
+# check `r`, the result of arithmetic typed `tid`, against that type's range.
+pub fn ir_narrow_to_tid(tid: Int, r: Int) -> Int:
+    narrow := ir_sized_int_narrow_fn(tid)
+    if narrow.len() == 0:
+        return r
+    out := ir_reg()
+    ir_emit_call1(out, narrow, "int", r)
+    return out
+
+# wrap `r` into the range of `tid` by keeping its low bits, for the wrapping
+# methods. the 64-bit types need nothing, since the ir already wraps there.
+pub fn ir_wrap_to_tid(tid: Int, r: Int) -> Int:
+    narrow := ir_sized_int_narrow_fn(tid)
+    if narrow.len() == 0:
+        return r
+    out := ir_reg()
+    ir_emit_call1(out, "pith_wrapping_" + narrow.to_lower(), "int", r)
+    return out
+
+# whether the fused map update, which adds in the runtime with Int's
+# overflow check, must leave `m[k] + d` on a value of this type to the
+# general path: a narrow type checks its own range there, and an unsigned
+# word checks the unsigned range.
+pub fn ir_fused_add_declines(tid: Int) -> Bool:
+    return ir_sized_int_narrow_fn(tid).len() > 0 or ir_is_unsigned_word(tid)
+
+# the arithmetic operators whose result can leave a narrow type's range.
+# comparisons yield a Bool, and the bit operations live in std.bits on Int.
+fn ir_op_can_overflow(op: String) -> Bool:
+    return op == "add" or op == "sub" or op == "mul" or op == "div" or op == "mod" or op == "negate"
+
+## narrow sized result.
+pub fn ir_narrow_sized_result(idx: Int, op: String, r: Int) -> Int:
+    if not ir_op_can_overflow(op):
+        return r
+    return ir_narrow_to_tid(c_get_expr_type(idx), r)
+
+## binary op is comparison.
+pub fn ir_binary_op_is_comparison(simple_op: String) -> Bool:
+    return simple_op == "lt" or simple_op == "gt" or simple_op == "lte" or simple_op == "gte"
+
+# the byte value (0-255) of a single-character string literal, or -1 if the
+# literal is empty, multi-character, or a non-ascii/unknown escape. `raw` is the
+# literal's source form *including its surrounding quotes*, e.g. `"/"` (three
+# chars) or `"\n"` (four), so it must be unquoted and unescaped before its
+# length means anything. only the escapes a byte scanner actually compares
+# against are decoded; anything else falls back to the normal string path.
+pub fn ir_string_lit_single_byte(raw: String) -> Int:
+    n := raw.len()
+    if n < 3:
+        return 0 - 1
+    inner_len := n - 2
+    if inner_len == 1:
+        # a plain character; a lone backslash is an incomplete escape, not a byte
+        c := raw[1]
+        if c == "\\":
+            return 0 - 1
+        return ord(c)
+    if inner_len == 2 and raw[1] == "\\":
+        e := raw[2]
+        if e == "n":
+            return 10
+        if e == "t":
+            return 9
+        if e == "r":
+            return 13
+        if e == "0":
+            return 0
+        if e == "\\":
+            return 92
+        if e == "\"":
+            return 34
+        if e == "'":
+            return 39
+    return 0 - 1
+
+# whether one side of a widened T? == T comparison qualifies as the plain
+# operand: a well-typed non-optional value. TID_ERR and TID_NONE are
+# primitives with tids >= 0, so they are named rather than caught by the
+# sign check.
+pub fn ir_plain_compare_operand_ok(tid: Int, info: TypeInfo) -> Bool:
+    return tid >= 0 and tid != TID_ERR and tid != TID_NONE and info.kind != "optional"
+
+# the scalar / string / bytes value operators: float arithmetic, string concat
+# and ordered comparison (which call the runtime rather than compare pointers),
+# enum structural equality, and the plain integer binops. emits into r (already
+# allocated by the caller so register numbering is stable) and returns it.
+# true for the unsigned 64-bit types, whose values are the bits of an i64:
+# division, remainder, ordering and printing need the unsigned forms, or a
+# value at or past 2^63 reads as negative. the narrower unsigned types are kept
+# zero-extended, so the signed forms already answer correctly for them.
+pub fn ir_is_unsigned_word(tid: Int) -> Bool:
+    if tid < 0:
+        return false
+    name := get_type_name(tid)
+    return name == "UInt" or name == "UInt64"
+
+# whether the arithmetic op on a value of type `tid` checks for overflow
+# itself: Int, and the unsigned words. the narrow types compute in 64 bits
+# and check the result against their range afterwards (see
+# ir_sized_int_narrow_fn), and Float has no overflow to check.
+pub fn ir_int_checks_overflow(tid: Int) -> Bool:
+    if tid < 0:
+        return false
+    name := get_type_name(tid)
+    return name == "Int" or name == "Int64" or ir_is_unsigned_word(tid)
+
+# the op that computes `op` on values of type `tid`: the unsigned form of
+# division, remainder and ordering for an unsigned word, and the checked form
+# of `+`, `-` and `*` for a type that stops on overflow (`addc`, or `uaddc`
+# for an unsigned word). an Int counter step is `addnsw` (see
+# ir_exact_int_arith). anything else is the op itself.
+pub fn ir_int_op(tid: Int, op: String) -> String:
+    if (op == "add" or op == "sub" or op == "mul") and ir_int_checks_overflow(tid) and not ir_plain_int_arith:
+        if ir_is_unsigned_word(tid):
+            return "u" + op + "c"
+        return op + "c"
+    if op == "add" and ir_exact_int_arith and ir_int_checks_overflow(tid) and not ir_is_unsigned_word(tid):
+        return "addnsw"
+    if not ir_is_unsigned_word(tid):
+        return op
+    if op == "div" or op == "mod" or op == "lt" or op == "gt" or op == "lte" or op == "gte":
+        if op == "mod":
+            return "urem"
+        return "u" + op
+    return op
+
+## specialize static callee.
+pub fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, explicit_generic_types: List[String]) -> ResolvedCallee:
+    if not ir_is_generic_function_name(callee.name):
+        return callee
+    generic_ret_type := ir_infer_type(idx)
+    return ResolvedCallee(ir_queue_generic_call(callee.name, idx, explicit_generic_types, generic_ret_type), false)
+
+# true when the callee node is an expression (not a plain name) whose
+# checked type is a function value.
+pub fn ir_callee_is_function_expr(callee_idx: Int, callee_node: Node) -> Bool:
+    if callee_node.kind == "ident":
+        return false
+    callee_tid := c_get_expr_type(callee_idx)
+    if callee_tid < 0:
+        return false
+    return get_type_info(callee_tid).kind == "function"
+
+# the list store that carries the element's kind with it, or "" when this is
+# not a list store. only the borrowed stores have a kind-carrying variant: an
+# owned value transfers its count instead of taking one, which the `_owned`
+# stores already do.
+pub fn ir_list_kind_store_name(emit_name: String) -> String:
+    if emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
+        return "list_push_kind"
+    if emit_name == "set" or emit_name == "pith_list_set_value":
+        return "list_set_kind"
+    if emit_name == "list_insert":
+        return "list_insert_kind"
+    return ""
+
+# the element-tag code a heap kind is written as in the ir. these are the
+# codes `pith_list_new` takes and the kind-carrying map stores carry, so they
+# are part of the ir contract and must not be renumbered.
+pub fn ir_element_tag_code(kind: String) -> Int:
+    if kind == "string":
+        return 1
+    if kind == "list":
+        return 2
+    if kind == "map":
+        return 3
+    if ir_kind_is_struct_header(kind):
+        return 4
+    if kind == "bytes":
+        return 5
+    if kind == "closure":
+        return 6
+    if kind == "set":
+        return 7
+    if kind == "channel":
+        return 8
+    if kind == "sync":
+        return 9
+    return 0
+
+# whether a value of this type is a plain machine word with no count: an
+# Int, a Float or a Bool. this names the types outright rather than taking
+# an empty ir_rc_kind, which also covers types the emitter could not infer.
+pub fn ir_type_is_scalar_word(type_hint: String) -> Bool:
+    return type_hint == "int" or type_hint == "float" or type_hint == "bool"
+
+# the value kinds a container learns from the store rather than from its
+# constructor.
+#
+# a container's flavor is normally picked at construction from the checked
+# type, but a map literal reads its value kind off the first entry, and an
+# empty `{}` has none, so `f({})` and every other empty map literal built a
+# map that owned nothing it held. carrying the kind on the store settles it
+# where the kind is known for certain: the container adopts it at the first
+# store (`MapImpl::adopt_value_tag`, `ListImpl::adopt_element_tag`), so the
+# count no longer depends on the constructor having guessed right, and a
+# container that cannot adopt takes the compensating count in the runtime
+# instead, the same leak the emitter used to add here.
+#
+# it is also what stops a *tagged* container being counted twice, which is
+# what a list store did: the list retained in the runtime and the emitter
+# retained again, because nothing at the store told a tagged list from an
+# untagged one. the kind is that missing evidence, and because the same
+# `store_kind` decides both whether to carry it and whether to skip the
+# compensating retain, the two cannot disagree.
+#
+# string values stay on the constructor path. that flavor has always been
+# picked correctly there, and routing it through the kind store would rewrite
+# every string insert in the tree for no change in ownership.
+pub fn ir_store_learns_kind(store_kind: String) -> Bool:
+    if store_kind == "list" or store_kind == "map" or store_kind == "set":
+        return true
+    if ir_kind_is_struct_header(store_kind):
+        return true
+    return store_kind == "bytes" or store_kind == "closure" or store_kind == "channel" or store_kind == "sync"
+
+# materialize an element-tag code into a register, for the store to carry.
+pub fn ir_emit_element_tag_const(kind: String) -> Int:
+    tag_r := ir_reg()
+    ir_emit("iconst " + tag_r.to_string() + " " + ir_element_tag_code(kind).to_string())
+    return tag_r
+
+# the map store that carries the value's kind with it, or "" when this is not
+# a map store.
+pub fn ir_map_kind_store_name(emit_name: String, owned: Bool) -> String:
+    if emit_name == "insert" or emit_name == "map_insert":
+        if owned:
+            return "map_insert_owned_kind"
+        return "map_insert_kind"
+    if emit_name == "map_insert_ikey":
+        if owned:
+            return "map_insert_ikey_owned_kind"
+        return "map_insert_ikey_kind"
+    if emit_name == "map_insert_bkey":
+        if owned:
+            return "map_insert_bkey_owned_kind"
+        return "map_insert_bkey_kind"
+    return ""
+
+# true when a *borrowed* value sent down a channel needs a count added here
+# rather than by the receiving end. a channel is a counted container like a
+# list: a store into it takes a count, so a borrowed value sent gets one here.
+# that count is consumed by whoever receives the value (the receive hands the
+# shell a destructor for it) or by the channel's own free, which drains what
+# was never received and releases each value by the payload tag recorded at
+# construction. an owned value simply transfers.
+#
+# lists and maps used to be on this list too. both now carry the stored
+# value's kind (ir_list_kind_store_name, ir_map_kind_store_name), so the
+# runtime knows whether it owns the value and takes the count itself: the
+# one place that can answer the question the emitter was guessing at.
+pub fn ir_channel_send_needs_retain(emit_name: String, store_kind: String) -> Bool:
+    return ir_is_channel_send_name(emit_name) and store_kind.len() > 0
+
+# the value kinds a container store may take the caller's count for.
+#
+# struct values were the last holdout: a `for` loop variable used to write
+# its borrowed element into the same named slot a later `:=` of that name
+# reused, so the rebind released a count the loop never took
+# (`std.crypto.x509.verify_chain_issuers` had exactly that shape), and the
+# second count a struct store took was what absorbed that over-release.
+# loop variables now get storage of their own, so the mask is gone and a
+# struct built straight into a container transfers like every other kind.
+pub fn ir_container_store_takes_count(store_kind: String) -> Bool:
+    if store_kind == "string" or store_kind == "bytes":
+        return true
+    if ir_kind_is_struct_header(store_kind):
+        return true
+    if store_kind == "channel" or store_kind == "sync":
+        return true
+    return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "closure"
+
+# the variant of a container store that takes the caller's count instead of
+# adding one of its own, or "" for a store with no such variant.
+#
+# a value built straight into a container (`l.push("v-{i}")`, `m[k] = "v-{i}"`)
+# is an owned temporary the caller stops tracking at the store. the caller
+# skips its release there (ownership transfers into the container), but the
+# runtime store also took a count of its own, so the value ended up with two
+# counts and one release. these entry points complete the transfer by not
+# taking that second count.
+#
+# whether there is a count to take is the runtime's call, not the emitter's:
+# only the container knows if it was built tagged to own its elements. an
+# untagged one takes nothing and the caller's count stays outstanding, which
+# is a leak rather than an element nothing keeps alive. see docs/ownership.md.
+pub fn ir_owned_container_store_name(emit_name: String) -> String:
+    if emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
+        return "pith_list_push_value_owned"
+    if emit_name == "set" or emit_name == "pith_list_set_value":
+        return "pith_list_set_value_owned"
+    if emit_name == "insert" or emit_name == "map_insert":
+        return "pith_map_insert_cstr_owned"
+    if emit_name == "map_insert_ikey":
+        return "pith_map_insert_ikey_owned"
+    if emit_name == "map_insert_bkey":
+        return "pith_map_insert_bkey_owned"
+    # insert is push with an index, and was the one container store left
+    # without a transferring variant. for want of it the caller had to keep its
+    # count on a fresh container. `xs.insert(0, {1, 2})` stranded the set,
+    # because releasing it would have handed the list a freed handle.
+    if emit_name == "list_insert":
+        return "pith_list_insert_value_owned"
+    return ""
+
+## list ctor for elem kind.
+pub fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
+    if elem_kind == "string":
+        return "__list_new_str"
+    if elem_kind == "list":
+        return "__list_new_list"
+    if elem_kind == "map":
+        return "__list_new_map"
+    if ir_kind_is_struct_header(elem_kind):
+        return "__list_new_struct"
+    if elem_kind == "bytes":
+        return "__list_new_bytes"
+    # a route table or a middleware chain is a List of closures. untagged it
+    # owned nothing, which made every closure that reached one live on a
+    # count somebody else was holding, and there is no somebody else once a
+    # fn value transfers its count at the call.
+    if elem_kind == "closure":
+        return "__list_new_closure"
+    # a set is a shared handle like a list or a map, and the only collection
+    # kind the runtime's element tag was missing. untagged, a List[Set] owned
+    # nothing: `xs.push({1, 2})` stranded its element for the life of the
+    # process, and the value position of `xs.insert(i, {1, 2})` had to keep its
+    # count for want of anywhere to transfer it to.
+    if elem_kind == "set":
+        return "__list_new_set"
+    # a channel handle is counted, so a List[Channel[T]] owns its elements
+    if elem_kind == "channel":
+        return "__list_new_channel"
+    if elem_kind == "sync":
+        return "__list_new_sync"
+    return "__list_new"
+
+# the most elements one `pith_list_of` call takes
+IR_LIST_OF_MAX := 8
+
+# the rc kind a tuple literal's element slot holds. an element the checker
+# widened into an optional slot holds the Some shell built around it, which
+# the literal owns, not the value's own kind.
+pub fn ir_tuple_elem_kind(elem_idx: Int) -> String:
+    if c_argument_widens_to_optional(elem_idx):
+        return "tuple"
+    return ir_rc_kind(ir_infer_type(elem_idx))
+
+# one letter per element kind, so a tuple type maps to a short signature
+# ("s0" is (String, Int)). the destructor for a signature releases just
+# its rc slots; two tuples with the same signature share one destructor.
+pub fn ir_tuple_elem_code(kind: String) -> String:
+    if kind == "string":
+        return "s"
+    if kind == "list":
+        return "l"
+    if kind == "map":
+        return "m"
+    if kind == "set":
+        return "t"
+    if kind == "bytes":
+        return "b"
+    if kind == "struct":
+        return "u"
+    if kind == "closure":
+        return "c"
+    if kind == "tuple":
+        return "p"
+    if kind == "channel":
+        return "h"
+    if kind == "sync":
+        return "y"
+    return "0"
+
+## tuple dtor code kind.
+pub fn ir_tuple_dtor_code_kind(code: String) -> String:
+    if code == "s":
+        return "string"
+    if code == "l":
+        return "list"
+    if code == "m":
+        return "map"
+    if code == "t":
+        return "set"
+    if code == "b":
+        return "bytes"
+    if code == "u":
+        return "struct"
+    if code == "c":
+        return "closure"
+    if code == "p":
+        return "tuple"
+    if code == "h":
+        return "channel"
+    if code == "y":
+        return "sync"
+    return ""
+
+## tuple dtor signature.
+pub fn ir_tuple_dtor_signature(elem_nodes: List[Int]) -> String:
+    mut sig := ""
+    for child in elem_nodes:
+        sig = sig + ir_tuple_elem_code(ir_tuple_elem_kind(child))
+    return sig
+
+# module-suffixed so each module carries its own copy, exactly like the
+# struct destructors: no cross-module references, no name clashes.
+pub fn ir_tuple_dtor_name(sig: String) -> String:
+    return "__tuple_dtor_" + sig + "_m" + ir_module_count.to_string()
+
+## tuple sig has rc.
+pub fn ir_tuple_sig_has_rc(sig: String) -> Bool:
+    mut i := 0
+    while i < sig.len():
+        if sig[i] != "0":
+            return true
+        i = i + 1
+    return false
+
+# module-suffixed like the destructor it twins.
+pub fn ir_tuple_tracer_name(sig: String) -> String:
+    return "__tuple_trace_" + sig + "_m" + ir_module_count.to_string()
+
+## field lookup key.
+pub fn ir_field_lookup_key(recv_idx: Int, field_name: String) -> String:
+    return ir_field_receiver_type(recv_idx) + "." + field_name
+
+# the widest payload across an enum's variants. every variant is boxed
+# at this size so a match arm can read a payload slot of a value that
+# turned out to be a different, narrower variant without running past
+# the allocation. the tag check still gates whether the comparison
+# counts, but the read itself must stay in bounds and land on a zeroed
+# slot (Event.Ping carries no payload, yet a Code(0) arm reads slot 1).
+pub fn ir_enum_max_payload_count(enum_name: String) -> Int:
+    mut max_count := 0
+    if ir_enum_variant_lists.contains_key(enum_name):
+        for vname in ir_enum_variant_lists[enum_name].split(","):
+            vkey := enum_name + "." + vname
+            if ir_enum_payload_kinds.contains_key(vkey):
+                count := ir_enum_payload_kinds[vkey].split(",").len()
+                if count > max_count:
+                    max_count = count
+    return max_count
+
+# whether the two-register result ABI is on for this process: on unless
+# PITH_RESULT_REG is "0". read once: the emitter must make the same decision
+# for a function's header and for every one of its call sites, across every
+# module of the program.
+pub fn ir_result_reg_enabled() -> Bool:
+    if ir_result_reg_flag < 0:
+        value := env_opt("PITH_RESULT_REG").unwrap_or("")
+        if value == "0":
+            ir_result_reg_flag = 0
+        else:
+            ir_result_reg_flag = 1
+    return ir_result_reg_flag == 1
+
+# register `name` for the two-register result ABI when it qualifies. the gate
+# is per-FUNCTION and must be decided before any call site emits, which is why
+# it runs during return-clause registration. narrow on purpose: no generics
+# (specializations re-emit bodies under substitution), no `main` (the entry
+# glue expects one return), and only ok payloads that fit one integer
+# register (ir_result_reg_ok_kind_fits: a Float! has no f64 pair yet, and an
+# optional or tuple payload is more than one word). the error payload is
+# whatever `fail` produced, always a single register, released by the
+# consumer exactly as the box world's err slot is.
+pub fn ir_maybe_register_result_reg(name: String, node: Node, home_module: String):
+    if not ir_result_reg_enabled():
+        return
+    if name == "main":
+        return
+    if ir_has_generic_params(node):
+        return
+    if not ir_func_returns.contains_key(name) or ir_func_returns[name] != "tuple":
+        return
+    if not ir_func_result_ok_kinds.contains_key(name):
+        return
+    ok_kind := ir_func_result_ok_kinds[name]
+    if not ir_result_reg_ok_kind_fits(ok_kind):
+        return
+    # a declaration containing a lambda or a spawn is excluded: their bodies
+    # are emitted as separate single-return functions while the enclosing
+    # function's return kind is still in effect, so a `fail` or `!` inside
+    # one would try to return the pair from a function that has no pair.
+    for child_idx in node.children:
+        if ir_node_contains_lambda_or_spawn(child_idx):
+            return
+    ir_result_reg_funcs.insert(name, true)
+
+## node contains lambda or spawn.
+pub fn ir_node_contains_lambda_or_spawn(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return true
+    for child_idx in node.children:
+        if ir_node_contains_lambda_or_spawn(child_idx):
+            return true
+    return false
+
+# lower a call to a pair-returning function. always emits rcall; then either
+# hands the raw pair to the consumer that asked for it (the try emitter, via
+# the defer handshake) or folds the pair into an ordinary result box so every
+# other context (bindings, field reads, argument position, forwarding)
+# behaves exactly as the box world always has.
+# the ok payload kinds the register ABI carries. every entry is one i64
+# register: ints and bools by value, the reference-counted kinds as handles
+# whose count transfers through the register exactly as it transferred
+# through the box's ok slot. Float needs the f64 pair (result_reg_f) and
+# multi-word shapes (tuple, optional) are excluded: they have no single register.
+pub fn ir_result_reg_ok_kind_fits(ok_kind: String) -> Bool:
+    if ok_kind == "int" or ok_kind == "bool" or ok_kind == "string" or ok_kind == "bytes":
+        return true
+    if ok_kind == "list" or ok_kind == "list_string" or ok_kind == "map" or ok_kind == "map_int" or ok_kind == "set" or ok_kind == "set_int":
+        return true
+    return ok_kind.starts_with("struct:")
+
+# true for a runtime builtin that returns its result as the (flag, payload)
+# pair in two registers rather than as a box: the parsers and the byte-count
+# writes (ir_builtin_result_retkind's "tuple" list). a name a declaration
+# claims is that declaration's, never the builtin.
+pub fn ir_is_pair_builtin(name: String) -> Bool:
+    return ir_is_pair_builtin_name(name) and not ir_is_declared_callable(name)
+
+# whether a call to `name` yields the (flag, payload) pair and so has to be
+# lowered with rcall: a function registered for the register abi, or a pair
+# builtin. every call site that can reach one asks this, not the registry.
+pub fn ir_call_returns_pair(name: String) -> Bool:
+    return ir_result_reg_funcs.contains_key(name) or ir_is_pair_builtin(name)
+
+# whether a call the checker typed as a result came back from a legacy
+# single-register callee, whose value the caller has to wrap
+pub fn ir_legacy_call_result_wraps(idx: Int, uses_result_abi: Bool, ret_type: String) -> Bool:
+    return uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple"
+
+## method call arg expr.
+pub fn ir_method_call_arg_expr(node: Node, arg_index: Int) -> Int:
+    actual_index := arg_index + 1
+    if actual_index >= node.children.len():
+        return 0 - 1
+    child := node.children[actual_index]
+    cn := get_node(child)
+    if cn.kind == "arg" and cn.children.len() > 0:
+        return cn.children[0]
+    return child
+
+# a channel send hands the value to whoever receives it, on another task and
+# usually after the sender's frame is gone. both forms transfer ownership, so
+# both need the same count: try_send used to be missing here, which let a
+# borrowed value (`ch.try_send(wire.ok)`) reach the receiver with no count of
+# its own and an owned temporary be released the moment the call returned.
+# a send that fails leaves the extra count behind: a bounded leak, and the
+# same trade already accepted for the blocking form.
+pub fn ir_is_channel_send_name(emit_name: String) -> Bool:
+    if emit_name == "send" or emit_name == "pith_channel_send":
+        return true
+    return emit_name == "try_send" or emit_name == "pith_channel_try_send"
+
+# --- method call dispatch ---
+# ---------------------------------------------------------------
+# interface values (docs/interface_values.md)
+# ---------------------------------------------------------------
+#
+# an interface value is a tuple-shaped box: slot 0 holds a type id for the
+# concrete type, slot 1 the concrete value, and slot 2 onwards one function
+# pointer per interface method, in declaration order. the box carries the
+# tuple destructor for its signature, which releases slot 1 by its kind.
+
+# the interface the value at idx converts to, or -1. the checker records a
+# conversion against the node, and a generic body is one node set walked per
+# specialization, so the record only applies where the value's type in the
+# specialization being emitted is concrete: at `T = Shape` the value is
+# already the interface value.
+pub fn ir_interface_coercion(idx: Int) -> Int:
+    if idx < 0 or ir_interface_coercion_bypass.contains_key(idx):
+        return 0 - 1
+    iface := c_interface_coercion(idx)
+    if iface < 0:
+        return 0 - 1
+    actual := c_get_expr_type(idx)
+    if actual < 0 or actual == iface or c_is_interface_value_type(actual):
+        return 0 - 1
+    return iface
+
+# the name an alias-qualified enum receiver (`b.Opt` in `b.Opt.Some(x)`) is
+# filed under: its declaring module's identity when another module declares a
+# generic of the same name, as ir_collect_enum_decl files it, and the bare name
+# otherwise. the bare name means whichever declaration this module filed under
+# it, so `b.Opt.Some("x")` built its box with the tag of a.Opt's Some.
+pub fn ir_qualified_enum_name(recv_idx: Int) -> String:
+    name := node_value(recv_idx)
+    sname := ir_alias_generic_base_identity(recv_idx, name)
+    if ir_enum_variant_lists.contains_key(sname):
+        return sname
+    return name
+
+# true when `recv.f(args)` calls a closure stored in recv's field `f`
+# rather than a method named `f`.
+pub fn ir_method_call_is_closure_field(node: Node, mname: String, obj_type: String) -> Bool:
+    cf_struct := ir_strip_type_args(obj_type)
+    if cf_struct.len() == 0:
+        return false
+    if not ir_struct_field_index_lookup.contains_key(cf_struct + "." + mname):
+        return false
+    return ir_lookup_impl_method_for(node.children[0], obj_type, mname).len() == 0
+
+# file a name this function frame binds. an empty name is what a binding
+# node with no written name hands over, and it can never be looked up.
+fn ir_record_func_local_name(name: String):
+    if name.len() > 0:
+        ir_func_local_names.add(name)
+
+# true when a bare name in the function being emitted is that function's own
+# storage rather than a module global. parameters and lambda captures live in
+# ir_var_regs; everything else the body binds is in ir_func_local_names.
+# a local bound to a lambda literal. binding the same name to two different
+# lambdas in one function leaves no single target, so the name is poisoned
+# and its calls stay indirect.
+pub fn ir_record_lambda_binding(name: String, symbol: String):
+    if ir_local_lambda_targets.contains_key(name) and ir_local_lambda_targets[name] != symbol:
+        ir_local_lambda_targets.insert(name, "")
+        return
+    ir_local_lambda_targets.insert(name, symbol)
+
+# the lambda symbol a call through this name can target directly, or empty
+# a closure parameter of the specialization being emitted that its key binds
+# to one function (ir_fn_bindings_by_param), or ""
+pub fn ir_bound_fn_target(name: String) -> String:
+    if not ir_active_fn_bindings.contains_key(name) or not ir_name_is_func_local(name):
+        return ""
+    return ir_active_fn_bindings[name]
+
+## devirtualized lambda target.
+pub fn ir_devirtualized_lambda_target(name: String) -> String:
+    if not ir_name_is_func_local(name):
+        return ""
+    if not ir_local_lambda_targets.contains_key(name):
+        return ""
+    return ir_local_lambda_targets[name]
+
+## name is func local.
+pub fn ir_name_is_func_local(name: String) -> Bool:
+    return ir_var_regs.contains_key(name) or ir_func_local_names.contains(name)
+
+# the ir operand a bare name is loaded from and stored to. a name this
+# function binds is its own storage and keeps its written spelling; anything
+# else that resolves to a global takes the global's storage symbol, which no
+# written name shares. without that split a local, a parameter or a match
+# binding spelled like a module global wrote the GLOBAL's data slot: the
+# global's own reads then came back as whatever the local last held (zero,
+# for a global read after a function that never ran), and a container global
+# reached `list indexing on invalid list handle` once the local's cleanup
+# freed what the slot still named.
+pub fn ir_resolve_storage_name(name: String) -> String:
+    if ir_name_is_func_local(name):
+        return name
+    if ir_import_renames.contains_key(name):
+        return ir_import_renames[name]
+    if ir_active_generic_module_path.len() > 0 and ir_import_declares_global(ir_active_generic_module_path, name):
+        return ir_import_target_name(ir_active_generic_module_path, ir_global_storage_symbol(name))
+    if ir_global_slot_names.contains(name):
+        return ir_global_storage_symbol(name)
+    return name
+
+# true when any argument carries a field name (named construction).
+pub fn ir_struct_args_have_names(arg_nodes: List[Int]) -> Bool:
+    for an_idx in arg_nodes:
+        an := get_node(an_idx)
+        if an.kind == "arg" and an.value.len() > 0:
+            return true
+    return false
+
+# field metadata for a struct construction, resolved by the checker's type id
+# when it typed the expression. Two modules can each declare a struct with the
+# same name; the name-keyed registry (and the global type table it consults)
+# then collapse them, so a field given by name matches the wrong struct's
+# layout and silently stores its default. the construction's checked tid names
+# the exact struct, so we read its ordered fields directly, the same
+# authoritative path field reads already use (ir_try_checked_field_read). We
+# fall back to the name-keyed registry when the checker never assigned a plain
+# struct tid (tuples and some emit-only constructions).
+pub fn ir_ctor_field_count(sname: String, tid: Int) -> Int:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct":
+            return info.fields.len()
+    return ir_struct_field_count(sname)
+
+## ctor field name at.
+pub fn ir_ctor_field_name_at(sname: String, tid: Int, field_index: Int) -> String:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct" and field_index >= 0 and field_index < info.fields.len():
+            return info.fields[field_index]
+    return ir_struct_field_name_at(sname, field_index)
+
+# the optional inner type of a constructed field, or "" when the field is not
+# an optional. see ir_emit_value_for_target_inner for why a wrap site needs it.
+pub fn ir_ctor_field_inner_type_name(sname: String, tid: Int, field_name: String) -> String:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct":
+            for name, i in info.fields:
+                if name == field_name and i < info.field_types.len():
+                    return ir_optional_inner_type_of_tid(info.field_types[i])
+    return ""
+
+# the checked type id of a constructed field, or -1
+pub fn ir_ctor_field_tid(sname: String, tid: Int, field_name: String) -> Int:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct":
+            for name, i in info.fields:
+                if name == field_name and i < info.field_types.len():
+                    return info.field_types[i]
+    return 0 - 1
+
+## ctor field type name.
+pub fn ir_ctor_field_type_name(sname: String, tid: Int, field_name: String) -> String:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct":
+            for name, i in info.fields:
+                if name == field_name and i < info.field_types.len():
+                    return ir_type_from_tid(info.field_types[i])
+    return ir_struct_field_type_name(sname, field_name)
+
+# true when obj_type has an `_opt` runtime we can dispatch to for
+# fail-propagate. Maps and lists ship the opt variants; string, bytes,
+# and set fall through to the strict runtime (they don't have _opt
+# accessors yet).
+pub fn ir_index_supports_propagate(obj_type: String) -> Bool:
+    if obj_type == "map":
+        return true
+    if obj_type == "map_int" or obj_type == "map_bytes":
+        return true
+    if obj_type == "list":
+        return true
+    if obj_type == "list_string":
+        return true
+    return false
+
+## index get opt call name.
+pub fn ir_index_get_opt_call_name(obj_type: String) -> String:
+    if obj_type == "map":
+        return "map_get_opt"
+    if obj_type == "map_int":
+        return "map_get_ikey_opt"
+    if obj_type == "map_bytes":
+        return "map_get_bkey_opt"
+    return "pith_list_get_opt"
+
+# the kind an await's value is typed with. a task returning a result hands
+# back its box, typed `tuple` so the count checker sees the box it opens.
+# anything else stays `unknown`, which the backend treats as a plain i64.
+pub fn ir_await_retkind(idx: Int) -> String:
+    tid := c_get_expr_type(idx)
+    if tid >= 0 and get_type_info(tid).kind == "result":
+        return "tuple"
+    return "unknown"
+
+# the rc kind of a result box's ok or err payload, from the box's type. a
+# box whose type the checker did not record falls back to the current
+# function's own ok kind (a forwarded result has the function's type) and to
+# a String error.
+pub fn ir_result_payload_rc_kind(box_tid: Int, slot: String) -> String:
+    if box_tid >= 0 and get_type_info(box_tid).kind == "result":
+        return ir_rc_kind(ir_result_field_kind(box_tid, slot))
+    if slot == "err":
+        return "string"
+    if ir_func_result_ok_kinds.contains_key(ir_current_arc_func):
+        return ir_rc_kind(ir_func_result_ok_kinds[ir_current_arc_func])
+    return ""
+
+# true when a type name is still an unresolved generic spelling: the bare
+# parameter itself, or an associated type reached through one (`I.Item`).
+# the unresolved test has to be syntactic. ir_rc_kind resolves a dotted
+# name by its bare suffix against the struct registry, so any user
+# `struct Item` in scope makes an unresolved `I.Item` read back as
+# "struct", and a gate that asks the kind instead of the shape then skips
+# the resolver and lowers over the wrong kind entirely (an Int-element
+# to_list built its rows as struct pointers and segfaulted at scale).
+pub fn ir_generic_name_unresolved(name: String) -> Bool:
+    if name.len() == 0:
+        return false
+    mut base := name
+    dot := name.index_of(".")
+    if dot >= 0:
+        base = name.substring(0, dot)
+    if ir_active_generic_params.contains(base):
+        return true
+    return ir_current_impl_subst_params.contains(base)
+
+## resolve field lookup key.
+pub fn ir_resolve_field_lookup_key(recv_idx: Int, fname: String) -> String:
+    direct := ir_field_lookup_key(recv_idx, fname)
+    if ir_struct_field_index_lookup.contains_key(direct):
+        return direct
+    recv_type := ir_field_receiver_type(recv_idx)
+    base := ir_strip_type_args(recv_type)
+    if base != recv_type:
+        base_key := base + "." + fname
+        if ir_struct_field_index_lookup.contains_key(base_key):
+            return base_key
+    return ""
+
+## extract param type.
+pub fn ir_extract_param_type(param_idx: Int) -> String:
+    node := get_node(param_idx)
+    if node.kind == "param" and node.children.len() > 0:
+        return ir_resolve_type_node(node.children[0])
+    return "Int"
+
+## find body.
+pub fn ir_find_body(fn_idx: Int) -> Int:
+    node := get_node(fn_idx)
+    nk := node.children
+    mut i := 0
+    while i < nk.len():
+        cn := get_node(nk[i])
+        if cn.kind == "body":
+            return nk[i]
+        i = i + 1
+    if nk.len() > 0:
+        return nk[nk.len() - 1]
+    return 0 - 1
+
+## param count.
+pub fn ir_param_count(fn_idx: Int) -> Int:
+    node := get_node(fn_idx)
+    nk := node.children
+    mut count := 0
+    for child in nk:
+        cn := get_node(child)
+        if cn.kind == "param":
+            count = count + 1
+    return count
+
+## extract return type.
+pub fn ir_extract_return_type(fn_idx: Int) -> String:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(ir_alias_target_node(returns_child))
+                if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type" or rn.kind == "optional_type":
+                    return ir_resolve_type_node(returns_child)
+    return "unknown"
+
+# the same answer as ir_optional_inner_type_of_node, for a site that holds a
+# type id rather than a type node.
+pub fn ir_optional_inner_type_of_tid(tid: Int) -> String:
+    if tid < 0:
+        return ""
+    info := get_type_info(tid)
+    if info.kind == "optional" and info.inner >= 0:
+        return ir_type_from_tid(info.inner)
+    return ""
+
+# the inner type of an `optional_type` node, or "" when the node is not one.
+# the wrap sites need this for the same reason the return site does: an
+# optional lowers to a tuple-shaped allocation, so a tuple-valued payload is
+# indistinguishable from an already-built shell unless the target says which
+# one it wants.
+pub fn ir_optional_inner_type_of_node(type_idx: Int) -> String:
+    if type_idx < 0:
+        return ""
+    tn := get_node(ir_alias_target_node(type_idx))
+    if tn.kind == "optional_type" and tn.children.len() > 0:
+        return ir_resolve_type_node(tn.children[0])
+    return ""
+
+## extract optional inner type.
+pub fn ir_extract_optional_inner_type(fn_idx: Int) -> String:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(ir_alias_target_node(returns_child))
+                if rn.kind == "optional_type" and rn.children.len() > 0:
+                    return ir_resolve_type_node(rn.children[0])
+    return ""
+
+# true when the function declared at `fn_idx` returns a Result (T! or T!E).
+# used to decide whether index-expression codegen should propagate a fail
+# on miss.
+# true for `T!` and `T!String`: the function's error can hold a miss message.
+pub fn ir_fn_miss_fails(fn_idx: Int) -> Bool:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(ir_alias_target_node(returns_child))
+                if rn.kind == "result_type":
+                    return rn.children.len() < 2 or ir_resolve_type_node(rn.children[1]) == "string"
+    return false
+
+## fn returns result.
+pub fn ir_fn_returns_result(fn_idx: Int) -> Bool:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(ir_alias_target_node(returns_child))
+                if rn.kind == "result_type":
+                    return true
+    return false
+
+## lookup impl method name.
+pub fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
+    if type_name.len() == 0:
+        return ""
+    key := ir_impl_method_key(type_name, method_name)
+    if ir_impl_methods.contains_key(key):
+        return ir_impl_methods[key]
+    resolved := ir_resolve_type_hint(type_name)
+    if resolved != type_name:
+        resolved_key := ir_impl_method_key(resolved, method_name)
+        if ir_impl_methods.contains_key(resolved_key):
+            return ir_impl_methods[resolved_key]
+    if type_name.contains("["):
+        base := type_name.substring(0, type_name.index_of("["))
+        base_key := ir_impl_method_key(base, method_name)
+        if ir_impl_methods.contains_key(base_key):
+            return ir_impl_methods[base_key]
+    return ""
+
+# the receiver's checked declaration tid, or -1 when the checker did not type
+# the expression as a plain struct or enum, or typed it under a different
+# name than emission sees: two type-argument lists that share an emission
+# kind share one specialization body, and that body was checked for the
+# first caller's types, so the tid is stale and must not steer dispatch
+# (tid-keyed specialization is the follow-up that removes the sharing).
+fn ir_checked_receiver_tid(recv_idx: Int, type_name: String) -> Int:
+    if recv_idx < 0:
+        return 0 - 1
+    mut tid := c_get_expr_type(recv_idx)
+    if tid < 0:
+        return 0 - 1
+    mut info := get_type_info(tid)
+    if info.kind == "optional" or info.kind == "result":
+        if info.inner < 0:
+            return 0 - 1
+        tid = info.inner
+        info = get_type_info(tid)
+    if info.kind != "struct" and info.kind != "enum":
+        return 0 - 1
+    if info.name != type_name:
+        return 0 - 1
+    return tid
+
+# the impl method symbol for a call on this receiver expression. two modules
+# can each declare a struct with the receiver's name, and the name-keyed
+# table holds whichever registered last. only the receiver's checked tid
+# names the right declaration, so the tid key is tried first, mirroring how
+# field reads resolve (ir_try_checked_field_read). when the receiver's tid is
+# known but the name-keyed entry belongs to a different declaration, the
+# entry is refused rather than lowering a method against the wrong layout.
+# with no usable tid (generic bodies, emit-only receivers) the name-keyed
+# lookup answers as before.
+pub fn ir_lookup_impl_method_for(recv_idx: Int, type_name: String, method_name: String) -> String:
+    tid := ir_checked_receiver_tid(recv_idx, type_name)
+    if tid >= 0:
+        tid_key := ir_impl_tid_key(tid, method_name)
+        if ir_impl_methods.contains_key(tid_key):
+            return ir_impl_methods[tid_key]
+        name_key := ir_impl_method_key(type_name, method_name)
+        if ir_impl_method_owner.contains_key(name_key):
+            if ir_impl_method_owner[name_key] != tid:
+                return ""
+    return ir_lookup_impl_method_name(type_name, method_name)
+
+# the symbol one call to a generic impl method lowers to. the method's own type
+# parameters are fixed by the argument types here and the specialization is
+# queued under the resolved symbol, exactly as a call to a free generic
+# function is. the inference walks the same node shape either way: a method
+# call's receiver sits at children[0] where a plain call's callee sits, and
+# self is never one of a method's declared parameters, so argument positions
+# line up with the declaration's parameter list without an offset.
+pub fn ir_queue_generic_method_call(idx: Int, node: Node, base_name: String) -> String:
+    ret_type := ir_infer_type(idx)
+    mut no_explicit_types: List[String] := []
+    return ir_queue_generic_call(base_name, idx, no_explicit_types, ret_type)
+
+# how many type parameters an impl target declares: the generic struct's
+# bracket list for `impl Box:` on a `struct Box[T]`, 0 for a concrete type.
+pub fn ir_owner_type_param_count(impl_type: String) -> Int:
+    if has_generic_declaration(impl_type) == false:
+        return 0
+    return collect_generic_parameter_names(get_node(get_generic_declaration_index(impl_type))).len()
+
+# the names a generic declaration's type arguments substitute, in the order
+# the checker records them: for a method on a generic owner the owner's
+# parameters first, then the method's own; for a free function or a method
+# on a concrete owner the declaration's own list alone.
+pub fn ir_generic_subst_params(name: String) -> List[String]:
+    mut params: List[String] := []
+    if not ir_generic_decl_indices.contains_key(name):
+        return params
+    if ir_generic_owner_param_count(name) > 0:
+        owner := ir_generic_method_owners[name]
+        params = collect_generic_parameter_names(get_node(get_generic_declaration_index(owner)))
+    for gp in ir_collect_generic_param_names(get_node(ir_generic_decl_indices[name])):
+        params.push(gp)
+    return params
+
+# the instance of generic struct `base` whose type arguments are `tids`, or
+# -1. the arguments come from the checker's record of a call on that
+# instance, so they are the instance's own ids and compare as ids.
+pub fn ir_struct_instance_for_args(base: String, tids: List[Int]) -> Int:
+    for inst_tid in struct_instance_tids:
+        if struct_instance_base_name[inst_tid] != base:
+            continue
+        if not struct_instance_type_args.contains_key(inst_tid):
+            continue
+        inst_args := decode_tid_list(struct_instance_type_args[inst_tid])
+        if inst_args.len() != tids.len():
+            continue
+        mut same := true
+        for t, i in inst_args:
+            if t != tids[i]:
+                same = false
+        if same:
+            return inst_tid
+    return 0 - 1
+
+# the emission kinds of the type arguments the checker recorded at a generic
+# call, or an empty list when it recorded none. this is the one source of a
+# specialization's kinds; the emitter used to infer them from the argument
+# types itself, and no call in the corpus reaches a path without a record.
+pub fn ir_generic_kinds_from_subst(idx: Int) -> List[String]:
+    mut kinds: List[String] := []
+    for tid in c_generic_call_subst(idx):
+        mut kind := ir_type_from_tid(tid)
+        if kind.len() == 0:
+            kind = "unknown"
+        kinds.push(kind)
+    return kinds
+
+# the payload kind of a specialization's return when the declaration writes
+# the return type as a bare type parameter (`-> T`) and the type argument for
+# that parameter is an optional; "" otherwise. the written-`T?` extractor
+# cannot see this case, and without it the return path reads the substituted
+# "tuple" kind as a result and boxes the optional a second time (#1042).
+pub fn ir_optional_inner_kind_of_param_return(decl_idx: Int, generic_params: List[String], tids: List[Int]) -> String:
+    decl := get_node(decl_idx)
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "returns" and cn.children.len() > 0:
+            rn := get_node(cn.children[0])
+            if rn.kind != "type":
+                return ""
+            for gp, i in generic_params:
+                if gp == rn.value and i < tids.len() and tids[i] >= 0:
+                    info := get_type_info(tids[i])
+                    if info.kind == "optional":
+                        return ir_type_from_tid(info.inner)
+                    return ""
+            return ""
+    return ""
+
+# queue the specialization one generic call asks for. the checker recorded
+# the type arguments it settled at this call node (c_generic_call_subst), and
+# when it did, and every one of them is a real type, they are the request:
+# the key and the symbol come from the types themselves, so `first[Int?]` and
+# `first[String?]` are two bodies rather than one "tuple" body checked for
+# whichever caller came first. a call the checker left without a record (an
+# explicit spelling it did not resolve) keeps the written type arguments, or
+# none, on the emission-kind key it always used.
+pub fn ir_queue_generic_call(name: String, idx: Int, explicit_types: List[String], ret_type: String) -> String:
+    tids := c_generic_call_subst(idx)
+    if tids.len() > 0 and ir_generic_decl_indices.contains_key(name):
+        param_count := ir_generic_subst_params(name).len()
+        mut all_real := tids.len() == param_count
+        for tid in tids:
+            if tid < 0 or tid == TID_ERR:
+                all_real = false
+        if all_real:
+            return ir_queue_generic_specialization_for_tids(name, tids, ret_type)
+    return ir_queue_generic_specialization(name, explicit_types, ret_type)
+
+fn ir_resolve_explicit_generic_type_arg(type_idx: Int) -> String:
+    type_node := get_node(type_idx)
+    if type_node.kind == "ident":
+        resolved := ir_specialize_type_name(type_node.value, ir_active_generic_params, ir_active_generic_concrete_types)
+        if resolved.len() > 0:
+            return resolved
+        return ir_resolve_type_hint(type_node.value)
+    return ir_resolve_type_node_with_subst(type_idx, ir_active_generic_params, ir_active_generic_concrete_types)
+
+## explicit generic concrete types.
+pub fn ir_explicit_generic_concrete_types(index_node: Node) -> List[String]:
+    mut concrete_types: List[String] := []
+    mut i := 1
+    while i < index_node.children.len():
+        concrete_types.push(ir_resolve_explicit_generic_type_arg(index_node.children[i]))
+        i = i + 1
+    return concrete_types
+
+# resolve a `T.Item` type name through a generic specialization: substitute the
+# base param (T -> the concrete type) then look up that type's assoc binding.
+pub fn ir_resolve_assoc_in_generic(type_name: String, params: List[String], concrete: List[String]) -> String:
+    if type_name.contains(".") == false:
+        return type_name
+    parts := type_name.split(".")
+    if parts.len() != 2:
+        return type_name
+    mut i := 0
+    for p in params:
+        if p == parts[0] and i < concrete.len():
+            akey := ir_strip_type_args(concrete[i]) + "." + parts[1]
+            if ir_assoc_bindings.contains_key(akey):
+                return ir_assoc_bindings[akey]
+        i = i + 1
+    return type_name
+
+# the parsed root of a module in this build, or -1.
+pub fn ir_module_root_for_path(module_path: String) -> Int:
+    for path, i in ir_preloaded_import_paths:
+        if path == module_path:
+            return ir_preloaded_import_roots[i]
+    for path, i in ir_all_module_paths:
+        if path == module_path:
+            return ir_all_module_roots[i]
+    return 0 - 1
+
+## is type node kind.
+pub fn ir_is_type_node_kind(kind: String) -> Bool:
+    return kind == "type" or kind == "generic_type" or kind == "optional_type" or kind == "tuple_type" or kind == "fn_type" or kind == "result_type"
+
+# a type node written back as text with each alias replaced by what it
+# names, or "" for a form with no plain spelling. depth stops an alias that
+# names itself.
+pub fn ir_type_node_text(type_idx: Int, depth: Int) -> String:
+    if depth > 16:
+        return ""
+    tn := get_node(type_idx)
+    if tn.kind == "type":
+        if ir_type_alias_nodes.contains_key(tn.value):
+            return ir_type_node_text(ir_type_alias_nodes[tn.value], depth + 1)
+        return tn.value
+    if tn.kind != "generic_type":
+        return ""
+    mut args: List[String] := []
+    for child in tn.children:
+        arg := ir_type_node_text(child, depth + 1)
+        if arg.len() == 0:
+            return ""
+        args.push(arg)
+    return tn.value + "[" + args.join(",") + "]"
+
+# the name a top-level declaration binds, or "" for one that binds none.
+pub fn ir_top_level_decl_name(node: Node) -> String:
+    if ir_is_fn_decl_kind(node.kind) or node.kind == "struct_decl" or node.kind == "struct" or node.kind == "enum_decl" or node.kind == "enum":
+        return ir_base_decl_name(node.value)
+    if ir_is_binding_kind(node.kind):
+        return ir_binding_name(node)
+    return ""
+
+# read a threadlocal global into dest_r: call the runtime, which returns this
+# thread's value (initializing it via the thunk on first access).
+pub fn ir_emit_tls_load(dest_r: Int, name: String):
+    slot_r := ir_reg()
+    ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[ir_tls_key(name)].to_string())
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " __tlsinit_" + name)
+    tag_r := ir_emit_tls_tag(name)
+    ir_emit("call " + dest_r.to_string() + " pith_tls_get_or_init_tagged " + ir_threadlocal_kinds[ir_tls_key(name)] + " 3 " + slot_r.to_string() + " " + fr.to_string() + " " + tag_r.to_string())
+
+# write val_r into a threadlocal global for this thread.
+fn ir_emit_tls_store(name: String, val_r: Int):
+    slot_r := ir_reg()
+    ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[ir_tls_key(name)].to_string())
+    tag_r := ir_emit_tls_tag(name)
+    ir_emit("call " + ir_reg().to_string() + " pith_tls_set_tagged void 3 " + slot_r.to_string() + " " + val_r.to_string() + " " + tag_r.to_string())
+
+# the element tag of a threadlocal's type, which the runtime keeps with each
+# task's value so the count it holds is dropped when the task finishes
+fn ir_emit_tls_tag(name: String) -> Int:
+    tag_r := ir_reg()
+    ir_emit("iconst " + tag_r.to_string() + " " + ir_element_tag_code(ir_rc_kind(ir_threadlocal_kinds[ir_tls_key(name)])).to_string())
+    return tag_r
+
+# a name refers to a threadlocal global only when it is a recorded threadlocal
+# and not shadowed by a local of the same name in the current function.
+pub fn ir_name_is_threadlocal(name: String) -> Bool:
+    return ir_threadlocal_slots.contains_key(ir_tls_key(name)) and not ir_name_is_func_local(name)
+
+# the key a threadlocal's slot and kind are recorded under: the name within the
+# module that declares it. keyed by the bare name, a threadlocal of the same
+# name in two modules shared one slot, so std.json, std.toml and std.yaml all
+# read and wrote each other's parser state and scope depth.
+pub fn ir_tls_key(name: String) -> String:
+    return ir_current_module_path + "::" + name
+
+# emit a load of `name`, routing threadlocal globals through the tls runtime and
+# everything else (locals, plain globals) through the normal storage slot. a
+# name the enclosing `for` loop bound reads its own loop slot, so the loop
+# variable and a function local of the same name stay separate.
+pub fn ir_emit_name_load(dest_r: Int, name: String):
+    loop_slot := ir_loop_var_slot(name)
+    if loop_slot.len() > 0:
+        ir_emit("load " + dest_r.to_string() + " " + loop_slot)
+    elif ir_name_is_threadlocal(name):
+        ir_emit_tls_load(dest_r, name)
+    else:
+        ir_emit("load " + dest_r.to_string() + " " + ir_resolve_storage_name(name))
+
+# emit a store of val_r into `name`, routing threadlocal globals through the tls
+# runtime and everything else through the normal storage slot. loop variables go
+# to their own slot, the same as loads.
+pub fn ir_emit_name_store(name: String, val_r: Int):
+    loop_slot := ir_loop_var_slot(name)
+    if loop_slot.len() > 0:
+        ir_emit("store " + loop_slot + " " + val_r.to_string())
+    elif ir_name_is_threadlocal(name):
+        ir_emit_tls_store(name, val_r)
+    else:
+        ir_emit("store " + ir_resolve_storage_name(name) + " " + val_r.to_string())
+
+# load a tracked local's own slot, ignoring any loop variable shadowing it. the
+# ARC cleanup addresses the function's storage directly: a `return` inside a
+# loop body must release what the local holds, not what the loop variable
+# happens to be borrowing at that moment.
+pub fn ir_emit_local_slot_load(dest_r: Int, name: String):
+    if ir_name_is_threadlocal(name):
+        ir_emit_tls_load(dest_r, name)
+    else:
+        ir_emit("load " + dest_r.to_string() + " " + ir_resolve_storage_name(name))
+
+# collect every name a function body binds function-wide (a local, a
+# parameter, an `if let` or `match` payload) into the set that tells name
+# resolution which bare names in this function are its own. a name in the set
+# keeps its written spelling; a name outside it that the module declares as a
+# global resolves to the global's storage symbol instead.
+# the modifiers the parser packs into a binding's value string are stripped
+# two ways because a binding may carry more than one, and an extra name here
+# only costs the function its access to a same-named global.
+fn ir_collect_func_local_names(idx: Int):
+    node := get_node(idx)
+    if node.kind == "param" or ir_is_binding_kind(node.kind):
+        ir_record_func_local_name(ir_binding_name(node))
+        space := node.value.index_of(" ")
+        if space > 0:
+            ir_record_func_local_name(node.value.substring(0, space))
+    elif node.kind == "pat_binding":
+        ir_record_func_local_name(node.value)
+    # a `for` variable is deliberately NOT collected. it is the one binding
+    # with storage scoped to a block rather than the function: it lives in
+    # the loop's own slot, ir_emit_name_load and ir_emit_name_store reach
+    # that slot before they ever resolve a name, and outside the loop the
+    # name means whatever it meant before, a global included. collecting it
+    # made a global read after the loop resolve to a local slot the ir never
+    # declared.
+    for child in node.children:
+        ir_collect_func_local_names(child)
+
+# start a function frame's name scope: everything the body binds, plus the
+# parameters and lambda captures already in ir_var_regs.
+pub fn ir_begin_func_local_names(body_idx: Int):
+    ir_func_local_names = {}
+    if body_idx >= 0:
+        ir_collect_func_local_names(body_idx)

@@ -263,6 +263,7 @@ pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emi
     # every arm returns, so the exit cleanup is what releases a pin here
     ir_take_match_pin(subj_r)
     subj_type := ir_checked_type(node.children[0])
+    saved_subj_tid := ir_match_subject_tid
     ir_match_subject_tid = c_get_expr_type(node.children[0])
     subj_release := ir_match_subject_release_kind(node, subj_type, subj_owned)
     mut i := 1
@@ -310,6 +311,7 @@ pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emi
         ir_rc_release_reg(subj_r, subj_release)
     if alias_release.len() > 0:
         alias_free(subj_r, alias_release)
+    ir_match_subject_tid = saved_subj_tid
 
 # emit a bool register that is 1 when subj_r matches pat, ignoring any bindings
 # (those are emitted separately, only in the branch where the pattern matched).
@@ -781,6 +783,7 @@ pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_
     pin_kind := ir_match_pin_slot_kind
     pin_slot := ir_take_match_pin(subj_r)
     subj_type := ir_checked_type(node.children[0])
+    saved_subj_tid := ir_match_subject_tid
     ir_match_subject_tid = c_get_expr_type(node.children[0])
     subj_release := ir_match_subject_release_kind(node, subj_type, subj_owned)
     result_temp := ir_new_temp_name("match")
@@ -840,6 +843,7 @@ pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_
     ir_emit("store " + result_temp + " " + zero_r.to_string())
     ir_emit_label(end_l)
     ir_release_match_pin(pin_slot, pin_kind)
+    ir_match_subject_tid = saved_subj_tid
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + result_temp)
     return r

@@ -763,7 +763,7 @@ pub fn copy_n_bytes(reader: BytesCursor, writer: ByteBuffer, count: Int) -> Int!
 # inside a multi-byte character. a character is never written in halves, so a
 # count that falls inside one stops before it and the write is that much
 # shorter — which is what "at most" already promised.
-pub fn write_n(writer: StringBuffer, data: String, count: Int) -> Int!:
+pub fn write_n[W: Writer](writer: W, data: String, count: Int) -> Int!:
     if count <= 0:
         return 0
     mut end := count
@@ -773,7 +773,7 @@ pub fn write_n(writer: StringBuffer, data: String, count: Int) -> Int!:
     return write_all_string(writer, data.substring(0, end))
 
 # write at most count bytes from the input bytes.
-pub fn write_n_bytes(writer: ByteBuffer, data: Bytes, count: Int) -> Int!:
+pub fn write_n_bytes[W: BytesWriter](writer: W, data: Bytes, count: Int) -> Int!:
     if count <= 0:
         return 0
     mut end := count
@@ -1157,7 +1157,7 @@ fn read_all_string(reader: StringReader) -> String!:
 fn read_all_string_chunked(reader: StringReader, chunk_size: Int) -> String!:
     return read_all_text_source(reader, chunk_size)
 
-fn write_all_string(writer: StringBuffer, data: String) -> Int!:
+fn write_all_string[W: Writer](writer: W, data: String) -> Int!:
     mut total := 0
     mut remaining := data
     while remaining.len() > 0:

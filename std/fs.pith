@@ -20,6 +20,9 @@ import std.os.path as path
 #       fs.write("backup.txt", content)!
 
 FS_IO_CHUNK_SIZE := 4096
+# cap recursive directory traversal depth so symlink cycles fail cleanly
+# instead of overflowing the stack.
+MAX_WALK_DEPTH := 128
 
 # Basic metadata for a path.
 pub struct Info:
@@ -90,13 +93,15 @@ fn entry_for_path(entry_path: String) -> Entry!:
     meta := info(entry_path)!
     return Entry(entry_path, path.base(entry_path), meta.is_dir, meta.size)
 
-fn walk_into(entries: List[Entry], root_path: String) -> List[Entry]!:
+fn walk_into(entries: List[Entry], root_path: String, depth: Int) -> List[Entry]!:
+    if depth > MAX_WALK_DEPTH:
+        fail "maximum directory walk depth exceeded (possible symlink cycle): " + root_path
     current := entry_for_path(root_path)!
     entries.push(current)
     if current.is_dir:
         for name in list(root_path):
             child_path := path.join(root_path, name)
-            walk_into(entries, child_path)!
+            walk_into(entries, child_path, depth + 1)!
     return entries
 
 # write data to a new temp file next to target_path and rename it over the
@@ -260,15 +265,16 @@ pub fn copy(from_path: String, to_path: String) -> Bool!:
     data := read_bytes(from_path)!
     return write_bytes(to_path, data)
 
-# copy a whole file tree recursively.
-pub fn copy_tree(from_path: String, to_path: String) -> Bool!:
+fn copy_tree_depth(from_path: String, to_path: String, depth: Int) -> Bool!:
+    if depth > MAX_WALK_DEPTH:
+        fail "maximum directory copy depth exceeded (possible symlink cycle): " + from_path
     if is_dir(from_path):
         if not make_dirs(to_path):
             fail "could not create dir: " + to_path
         for entry in list(from_path):
             child_from := path.join(from_path, entry)
             child_to := path.join(to_path, entry)
-            copied := copy_tree(child_from, child_to)
+            copied := copy_tree_depth(child_from, child_to, depth + 1)
             if copied.is_err:
                 fail "could not copy tree entry: " + child_from
         return true
@@ -278,6 +284,10 @@ pub fn copy_tree(from_path: String, to_path: String) -> Bool!:
             fail "could not copy file: " + from_path
         return copied.ok
     fail "path does not exist: " + from_path
+
+# copy a whole file tree recursively.
+pub fn copy_tree(from_path: String, to_path: String) -> Bool!:
+    return copy_tree_depth(from_path, to_path, 0)
 
 # return basic metadata for a path.
 pub fn info(path: String) -> Info!:
@@ -339,7 +349,7 @@ pub fn walk(root_path: String) -> List[Entry]!:
     if not exists(root_path):
         fail "path does not exist: " + root_path
     mut entries: List[Entry] := []
-    return walk_into(entries, root_path)
+    return walk_into(entries, root_path, 0)
 
 test "fs writes reads appends and removes files":
     dir := make_temp_dir("pith-std-fs-")!

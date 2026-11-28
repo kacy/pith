@@ -58,6 +58,9 @@ import std.crypto.jwt as jwt
 # a key set is a handful of keys, not a directory. anything past this is
 # either a mistake at the issuer or somebody making us do work.
 MAX_KEYS := 32
+# mirror std.crypto.jwt's token length ceiling so oversized untrusted tokens
+# are rejected before base64/JSON header pre-parsing or JWKS fetches run.
+MAX_TOKEN_LEN := 8192
 MAX_DOCUMENT_BYTES := 262144
 
 # an rsa modulus outside this range is not a key anyone should be verifying
@@ -300,6 +303,8 @@ pub fn parse(document: String) -> KeySet!:
 # thing the header is read for: it picks which key to try, and the algorithm
 # still comes from that key.
 fn token_kid(token: String) -> String:
+    if token.len() > MAX_TOKEN_LEN:
+        return ""
     cut := token.index_of(".")
     if cut <= 0:
         return ""
@@ -349,6 +354,8 @@ impl KeySet:
     # a single-key issuer needs and what a rotating one is not supposed to
     # leave you doing.
     fn verify(token: String, options: jwt.Options) -> jwt.Verified!:
+        if token.len() > MAX_TOKEN_LEN:
+            fail "token exceeds maximum length"
         return self.verify_named(token_kid(token), token, options)!
 
     # `verify`, for a caller that has already read the token's kid.
@@ -479,6 +486,8 @@ impl Cache:
     # a stream of invented `kid`s becomes a stream of refusals rather than a
     # stream of requests at the issuer.
     fn verify(token: String, options: jwt.Options) -> jwt.Verified!:
+        if token.len() > MAX_TOKEN_LEN:
+            fail "token exceeds maximum length"
         set := self.shared_keys()!.set
         kid := token_kid(token)
         if kid.len() == 0 or set.has(kid):
@@ -870,3 +879,11 @@ test "a cache url must be https, or http on a port we can reach":
     # nothing is fetched here; the scheme is checked before a socket is opened.
     assert(cache("ftp://issuer.test/jwks.json").keys().is_err)
     assert(cache("not a url").keys().is_err)
+
+test "oversized tokens are rejected before header pre-parsing or cache fetch":
+    huge := "a".repeat(MAX_TOKEN_LEN + 10) + ".b.c"
+    assert_eq(token_kid(huge), "")
+    set := parse("{{\"keys\":[" + es256_key("ec-1") + "]}}")!
+    assert(set.verify(huge, jwt.default_options()).is_err)
+    # Cache.verify must fail immediately without touching the unreachable URL.
+    assert(cache("https://127.0.0.1:1/jwks.json").verify(huge, jwt.default_options()).is_err)

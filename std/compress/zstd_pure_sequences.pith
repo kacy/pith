@@ -105,20 +105,27 @@ pub struct SequenceCount:
     pub count: Int
     pub bytes_used: Int
 
-## read the sequence count, whose width depends on its own first byte.
-pub fn read_sequence_count(data: Bytes, off: Int) -> SequenceCount!:
-    if off >= data.len():
+## read the sequence count, failing if it runs past `end`.
+pub fn read_sequence_count_bounded(data: Bytes, off: Int, end: Int) -> SequenceCount!:
+    mut bound := end
+    if bound > data.len():
+        bound = data.len()
+    if off >= bound:
         fail "zstd: truncated sequence count"
     first := data[off]
     if first < 128:
         return SequenceCount(first, 1)
     if first < 255:
-        if off + 2 > data.len():
+        if off + 2 > bound:
             fail "zstd: truncated sequence count"
         return SequenceCount(bits.shl(first - 128, 8) + data[off + 1], 2)
-    if off + 3 > data.len():
+    if off + 3 > bound:
         fail "zstd: truncated sequence count"
     return SequenceCount(data[off + 1] + bits.shl(data[off + 2], 8) + 0x7F00, 3)
+
+## read the sequence count, whose width depends on its own first byte.
+pub fn read_sequence_count(data: Bytes, off: Int) -> SequenceCount!:
+    return read_sequence_count_bounded(data, off, data.len())
 
 ## the three tables a sequence section decodes against.
 pub struct SequenceTables:

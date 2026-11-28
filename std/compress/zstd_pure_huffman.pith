@@ -62,9 +62,15 @@ fn bit_length(v: Int) -> Int:
 ## inferred one is appended. fails when the weights overflow the space or
 ## leave a gap that is not a power of two.
 pub fn build_table(weights: List[Int]) -> HuffTable!:
+    # RFC 8878 §4.2.1: at most 255 explicit weights plus the 1 inferred weight
+    # cover the 256 possible byte symbols (0..255).
+    if weights.len() > 255:
+        fail "zstd: huffman weight list exceeds 255 symbols"
     # the coded weights consume sum(2^(w-1)) of the probability space.
     mut total := 0
     for w in weights:
+        if w < 0 or w > MAX_TABLE_LOG:
+            fail "zstd: huffman weight out of range"
         if w > 0:
             total = total + bits.shl(1, w - 1)
     if total == 0:
@@ -261,8 +267,11 @@ pub fn read_tree_description(data: Bytes, off: Int, end: Int) -> TreeDescription
     header := data[off]
     if header >= 128:
         count := header - 127
+        needed := (count + 1) / 2
+        if off + 1 + needed > end:
+            fail "zstd: direct huffman weights run past the literals section"
         weights := read_direct_weights(data, off + 1, count)!
-        return TreeDescription(build_table(weights)!, 1 + (count + 1) / 2)
+        return TreeDescription(build_table(weights)!, 1 + needed)
 
     # fse-coded weights: `header` is the byte length of the whole coded
     # description, table and payload together.
@@ -350,11 +359,12 @@ fn read_le(data: Bytes, off: Int, count: Int) -> Int:
         i = i - 1
     return value
 
-## parse the literals section header at `off`. the size fields are packed at
-## bit offsets that depend on the block type and size format, which is why
-## this reads a little-endian word and shifts rather than taking bytes.
-pub fn parse_literals_header(data: Bytes, off: Int) -> LiteralsHeader!:
-    if off >= data.len():
+## parse the literals section header at `off`, failing if it runs past `end`.
+pub fn parse_literals_header_bounded(data: Bytes, off: Int, end: Int) -> LiteralsHeader!:
+    mut bound := end
+    if bound > data.len():
+        bound = data.len()
+    if off >= bound:
         fail "zstd: truncated literals header"
     first := data[off]
     kind := bits.band(first, 3)
@@ -365,10 +375,10 @@ pub fn parse_literals_header(data: Bytes, off: Int) -> LiteralsHeader!:
         if size_format == 0 or size_format == 2:
             return LiteralsHeader(kind, bits.shr(first, 3), 0, 0, 1)
         if size_format == 1:
-            if off + 2 > data.len():
+            if off + 2 > bound:
                 fail "zstd: truncated literals header"
             return LiteralsHeader(kind, bits.shr(read_le(data, off, 2), 4), 0, 0, 2)
-        if off + 3 > data.len():
+        if off + 3 > bound:
             fail "zstd: truncated literals header"
         return LiteralsHeader(kind, bits.shr(read_le(data, off, 3), 4), 0, 0, 3)
 
@@ -378,25 +388,31 @@ pub fn parse_literals_header(data: Bytes, off: Int) -> LiteralsHeader!:
     if size_format == 0:
         streams = 1
     if size_format == 0 or size_format == 1:
-        if off + 3 > data.len():
+        if off + 3 > bound:
             fail "zstd: truncated literals header"
         word := read_le(data, off, 3)
         regenerated := bits.band(bits.shr(word, 4), 1023)
         compressed := bits.band(bits.shr(word, 14), 1023)
         return LiteralsHeader(kind, regenerated, compressed, streams, 3)
     if size_format == 2:
-        if off + 4 > data.len():
+        if off + 4 > bound:
             fail "zstd: truncated literals header"
         word := read_le(data, off, 4)
         regenerated := bits.band(bits.shr(word, 4), 16383)
         compressed := bits.band(bits.shr(word, 18), 16383)
         return LiteralsHeader(kind, regenerated, compressed, streams, 4)
-    if off + 5 > data.len():
+    if off + 5 > bound:
         fail "zstd: truncated literals header"
     word := read_le(data, off, 5)
     regenerated := bits.band(bits.shr(word, 4), 262143)
     compressed := bits.band(bits.shr(word, 22), 262143)
     return LiteralsHeader(kind, regenerated, compressed, streams, 5)
+
+## parse the literals section header at `off`. the size fields are packed at
+## bit offsets that depend on the block type and size format, which is why
+## this reads a little-endian word and shifts rather than taking bytes.
+pub fn parse_literals_header(data: Bytes, off: Int) -> LiteralsHeader!:
+    return parse_literals_header_bounded(data, off, data.len())
 
 # ---------------------------------------------------------------
 # tests
@@ -535,3 +551,14 @@ test "literals headers parse every size format":
     assert_eq(hd.compressed_size, 5000)
     assert_eq(hd.streams, 4)
     assert_eq(hd.header_len, 4)
+
+test "build_table rejects more than 255 weights and out-of-range weights":
+    mut too_many: List[Int] := []
+    mut k := 0
+    while k < 256:
+        too_many.push(0)
+        k = k + 1
+    too_many[0] = 1
+    assert(build_table(too_many).is_err)
+    assert(build_table([MAX_TABLE_LOG + 1]).is_err)
+    assert(build_table([0 - 1]).is_err)

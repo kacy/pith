@@ -170,6 +170,13 @@ fn b64_decode_with(input: String, table: String, padded: Bool, ignore_ws: Bool) 
             if d < 0:
                 fail "invalid base64 character"
 
+        # RFC 4648 §3.5: unused trailing bits in a padded final quantum must be
+        # zero so every byte sequence has a single canonical encoding.
+        if c_pad and b % 16 != 0:
+            fail "invalid base64: non-zero trailing bits"
+        if d_pad and not c_pad and c % 4 != 0:
+            fail "invalid base64: non-zero trailing bits"
+
         buf.write_byte(a * 4 + b / 16)!
         if not c_pad:
             buf.write_byte((b % 16) * 16 + c / 4)!
@@ -281,6 +288,7 @@ fn b32_decode_with(input: String, table: String, padded: Bool, ignore_ws: Bool) 
     mut pending_bits := 0
     mut bits_left := 0
     mut seen_pad := false
+    mut data_chars := 0
     mut i := 0
     while i < text.len():
         c := text[i]
@@ -292,6 +300,7 @@ fn b32_decode_with(input: String, table: String, padded: Bool, ignore_ws: Bool) 
             digit := table_char_val(c.to_upper(), table)
             if digit < 0:
                 fail "invalid base32 character"
+            data_chars = data_chars + 1
             pending_bits = pending_bits * 32 + digit
             bits_left = bits_left + 5
             while bits_left >= 8:
@@ -300,6 +309,13 @@ fn b32_decode_with(input: String, table: String, padded: Bool, ignore_ws: Bool) 
                 bits_left = bits_left - 8
                 pending_bits = pending_bits % pow2(bits_left)
         i = i + 1
+    # RFC 4648 §6: valid 5-bit base32 quanta contain 0, 2, 4, 5, or 7 symbols
+    # (never 1, 3, or 6) and any trailing unused bits must be zero.
+    rem := data_chars % 8
+    if rem == 1 or rem == 3 or rem == 6:
+        fail "invalid base32: invalid length"
+    if bits_left > 0 and pending_bits != 0:
+        fail "invalid base32: non-zero trailing bits"
     return buf.bytes()
 
 # encode bytes as padded RFC 4648 base32.
@@ -827,3 +843,19 @@ test "decoders reject malformed input":
     assert(bad_varint_truncated.is_err)
     assert(bad_pem.is_err)
     assert(bad_pem_all.is_err)
+
+test "base64 and base32 reject non-canonical padding and trailing bits":
+    # AA== encodes [0x00]; AB== has non-zero trailing 4 bits and must fail.
+    assert_eq(b64_decode("AA==")!.len(), 1)
+    assert(b64_decode("AB==").is_err)
+    assert(b64_raw_decode("AB").is_err)
+    # AAA= encodes [0x00, 0x00]; AAB= has non-zero trailing 2 bits and must fail.
+    assert_eq(b64_decode("AAA=")!.len(), 2)
+    assert(b64_decode("AAB=").is_err)
+    assert(b64_raw_decode("AAB").is_err)
+    # Base32: invalid data-character counts (1, 3, 6) and non-zero trailing bits.
+    assert_eq(base32_decode("AA======")!.len(), 1)
+    assert(base32_decode("AB======").is_err)
+    assert(base32_decode("A=======").is_err)
+    assert(base32_decode("AAA=====").is_err)
+    assert(base32_decode("AAAAAA==").is_err)

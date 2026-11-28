@@ -387,6 +387,8 @@ impl Decoder:
         reader := binary.reader(block)
         mut out: List[HeaderField] := []
         mut decoded_bytes := 0
+        mut seen_header_field := false
+        mut size_updates := 0
         while binary.remaining(reader) > 0:
             first := read_u8(reader)!
             # the leading bits of the first octet select the representation
@@ -394,6 +396,7 @@ impl Decoder:
             # incremental indexing, 001xxxxx table size update, and 0000xxxx /
             # 0001xxxx literal without indexing or never indexed.
             if bits.band(first, 128) != 0:
+                seen_header_field = true
                 index := read_integer(reader, 7, first)!
                 if index == 0:
                     fail "hpack indexed field with index 0"
@@ -401,12 +404,21 @@ impl Decoder:
                 out.push(indexed)
                 decoded_bytes = decoded_bytes + indexed.name.len() + indexed.value.len()
             elif bits.band(first, 64) != 0:
+                seen_header_field = true
                 name := read_name(self.table, reader, first, 6)!
                 value := read_string(reader)!
                 out.push(HeaderField(name, value))
                 self.table.add(name, value)
                 decoded_bytes = decoded_bytes + name.len() + value.len()
             elif bits.band(first, 32) != 0:
+                # RFC 7541 §4.2: dynamic table size updates MUST occur at the
+                # beginning of a header block, and at most two are needed
+                # (shrink to minimum, then grow to final size).
+                if seen_header_field:
+                    fail "hpack: dynamic table size update after header field"
+                size_updates = size_updates + 1
+                if size_updates > 2:
+                    fail "hpack: too many dynamic table size updates"
                 new_size := read_integer(reader, 5, first)!
                 # a peer must not grow our decoder table past the size we
                 # advertised; an unbounded update would let indexable headers
@@ -415,6 +427,7 @@ impl Decoder:
                     fail "hpack: dynamic table size update exceeds advertised limit"
                 self.table.set_max_size(new_size)
             else:
+                seen_header_field = true
                 name := read_name(self.table, reader, first, 4)!
                 value := read_string(reader)!
                 out.push(HeaderField(name, value))
@@ -644,3 +657,13 @@ test "hpack bounds the encoder table via set_max_table_size":
     encoder.set_max_table_size(0)
     assert_eq(encoder.table.current_size(), 0)
     assert_eq(encoder.table.max_size, 0)
+
+test "hpack rejects mid-block or excessive dynamic table size updates":
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    # 0x82 (:method GET) followed by 0x20 (table size update to 0) violates RFC 7541 §4.2.
+    assert(decoder.decode(encoding.from_hex("8220")!).is_err)
+    # Three consecutive table size updates (0x20 0x20 0x20) are refused.
+    assert(decoder.decode(encoding.from_hex("20202082")!).is_err)
+    # Two leading updates (shrink then grow) followed by a field remain valid.
+    fields := decoder.decode(encoding.from_hex("203fe11f82")!)!
+    assert_eq(fields.len(), 1)

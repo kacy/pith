@@ -560,6 +560,9 @@ fn decode_double_quoted(body: String) -> String:
                     return ""
                 code = code * 16 + digit
                 d = d + 1
+            if code >= 0xD800 and code <= 0xDFFF:
+                yaml_fail("invalid surrogate code point in \\u escape")
+                return ""
             parts.push(utf8_encode(code))
             i = i + 6
             continue
@@ -1975,3 +1978,12 @@ test "yaml handles huge integer and float literals without overflowing":
     # 18-digit decimal integers up to i64::MAX must parse cleanly
     max_root := parse("max: 9223372036854775807\n")
     assert_eq(get_int(max_root, "max"), 9223372036854775807)
+
+test "yaml rejects UTF-16 surrogate escapes in double-quoted scalars":
+    dq := chr(34)
+    bs := chr(92)
+    assert(parse("bad: " + dq + bs + "uD800" + dq) < 0)
+    assert(parse("bad: " + dq + bs + "uDFFF" + dq) < 0)
+    assert(last_error().contains("surrogate"))
+    ok := parse("good: " + dq + bs + "u00E9" + dq)
+    assert(ok >= 0)

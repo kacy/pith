@@ -118,7 +118,6 @@ fn main() -> Int:
     check("chunk extension", "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3;name=val\r\nabc\r\n0;last\r\n\r\n")
     check("chunk trailers", "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Trailer: t\r\nX-Other: u\r\n\r\n")
     check("chunk upper hex", "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n")
-    check("chunked bare lf", "POST /c HTTP/1.1\nHost: h\nTransfer-Encoding: chunked\n\n3\nabc\n0\n\n")
 
     print("-- request line --")
     check("garbage", "GARBAGE\r\n\r\n")
@@ -189,5 +188,6 @@ fn main() -> Int:
     check("chunk size overflow", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000001\r\nabc\r\n0\r\n\r\n")
     check("chunk size too large", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nffffff\r\nabc\r\n0\r\n\r\n")
     check("chunk data missing crlf", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n0\r\n\r\n")
+    check("chunked bare lf", "POST /c HTTP/1.1\nHost: h\nTransfer-Encoding: chunked\n\n3\nabc\n0\n\n")
     check("head too large", "GET / HTTP/1.1\r\nHost: h\r\nX-A: " + "b".repeat(70000) + "\r\n\r\n")
     return 0

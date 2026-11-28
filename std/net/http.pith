@@ -1742,7 +1742,7 @@ impl HttpRequestBytes:
     # "user:password". the scheme name is matched without case.
     fn basic_auth() -> BasicAuth!:
         header := self.header_or("Authorization", "")
-        if header.len() < 6 or not header_key_matches(header.substring(0, 6), "Basic "):
+        if not ascii_starts_with_ci(header, "Basic "):
             fail "no basic credentials in the Authorization header"
         decoded := encoding.b64_decode(header.substring(6, header.len()).trim())!.to_string_utf8()!
         colon := decoded.index_of(":")
@@ -1933,16 +1933,37 @@ fn source_read_head(src: ByteSource, cap: Int) -> Bytes!:
         return read_until_including_from_tls(src.conn, bytes.empty(), cap)
     return src.reader.read_head_bounded(cap)
 
-# the end of the content on a chunked-body line, before its LF or CRLF. a line
-# without an LF means the stream ended inside it.
+# byte-wise case-insensitive prefix match against an ascii `prefix`, safe even
+# when `prefix.len()` falls inside a multi-byte utf-8 sequence in `text`.
+fn ascii_starts_with_ci(text: String, prefix: String) -> Bool:
+    if text.len() < prefix.len():
+        return false
+    mut i := 0
+    while i < prefix.len():
+        if ascii_lower(ord(text[i])) != ascii_lower(ord(prefix[i])):
+            return false
+        i = i + 1
+    return true
+
+fn is_ascii_string(text: String) -> Bool:
+    mut i := 0
+    while i < text.len():
+        if ord(text[i]) >= 128:
+            return false
+        i = i + 1
+    return true
+
+# the end of the content on a chunked-body line, before its required CRLF
+# (rfc 9112 7.1). a line without LF means the stream ended early; a bare LF
+# without CR is rejected as malformed framing so proxy/origin chunk parsers
+# cannot disagree on chunk boundaries.
 fn chunk_line_content_end(line: Bytes) -> Int!:
-    mut end := line.len()
+    end := line.len()
     if end == 0 or line[end - 1] != 10:
         fail "http: chunked body ended early"
-    end = end - 1
-    if end > 0 and line[end - 1] == 13:
-        end = end - 1
-    return end
+    if end < 2 or line[end - 2] != 13:
+        fail bad_request("chunked framing requires CRLF")
+    return end - 2
 
 # the largest value a chunk size may hold before one more hex digit overflows.
 CHUNK_SIZE_MAX_DIV16 := 576460752303423487
@@ -3811,7 +3832,8 @@ pub fn read_request_bytes(fd: Int) -> HttpRequestBytes!:
 pub fn read_request_bytes_into(fd: Int, writer: BufferedBytesWriter) -> StreamedHttpRequest!:
     stream := io.from_fd(fd)
     reader := stream.buffered_bytes_reader_chunked(512)
-    return read_request_into(buffered_source(reader), writer)
+    defer reader.free()
+    return read_request_into(buffered_source(reader), writer)!
 
 # sends one structured response through a buffered writer.
 pub fn send_buffered(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:
@@ -3849,6 +3871,7 @@ pub fn send_stream_text(writer: BufferedBytesWriter, data: String) -> Int!:
 
 fn write_file_body(writer: BufferedBytesWriter, file: FileStream) -> Int!:
     reader := file.buffered_bytes_reader_chunked(HTTP_FILE_STREAM_CHUNK_SIZE)
+    defer reader.free()
     mut written := 0
     while true:
         chunk := reader.read_bytes(HTTP_FILE_STREAM_CHUNK_SIZE)!
@@ -3867,9 +3890,8 @@ pub fn send_file_stream(writer: BufferedBytesWriter, response: HttpResponse, fil
 pub fn send_file_path(writer: BufferedBytesWriter, response: HttpResponse, file_path: String) -> Int!:
     meta := streamed_file_info(file_path)!
     file := fs.open(file_path)!
-    written := send_file_stream(writer, response, file, meta.size)!
-    file.close()
-    return written
+    defer file.close()
+    return send_file_stream(writer, response, file, meta.size)!
 
 # guesses a content type from the path and streams the file without buffering it.
 pub fn send_static_path(writer: BufferedBytesWriter, response: HttpResponse, file_path: String) -> Int!:
@@ -4024,6 +4046,7 @@ fn read_file_range(file_path: String, start: Int, length: Int) -> Bytes!:
     file := fs.open(file_path)!
     defer file.close()
     reader := file.buffered_bytes_reader_chunked(FILE_READ_CHUNK)
+    defer reader.free()
     mut skipped := 0
     while skipped < start:
         chunk := reader.read_bytes(min(FILE_READ_CHUNK, start - skipped))!
@@ -4079,6 +4102,8 @@ fn http_date_seconds(year: Int, month_name: String, day: Int, clock: String) -> 
 # ("Wed, 21-Oct-2035 07:28:00 GMT"), and asctime ("Sun Nov  6 08:49:37 1994").
 pub fn parse_http_date(text: String) -> Int!:
     value := text.trim()
+    if not is_ascii_string(value):
+        fail "invalid http date: " + value
     comma := value.index_of(",")
     if comma == 3 and value.len() == 29 and value.ends_with(" GMT") and value[4] == " " and value[7] == " " and value[11] == " " and value[16] == " ":
         return http_date_seconds(small_decimal(value.substring(12, 16)), value.substring(8, 11), small_decimal(value.substring(5, 7)), value.substring(17, 25))
@@ -4106,15 +4131,15 @@ fn etag_list_matches(list: String, etag: String, weak_ok: Bool) -> Bool:
         return etag != ""
     mut i := 0
     while i < list.len():
-        c := list[i]
-        if c == " " or c == "\t" or c == ",":
+        b := ord(list[i])
+        if b == 32 or b == 9 or b == 44:
             i = i + 1
             continue
         mut is_weak := false
-        if list.substring(i, min(i + 2, list.len())) == "W/":
+        if i + 1 < list.len() and b == 87 and ord(list[i + 1]) == 47:
             is_weak = true
             i = i + 2
-        if i >= list.len() or list[i] != "\"":
+        if i >= list.len() or ord(list[i]) != 34:
             return false
         close := list.substring(i + 1, list.len()).index_of("\"")
         if close < 0:
@@ -4836,9 +4861,9 @@ fn redirect_request(req: ClientRequest, resp: HttpResponse) -> ClientRequest!:
     mut next_port := req.port
     mut next_path := req.path
 
-    if location.starts_with("http://") or location.starts_with("https://"):
+    if ascii_starts_with_ci(location, "http://") or ascii_starts_with_ci(location, "https://"):
         parsed := url_mod.parse(location)
-        scheme := url_mod.scheme(parsed)
+        scheme := url_mod.scheme(parsed).to_lower()
         next_use_tls = scheme == "https"
         next_host = url_mod.host(parsed)
         if next_host == "":
@@ -4870,8 +4895,10 @@ fn redirect_request(req: ClientRequest, resp: HttpResponse) -> ClientRequest!:
     if request_origin_changed(req, next_use_tls, next_host, next_port):
         next_headers = header_without(next_headers, "Authorization")
         next_headers = header_without(next_headers, "Cookie")
+        next_headers = header_without(next_headers, "Host")
         next_extra = header_fields_without(next_extra, "Authorization")
         next_extra = header_fields_without(next_extra, "Cookie")
+        next_extra = header_fields_without(next_extra, "Host")
         next_sni = ""
     return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, next_sni, next_extra)
 
@@ -5553,6 +5580,8 @@ fn origin_key(use_tls: Bool, host: String, port: Int) -> String:
 fn idle_conn_usable(c: WireConn, idle_timeout_ms: Int) -> Bool:
     if idle_timeout_ms > 0 and time_mod.mono_millis() - c.idle_since >= idle_timeout_ms:
         return false
+    if c.use_tls and c.tls_conn.pending_len() > 0:
+        return false
     return tcp_wait_readable(c.stream.fd, 0) == 0
 
 # whether a request that failed on a reused connection before any of the
@@ -6146,7 +6175,11 @@ impl Client:
     # bytes left over after a complete response belong to no request. reusing
     # the connection would hand them to the next caller as its response.
     fn put_idle(c: WireConn):
-        if not c.use_tls and c.reader.cached_len() > 0:
+        if c.use_tls:
+            if c.tls_conn.pending_len() > 0:
+                wire_close(c)
+                return
+        elif c.reader.cached_len() > 0:
             wire_close(c)
             return
         tcp_set_read_deadline(c.stream.fd, 0)
@@ -7947,3 +7980,87 @@ test "http normalizes authority-like paths, checks strict loopback, and caps 1xx
     defer r.close()
     src := ByteSource(br, tls.no_conn(), false, 0 - 1)
     assert(read_response_head_from(src, "GET", MAX_RESPONSE_HEADER_BYTES).is_err)
+
+test "http handles multibyte utf-8 in basic_auth, etags, and dates without panicking":
+    assert(auth_request("Basicé")!.basic_auth().is_err)
+    assert(auth_request("Basic " + "é")!.basic_auth().is_err)
+    assert(not etag_list_matches("aé", "\"v1\"", true))
+    assert(not etag_list_matches("日", "\"v1\"", true))
+    assert(not etag_list_matches("W/é", "\"v1\"", true))
+    assert(parse_http_date("Sun, 06 Nov 1994 08:49:3é GMT").is_err)
+    assert(parse_http_date("Sun, 06 Nov 1994 08:4é:37 GMT").is_err)
+
+test "http cross-origin redirects recognize uppercase scheme and strip custom Host":
+    req := get_request("example.test", 80, "/old").header("Host", "custom.example.test").header("Authorization", "Bearer tok").cookie("sid", "1")
+    upper := redirect_request(req, response(302).header("Location", "HTTPS://Other.Example.Test/new"))!
+    assert(upper.use_tls)
+    assert_eq(upper.host, "Other.Example.Test")
+    assert_eq(upper.port, 443)
+    assert_eq(upper.path, "/new")
+    assert_eq(header_lookup(upper.headers, "Host"), "")
+    assert_eq(header_lookup(upper.headers, "Authorization"), "")
+    assert_eq(header_lookup(upper.headers, "Cookie"), "")
+
+    same := redirect_request(req, response(302).header("Location", "/same"))!
+    assert_eq(header_lookup(same.headers, "Host"), "custom.example.test")
+
+test "http chunked framing rejects bare LF line endings":
+    bare_lf := bytes.from_string_utf8("3\nabc\n0\n\n")
+    r := io.bytes_reader(bare_lf)
+    br := r.buffered_chunked(16)
+    defer br.free()
+    defer r.close()
+    assert(read_chunked_body(br, 1024).is_err)
+
+    good := bytes.from_string_utf8("3\r\nabc\r\n0\r\n\r\n")
+    r2 := io.bytes_reader(good)
+    br2 := r2.buffered_chunked(16)
+    defer br2.free()
+    defer r2.close()
+    assert_eq(read_chunked_body(br2, 1024)!.to_string_utf8()!, "abc")
+
+fn serve_https_smuggle_test(listener: tls.Listener):
+    crlf := chr(13) + chr(10)
+    mut conn_num := 0
+    while conn_num < 2:
+        conn := tls.accept(listener) catch:
+            return
+        req := read_request_from(tls_source(conn))
+        if req.is_ok:
+            if conn_num == 0:
+                # coalesce a valid first response and a smuggled trailing response in
+                # the same TLS record so the client's tls.Conn buffers the trailing
+                # decrypted bytes inside its internal pending buffer.
+                first := "HTTP/1.1 200 OK" + crlf + "Content-Length: 5" + crlf + crlf + "first"
+                smuggled := "HTTP/1.1 200 OK" + crlf + "Content-Length: 7" + crlf + crlf + "POISON!"
+                conn.write_all_bytes(bytes.from_string_utf8(first + smuggled)) catch 0
+            else:
+                second := "HTTP/1.1 200 OK" + crlf + "Content-Length: 6" + crlf + crlf + "second"
+                conn.write_all_bytes(bytes.from_string_utf8(second)) catch 0
+        conn.close()
+        conn_num = conn_num + 1
+
+test "https pool refuses to reuse a tls connection with pending decrypted bytes":
+    port := 18945
+    srv_cfg := tls.server_config("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!
+    defer srv_cfg.close()
+    listener := tls.listen("127.0.0.1", port, srv_cfg)!
+    defer listener.close()
+    spawn serve_https_smuggle_test(listener)
+
+    cli_cfg := tls.client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!
+    defer cli_cfg.close()
+    c := client().with_tls_config(cli_cfg)
+    defer c.close_idle_connections()
+
+    req1 := https_request_port("GET", "127.0.0.1", port, "/one").with_server_name("localhost").keep_alive()
+    r1 := c.send(req1)!
+    assert_eq(r1.status, 200)
+    assert_eq(r1.body_text()!, "first")
+
+    # if the connection with buffered "POISON!" had been pooled, req2 would
+    # receive "POISON!" instead of opening a clean connection and getting "second".
+    req2 := https_request_port("GET", "127.0.0.1", port, "/two").with_server_name("localhost").keep_alive()
+    r2 := c.send(req2)!
+    assert_eq(r2.status, 200)
+    assert_eq(r2.body_text()!, "second")

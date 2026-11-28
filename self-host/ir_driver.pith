@@ -1,6 +1,7 @@
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from ast import reset_arena, get_node
+from ir_metadata import ir_builtin_result_ok_kind, ir_builtin_result_retkind, ir_is_pair_builtin_name
 from ir_emitter import emit_ir, set_import_roots, set_all_module_roots, set_entry_root, set_current_module_path, set_test_mode, set_test_source_file, set_count_marks
 from driver import init_driver, resolve_imports, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, find_imports
 from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module
@@ -248,11 +249,6 @@ fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix:
         callee_end := next_space(line, callee_start)
         return rewrite_call_callee(line, declared, prefix, init_prefix, callee_start, callee_end)
 
-    if op == "callv":
-        callee_start := first_end + 1
-        callee_end := next_space(line, callee_start)
-        return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
-
     if op == "closure_ref" or op == "closure_stack" or op == "funcref":
         reg_start := first_end + 1
         reg_end := next_space(line, reg_start)
@@ -301,26 +297,6 @@ fn rewrite_main_ir(main_ir: String, imported_init_funcs: List[String]) -> String
             out = inject_imported_init_calls(out, init_funcs)
     return out.join(chr(10))
 
-# the ok payload kind of a builtin that returns its result as the
-# (flag, payload) register pair, or "" for any other name: the parsers and
-# the byte-count writes (#1153, #1162). such a builtin is reached only by
-# rcall, whose payload kind has to be this one.
-fn pair_builtin_payload_kind(name: String) -> String:
-    if name == "parse_int":
-        return "int"
-    if name == "parse_float":
-        return "float"
-    if name == "tcp_write" or name == "tcp_write_bytes" or name == "process_write" or name == "process_write_bytes" or name == "file_write" or name == "file_write_bytes" or name == "byte_buffer_write" or name == "byte_buffer_write_string_utf8":
-        return "int"
-    return ""
-
-fn builtin_retkind(name: String) -> String:
-    if name == "tcp_connect" or name == "tcp_listen" or name == "tcp_accept" or name == "unix_connect" or name == "unix_listen" or name == "unix_accept" or name == "process_spawn" or name == "process_spawn_argv" or name == "process_output_argv" or name == "file_open_read" or name == "file_open_write" or name == "file_open_append":
-        return "result_int"
-    if name == "write_file" or name == "append_file":
-        return "result_bool"
-    return ""
-
 fn is_sync_opaque_name(name: String) -> Bool:
     return name == "Mutex" or name == "WaitGroup" or name == "Semaphore" or name == "AtomicInt"
 
@@ -364,10 +340,10 @@ fn validate_call_retkind(line_no: Int, parts: List[String], struct_names: Map[St
         if callee_kind == "result_reg" or callee_kind == "result_reg_f":
             ir_contract_error(line_no, "call to " + callee + ", which returns a register pair: it must be an rcall")
         return
-    if pair_builtin_payload_kind(callee).len() > 0:
+    if ir_is_pair_builtin_name(callee):
         ir_contract_error(line_no, "call to builtin " + callee + ", which returns a register pair: it must be an rcall")
-    builtin_kind := builtin_retkind(callee)
-    if builtin_kind.len() > 0 and builtin_kind != retkind:
+    builtin_kind := ir_builtin_result_retkind(callee)
+    if (builtin_kind == "result_int" or builtin_kind == "result_bool") and builtin_kind != retkind:
         ir_contract_error(line_no, "builtin call retkind '" + retkind + "' does not match expected '" + builtin_kind + "' for " + callee)
 
 # `rcall FLAG VAL FNAME PAYLOAD_KIND NARGS ARG...` must name a function that
@@ -384,9 +360,9 @@ fn validate_rcall_contract(line_no: Int, parts: List[String], func_kinds: Map[St
         if callee_kind != "result_reg" and callee_kind != "result_reg_f":
             ir_contract_error(line_no, "rcall to " + callee + ", whose retkind '" + callee_kind + "' returns no register pair")
         return
-    builtin_kind := pair_builtin_payload_kind(callee)
-    if builtin_kind.len() == 0:
+    if not ir_is_pair_builtin_name(callee):
         ir_contract_error(line_no, "rcall to " + callee + ", which is neither a declared pair function nor a pair builtin")
+    builtin_kind := ir_builtin_result_ok_kind(callee)
     if builtin_kind != payload_kind:
         ir_contract_error(line_no, "rcall payload kind '" + payload_kind + "' does not match '" + builtin_kind + "' for " + callee)
 
@@ -473,16 +449,6 @@ fn validate_combined_ir_contract(ir: String):
         validate_strref_contract(line_no, parts, string_names)
         line_no = line_no + 1
     return
-
-# whether an imported module's body can be skipped because it is nothing but the
-# runtime provides directly. no module qualifies today: std.net.tcp and
-# std.net.dns look like thin builtin wrappers, but their functions wrap the
-# builtin's result (tcp.connect returns Int!, dns.resolve returns String!), so a
-# caller links to those wrapper bodies, not the raw builtin. skipping them left
-# an imported `tcp.connect`/`dns.resolve` call pointing at a function that was
-# never emitted, which trapped at runtime as an unresolved call.
-fn is_runtime_builtin_module(module_path: String) -> Bool:
-    return false
 
 fn parse_args() -> CliArgs:
     a := args()
@@ -650,10 +616,6 @@ fn emit_single_file(path: String, emit_tests: Bool) -> String!:
     print(ir)
     return ""
 
-fn should_skip_imported_module(module_root: Int) -> Bool:
-    module_path := get_resolved_module_path(module_root)
-    return is_runtime_builtin_module(module_path)
-
 # true when the module declares a top-level fn main, pub or not.
 fn module_declares_main(root: Int) -> Bool:
     for child in get_node(root).children:
@@ -684,8 +646,6 @@ fn emit_combined_file(path: String, emit_tests: Bool, validate_combined: Bool) -
     configure_all_module_roots(import_roots)
     set_entry_root(root)
     for import_root, i in import_roots:
-        if should_skip_imported_module(import_root):
-            continue
         module_path := get_resolved_module_path(import_root)
         module_deps := emission_module_roots(import_root, roots_by_path)
         ir := emit_module_ir(import_root, module_deps, module_path, false)

@@ -1,0 +1,1075 @@
+# ir_lower_calls.pith: lowering for static, indirect, module-alias, interface,
+# higher-order list, decode-dispatch, and method calls.
+#
+# imports ir_lower_data for constructor/variant lowering and takes IrEmitHooks
+# from ir_lower to keep the module graph a strict DAG.
+
+from ast import Node, get_node, node_kind, node_value
+from checker import c_get_expr_type, c_is_interface_value_type, wrapping_conversion_target
+from types import get_type_info, lookup_type_id
+from ir_common import ir_global_storage_symbol, ir_unpack_field_index
+from ir_metadata import ir_builtin_result_retkind, ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_obj_type_is_primitive, ir_primitive_method_call_name
+from ir_builder import ir_emit, ir_label, ir_new_temp_name, ir_reg, ir_zero_reg
+from ir_state import IrDecodeHooks, IrEmitHooks, ir_active_generic_module_path, ir_boxed_enums, ir_decode_last_args, ir_fn_arg_lambda_symbols, ir_getter_consumed_idx, ir_global_slot_names, ir_inflight_drop, ir_inflight_push, ir_lambda_borrows_captures, ir_lambda_on_stack, ir_last_lambda_symbol, ir_loop_var_slot, ir_optional_tuple_dtor_needed, ir_rcall_current_idx, ir_rcall_defer_idx, ir_rcall_flag_reg, ir_rcall_pair_ready, ir_rcall_val_reg, ir_struct_field_index_lookup, ir_var_types
+from ir_types import ir_checked_type, ir_function_return_kind, ir_is_declared_callable, ir_list_element_kind, ir_list_element_tid, ir_lookup_specialized_method, ir_rc_kind, ir_retkind, ir_strip_type_args, ir_struct_base_name, ir_type_from_tid
+from ir_symbols import ResolvedCallee, ir_is_generic_function_name, ir_is_generic_method_name, ir_plain_method_name, ir_queue_generic_specialization, ir_resolve_generic_module_call_name, ir_resolve_module_alias_method_call_name, ir_resolve_static_callee
+from ir_primitives import ir_call_arg_expr_index, ir_emit_call1, ir_emit_call2, ir_emit_call_text, ir_emit_label, ir_emit_optional_attach_dtor, ir_emit_result_flag_field, ir_emit_result_ok_field_typed, ir_emit_result_store_error_branch, ir_emit_result_value_field, ir_emit_simple_binary, ir_join_arg_regs, ir_method_call_arg_regs, ir_optional_flag_field, ir_optional_value_as, ir_optional_value_field, ir_rc_release_reg, ir_rc_retain_reg, ir_result_field_kind
+from ir_collections_ops import ir_emit_list_contains_from_index, ir_emit_list_filter_loop, ir_emit_list_index_search_loop, ir_emit_list_is_empty, ir_emit_list_map_loop, ir_emit_list_missing_index_result, ir_emit_list_reduce_loop, ir_is_list_runtime_type
+from ir_decode_emit import ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_path_call, ir_is_handle_decode_callee, ir_is_json_decode_callee
+from ir_type_infer import ir_alias_generic_base_identity, ir_bound_fn_target, ir_call_retkind_for_name, ir_call_returns_pair, ir_callee_is_function_expr, ir_callee_uses_result_abi, ir_channel_send_needs_retain, ir_container_store_takes_count, ir_devirtualized_lambda_target, ir_emit_element_tag_const, ir_emit_tls_load, ir_explicit_generic_concrete_types, ir_generic_kinds_from_subst, ir_infer_type, ir_is_channel_send_name, ir_is_local_generic_callee, ir_legacy_call_result_wraps, ir_list_ctor_for_elem_kind, ir_list_kind_store_name, ir_lookup_impl_method_for, ir_map_kind_store_name, ir_method_call_arg_expr, ir_method_call_is_closure_field, ir_method_receiver_type, ir_name_is_func_local, ir_name_is_threadlocal, ir_owned_container_store_name, ir_qualified_enum_name, ir_queue_generic_call, ir_queue_generic_method_call, ir_specialize_static_callee, ir_store_learns_kind, ir_temp_name, ir_wrap_to_tid
+from ir_analysis import ir_call_needs_no_pins, ir_callee_runs_user_code, ir_later_operands_drop, ir_local_closure_arg_positions, ir_subtree_keeps_storage
+from ir_rc_lifecycle import ir_arg_pin_kind, ir_attach_result_box_dtor, ir_bind_fn_specialization, ir_call_operand_exprs, ir_emit_release_result_error, ir_expr_is_borrowed, ir_expr_is_fresh_optional_shell, ir_extraction_operand_class, ir_extraction_retains, ir_field_receiver_is_owned_temp, ir_fn_arg_bindings, ir_higher_order_fn_may_drop, ir_higher_order_walk_done, ir_higher_order_walk_list, ir_ident_names_module, ir_inflight_pop_n, ir_method_result_retains_over_args, ir_optional_subject_is_owned, ir_owned_receiver_getter_payload_kind, ir_pin_arg_inflight, ir_pin_inflight, ir_pin_operand, ir_release_fresh_result_arg, ir_release_owned_args, ir_release_owned_method_args, ir_release_owned_operand, ir_runtime_opt_producer_payload_kind, ir_unpin_args, ir_unpin_inflight
+from ir_synth_helpers import ir_emit_devirtualized_call, ir_emit_index_search_to_optional, ir_emit_result_reg_call, ir_emit_result_value_to_string, ir_emit_share_expr, ir_emit_test_assert, ir_emit_test_assert_eq, ir_emit_wrapped_legacy_result, ir_interface_method_names, ir_push_channel_ctor_args, ir_wrap_legacy_call_result
+from ir_lower_data import ir_emit_byte_operand_with, ir_emit_call_arg_with, ir_emit_struct_positional_init, ir_emit_variant_construction, ir_static_struct_init_call
+
+# emit the call instruction (pair-ABI rcall, devirtualized closure call, or
+# plain call), attach any transferring runtime-getter destructor, release owned
+# arguments, unpin arguments, and wrap a legacy single-register result.
+fn ir_finish_static_or_alias_call(idx: Int, node: Node, callee: ResolvedCallee, devirt_name: String, arg_regs: List[Int], arg_pins: List[String], check_free_opt_dtor: Bool) -> Int:
+    mut r := ir_reg()
+    uses_result_abi := ir_callee_uses_result_abi(callee, idx)
+    ret_type := ir_call_retkind_for_name(idx, uses_result_abi, callee.name)
+    if ir_call_returns_pair(callee.name):
+        ir_rcall_current_idx = idx
+        r = ir_emit_result_reg_call(r, callee.name, arg_regs.len(), ir_join_arg_regs(arg_regs))
+        ir_rcall_current_idx = 0 - 1
+    elif devirt_name.len() > 0:
+        ir_emit_devirtualized_call(r, callee.name, ret_type, devirt_name, arg_regs)
+    else:
+        ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+    if check_free_opt_dtor and not ir_is_declared_callable(callee.name):
+        free_opt_kind := ir_runtime_opt_producer_payload_kind(callee.name, "")
+        if free_opt_kind.len() > 0:
+            ir_emit_optional_attach_dtor(r, free_opt_kind)
+    ir_release_owned_args(node, 1, arg_regs)
+    ir_unpin_args(arg_regs, arg_pins)
+    return ir_wrap_legacy_call_result(r, ret_type, callee.name, idx, uses_result_abi)
+
+# local_fn_positions lists the arguments, counted from start_idx, that land in
+# a parameter the callee only calls (see ir_record_closure_params). with pin
+# set, arguments are pinned as above; an argument a later one can drop is
+# pinned either way. pins receives one entry per register.
+fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int], pin: Bool, pins: List[String], hooks: IrEmitHooks) -> List[Int]:
+    later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, start_idx))
+    mut arg_regs: List[Int] := []
+    mut inflight := 0
+    for child, i in node.children:
+        if i < start_idx:
+            continue
+        mut expr_idx := child
+        if node_kind(child) == "arg":
+            cn := get_node(child)
+            if cn.children.len() == 0:
+                continue
+            expr_idx = cn.children[0]
+        if local_fn_positions.contains(i - start_idx) and node_kind(expr_idx) == "lambda":
+            arg_regs.push(ir_emit_local_fn_arg(expr_idx, hooks))
+            pins.push("")
+        else:
+            arg_r := ir_emit_call_arg_with(expr_idx, hooks)
+            inflight = inflight + ir_pin_arg_inflight(expr_idx, arg_r, pins, pin or later_drops[arg_regs.len()])
+            arg_regs.push(arg_r)
+    ir_inflight_pop_n(inflight)
+    return arg_regs
+
+# the receiver's register first, then each argument's. with pin set (an impl
+# method, which is user code) the receiver and the arguments are pinned the
+# way ir_collect_call_arg_regs pins, one pins entry per register.
+fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String], hooks: IrEmitHooks) -> List[Int]:
+    later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, 0))
+    mut regs: List[Int] := []
+    mut inflight := 0
+    for child, i in node.children:
+        mut expr_idx := child
+        if i > 0 and node_kind(child) == "arg":
+            cn := get_node(child)
+            if cn.children.len() == 0:
+                continue
+            expr_idx = cn.children[0]
+        mut r := 0
+        if i == 0:
+            r = hooks.emit_expr(expr_idx)
+        else:
+            r = ir_emit_call_arg_with(expr_idx, hooks)
+        inflight = inflight + ir_pin_arg_inflight(expr_idx, r, pins, pin or later_drops[regs.len()])
+        regs.push(r)
+    ir_inflight_pop_n(inflight)
+    return regs
+
+# a lambda literal handed to a callee that only calls it (an open-coded map,
+# filter or reduce, or a parameter ir_record_closure_params proved local)
+# never outlives this call, so it can be built in a stack slot.
+fn ir_emit_local_fn_arg(fn_idx: Int, hooks: IrEmitHooks) -> Int:
+    is_lambda := get_node(fn_idx).kind == "lambda"
+    ir_lambda_on_stack = is_lambda
+    ir_lambda_borrows_captures = is_lambda
+    r := hooks.emit_expr(fn_idx)
+    ir_lambda_on_stack = false
+    ir_lambda_borrows_captures = false
+    if is_lambda:
+        ir_fn_arg_lambda_symbols.insert(r, ir_last_lambda_symbol)
+    return r
+
+fn ir_emit_list_map_call(idx: Int, node: Node, hooks: IrEmitHooks) -> Int:
+    if node.children.len() != 3:
+        return -1
+    return ir_emit_list_map_lowering(idx, ir_call_arg_expr_index(node.children[1]), ir_call_arg_expr_index(node.children[2]), hooks)
+
+fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int, hooks: IrEmitHooks) -> Int:
+    may_drop := ir_higher_order_fn_may_drop(mapper_idx)
+    list_r := ir_higher_order_walk_list(list_idx, hooks.emit_expr(list_idx), may_drop)
+    mapper_r := ir_emit_local_fn_arg(mapper_idx, hooks)
+    mapper_pin := ir_pin_operand(mapper_idx, mapper_r, may_drop)
+    mapper_name := ir_temp_name("__map_fn")
+    ir_emit("store " + mapper_name + " " + mapper_r.to_string())
+
+    mut result_kind := ir_checked_type(idx)
+    if result_kind.len() == 0:
+        result_kind = "list"
+    mut elem_kind := ir_list_element_kind(list_idx)
+    mapped_kind := ir_function_return_kind(mapper_idx)
+
+    # the result's element type is what the mapper returns, and the checked
+    # type of the call carries it; the mapper's own return type is the
+    # fallback for a call the checker left untyped. an untagged result would
+    # own nothing, and the mapper's fresh values have no other owner.
+    mut result_elem_kind := ir_rc_kind(ir_list_element_kind(idx))
+    if result_elem_kind.len() == 0:
+        result_elem_kind = ir_rc_kind(mapped_kind)
+    ctor := ir_list_ctor_for_elem_kind(result_elem_kind)
+
+    out_r := ir_emit_list_map_loop(list_r, ctor, mapper_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_retkind(mapped_kind), ir_temp_name("__map_i"))
+    ir_higher_order_walk_done(list_idx, list_r, may_drop, mapper_idx, mapper_r, mapper_pin)
+    return out_r
+
+fn ir_emit_list_filter_call(idx: Int, node: Node, hooks: IrEmitHooks) -> Int:
+    if node.children.len() != 3:
+        return -1
+    return ir_emit_list_filter_lowering(idx, ir_call_arg_expr_index(node.children[1]), ir_call_arg_expr_index(node.children[2]), hooks)
+
+fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int, hooks: IrEmitHooks) -> Int:
+    may_drop := ir_higher_order_fn_may_drop(keep_idx)
+    list_r := ir_higher_order_walk_list(list_idx, hooks.emit_expr(list_idx), may_drop)
+    keep_r := ir_emit_local_fn_arg(keep_idx, hooks)
+    keep_pin := ir_pin_operand(keep_idx, keep_r, may_drop)
+    keep_name := ir_temp_name("__filter_fn")
+    ir_emit("store " + keep_name + " " + keep_r.to_string())
+
+    mut result_kind := ir_checked_type(idx)
+    if result_kind.len() == 0:
+        result_kind = ir_infer_type(list_idx)
+    if result_kind.len() == 0:
+        result_kind = "list"
+    mut elem_kind := ir_list_element_kind(list_idx)
+
+    # filter keeps the source's own elements, so the result's element type is
+    # the source's. tagging it is what lets the result outlive the list it
+    # was filtered from: the push takes a count of its own.
+    ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem_kind))
+
+    out_r := ir_emit_list_filter_loop(list_r, ctor, keep_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_temp_name("__filter_i"))
+    ir_higher_order_walk_done(list_idx, list_r, may_drop, keep_idx, keep_r, keep_pin)
+    return out_r
+
+fn ir_emit_list_reduce_call(idx: Int, node: Node, hooks: IrEmitHooks) -> Int:
+    if node.children.len() != 4:
+        return -1
+    return ir_emit_list_reduce_lowering(idx, ir_call_arg_expr_index(node.children[1]), ir_call_arg_expr_index(node.children[2]), ir_call_arg_expr_index(node.children[3]), hooks)
+
+fn ir_emit_list_reduce_lowering(idx: Int, list_idx: Int, init_idx: Int, reducer_idx: Int, hooks: IrEmitHooks) -> Int:
+    # the initial value runs after the list is read, so one that can drop the
+    # list (`o.items.reduce(reset(o), f)`) needs the walked copy too
+    may_drop := ir_higher_order_fn_may_drop(reducer_idx) or not ir_subtree_keeps_storage(init_idx, 0 - 1, 0 - 1)
+    list_r := ir_higher_order_walk_list(list_idx, hooks.emit_expr(list_idx), may_drop)
+    init_r := hooks.emit_expr(init_idx)
+    reducer_r := ir_emit_local_fn_arg(reducer_idx, hooks)
+    reducer_pin := ir_pin_operand(reducer_idx, reducer_r, may_drop)
+    reducer_name := ir_temp_name("__reduce_fn")
+    acc_name := ir_temp_name("__reduce_acc")
+    elem_kind := ir_list_element_kind(list_idx)
+    mut result_kind := ir_checked_type(idx)
+    if result_kind.len() == 0:
+        result_kind = ir_infer_type(init_idx)
+    if result_kind.len() == 0:
+        result_kind = "unknown"
+    # the accumulator owns one count of its value: a borrowed initial value
+    # takes one here, and each step gives the old value's back once the
+    # reducer has returned the new one. the steps released nothing, so every
+    # intermediate accumulator leaked, and an empty list handed back a
+    # borrowed initial value as if it were owned. an optional stays out, as
+    # in ir_owned_arg_kind_releases.
+    mut acc_rc := ir_rc_kind(result_kind)
+    if acc_rc == "tuple" or acc_rc == "weak":
+        acc_rc = ""
+    if acc_rc.len() > 0 and ir_expr_is_borrowed(init_idx):
+        ir_rc_retain_reg(init_r, acc_rc)
+    ir_emit("store " + reducer_name + " " + reducer_r.to_string())
+    ir_emit("store " + acc_name + " " + init_r.to_string())
+
+    out_r := ir_emit_list_reduce_loop(list_r, reducer_name, acc_name, ir_retkind(elem_kind), ir_retkind(result_kind), acc_rc, ir_temp_name("__reduce_i"))
+    ir_higher_order_walk_done(list_idx, list_r, may_drop, reducer_idx, reducer_r, reducer_pin)
+    return out_r
+
+fn ir_emit_higher_order_list_call(idx: Int, node: Node, callee_name: String, hooks: IrEmitHooks) -> Int:
+    if callee_name == "map":
+        return ir_emit_list_map_call(idx, node, hooks)
+    if callee_name == "filter":
+        return ir_emit_list_filter_call(idx, node, hooks)
+    if callee_name == "reduce":
+        return ir_emit_list_reduce_call(idx, node, hooks)
+    return -1
+
+fn ir_emit_list_is_empty_method(node: Node, hooks: IrEmitHooks) -> Int:
+    list_r := hooks.emit_expr(node.children[0])
+    return ir_emit_list_is_empty(list_r)
+
+# emit the scan behind `xs.index_of(v)` and `xs.contains(v)`. the target goes
+# through the call-argument emitter, so a plain value the checker widened
+# against a `List[T?]` arrives as the `Some(v)` shell the elements are. the
+# element type id rides alongside the kind so the comparison inside the loop
+# is the one `==` performs on that type.
+fn ir_emit_list_index_search(node: Node, obj_type: String, hooks: IrEmitHooks) -> Int:
+    if node.children.len() < 2:
+        return ir_emit_list_missing_index_result()
+    list_idx := node.children[0]
+    target_idx := ir_method_call_arg_expr(node, 0)
+    list_r := hooks.emit_expr(list_idx)
+    # a list read out of storage has to outlive a target that can drop it:
+    # `o.items.contains(rename(o))` scanned a freed list
+    list_pin := ir_pin_inflight(list_idx, list_r, not ir_subtree_keeps_storage(target_idx, 0 - 1, 0 - 1))
+    target_r := ir_emit_call_arg_with(target_idx, hooks)
+    mut elem_kind := ir_list_element_kind(list_idx)
+    if obj_type == "list_string":
+        elem_kind = "string"
+
+    out_r := ir_emit_list_index_search_loop(list_r, target_r, ir_retkind(elem_kind), ir_list_element_tid(list_idx), ir_temp_name("__list_index_result"), ir_temp_name("__list_index_i"))
+    # a fresh shell dies with the scan: a widened one owns its payload through
+    # the destructor ir_emit_value_for_target attached, a `none` holds
+    # nothing, and a call-produced one (`xs.contains(maybe(i))`) owns or
+    # borrows its payload exactly as it would in any other argument position,
+    # so releasing the shell is the whole of it in every case.
+    if ir_expr_is_fresh_optional_shell(target_idx):
+        ir_rc_release_reg(target_r, "tuple")
+    else:
+        # a plain fresh target dies with the scan, exactly as it would with the
+        # call it would otherwise have fed: the loop only reads it. this used to
+        # be unreachable, because a search compared pointers and a fresh operand
+        # could never match; comparing structurally made `xs.contains(a + b)`
+        # and `bs.contains(bytes.from_string_utf8(s))` worth writing, and every
+        # one of them stranded its operand.
+        ir_release_owned_operand(target_idx, target_r, ir_infer_type(target_idx))
+    # the list dies with the scan too when nothing else holds it: a literal
+    # (`["a", "b"].contains(x)`) or a call result. a borrowed list is left
+    # alone. the scan returns an index, never an element, so nothing it hands
+    # out depends on the list living on.
+    ir_release_owned_operand(list_idx, list_r, ir_infer_type(list_idx))
+    ir_unpin_inflight(list_r, list_pin)
+    return out_r
+
+fn ir_emit_list_contains_method(node: Node, obj_type: String, hooks: IrEmitHooks) -> Int:
+    index_r := ir_emit_list_index_search(node, obj_type, hooks)
+    return ir_emit_list_contains_from_index(index_r)
+
+fn ir_emit_self_hosted_list_method(idx: Int, node: Node, mname: String, obj_type: String, hooks: IrEmitHooks) -> Int:
+    if not ir_is_list_runtime_type(obj_type):
+        return -1
+    if mname == "is_empty":
+        return ir_emit_list_is_empty_method(node, hooks)
+    if mname == "index_of":
+        raw_idx_r := ir_emit_list_index_search(node, obj_type, hooks)
+        return ir_emit_index_search_to_optional(raw_idx_r)
+    if mname == "contains":
+        return ir_emit_list_contains_method(node, obj_type, hooks)
+    if mname == "map":
+        # list.map(fn): receiver is the list, child 0; the mapper is arg 0
+        return ir_emit_list_map_lowering(idx, node.children[0], ir_method_call_arg_expr(node, 0), hooks)
+    if mname == "filter":
+        return ir_emit_list_filter_lowering(idx, node.children[0], ir_method_call_arg_expr(node, 0), hooks)
+    if mname == "reduce":
+        # list.reduce(init, fn): init is arg 0, reducer is arg 1
+        return ir_emit_list_reduce_lowering(idx, node.children[0], ir_method_call_arg_expr(node, 0), ir_method_call_arg_expr(node, 1), hooks)
+    return -1
+
+fn ir_emit_local_handle_decode_text_path_call(idx: Int, node: Node, callee_node: Node, hooks: IrEmitHooks) -> Int:
+    mut arg_pins: List[String] := []
+    arg_regs := ir_collect_call_arg_regs(node, 1, [], false, arg_pins, hooks)
+    if arg_regs.len() < 2:
+        ir_unpin_args(arg_regs, arg_pins)
+        return ir_zero_reg()
+
+    input_r := arg_regs[0]
+    dotted_path_r := arg_regs[1]
+    temp_name := ir_new_temp_name("handle_decode_text_path")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    parse_result_r := ir_reg()
+    ir_emit_call1(parse_result_r, ir_resolve_generic_module_call_name(ir_active_generic_module_path, "parse_required"), "tuple", input_r)
+    ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
+    root_r := ir_emit_result_ok_field_typed(parse_result_r, "Int")
+
+    generic_ret_type := ir_infer_type(idx)
+    mut concrete_types := ir_explicit_generic_concrete_types(callee_node)
+    if concrete_types.len() == 0:
+        concrete_types = ir_generic_kinds_from_subst(idx)
+    decode_path_name := ir_queue_generic_specialization("decode_path", concrete_types, generic_ret_type)
+    path_result_r := ir_reg()
+    ir_emit_call2(path_result_r, decode_path_name, "tuple", root_r, dotted_path_r)
+    ir_emit("store " + temp_name + " " + path_result_r.to_string())
+    ir_emit_label(done_l)
+    ir_unpin_args(arg_regs, arg_pins)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+fn ir_emit_index_json_decode_call(idx: Int, node: Node, callee_idx: Int, hooks: IrDecodeHooks) -> Int:
+    if ir_is_json_decode_callee(callee_idx, "decode") or ir_is_local_generic_callee(callee_idx, "decode", "input"):
+        return ir_emit_json_decode_call(idx, node, false, hooks)
+    if ir_is_json_decode_callee(callee_idx, "decode_text") or ir_is_local_generic_callee(callee_idx, "decode_text", "input"):
+        return ir_emit_json_decode_call(idx, node, true, hooks)
+    if ir_is_json_decode_callee(callee_idx, "decode_object") or ir_is_local_generic_callee(callee_idx, "decode_object", "handle"):
+        return ir_emit_json_decode_object_call(idx, node, hooks)
+    if ir_is_json_decode_callee(callee_idx, "decode_path") or ir_is_local_generic_callee(callee_idx, "decode_path", "handle"):
+        return ir_emit_json_decode_path_call(idx, node, false, hooks)
+    if ir_is_json_decode_callee(callee_idx, "decode_text_path") or ir_is_local_generic_callee(callee_idx, "decode_text_path", "input"):
+        return ir_emit_json_decode_path_call(idx, node, true, hooks)
+    if ir_is_json_decode_callee(callee_idx, "decode_file") or ir_is_local_generic_callee(callee_idx, "decode_file", "file_path"):
+        return ir_emit_json_decode_file_call(idx, node, false, hooks)
+    if ir_is_json_decode_callee(callee_idx, "decode_file_path") or ir_is_local_generic_callee(callee_idx, "decode_file_path", "file_path"):
+        return ir_emit_json_decode_file_call(idx, node, true, hooks)
+    return 0 - 1
+
+fn ir_emit_index_handle_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node: Node, decode_hooks: IrDecodeHooks, hooks: IrEmitHooks) -> Int:
+    if ir_is_handle_decode_callee(callee_idx, "decode") or ir_is_local_generic_callee(callee_idx, "decode", "handle"):
+        return ir_emit_handle_decode_call(idx, node, false, decode_hooks)
+    if ir_is_handle_decode_callee(callee_idx, "decode_text") or ir_is_local_generic_callee(callee_idx, "decode_text", "input"):
+        return ir_emit_handle_decode_call(idx, node, true, decode_hooks)
+    if ir_is_handle_decode_callee(callee_idx, "decode_path"):
+        return ir_emit_handle_decode_path_call(idx, node, false, decode_hooks)
+    if ir_is_handle_decode_callee(callee_idx, "decode_text_path"):
+        return ir_emit_handle_decode_path_call(idx, node, true, decode_hooks)
+    if ir_is_local_generic_callee(callee_idx, "decode_text_path", "input"):
+        return ir_emit_local_handle_decode_text_path_call(idx, node, callee_node, hooks)
+    if ir_is_handle_decode_callee(callee_idx, "decode_file") or ir_is_local_generic_callee(callee_idx, "decode_file", "file_path"):
+        return ir_emit_handle_decode_file_call(idx, node, false, decode_hooks)
+    if ir_is_handle_decode_callee(callee_idx, "decode_file_path") or ir_is_local_generic_callee(callee_idx, "decode_file_path", "file_path"):
+        return ir_emit_handle_decode_file_call(idx, node, true, decode_hooks)
+    return 0 - 1
+
+fn ir_emit_index_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node: Node, hooks: IrEmitHooks, decode_hooks: IrDecodeHooks) -> Int:
+    json_r := ir_emit_index_json_decode_call(idx, node, callee_idx, decode_hooks)
+    if json_r >= 0:
+        return json_r
+    # the config and handle decodes read their arguments and leave them: an
+    # owned one dies with the decode like any call argument.
+    # `config.decode[T](config.from_map(m))` leaked the Config every time.
+    ir_decode_last_args = []
+    mut r := ir_emit_index_config_decode_call(idx, node, callee_idx, decode_hooks)
+    if r < 0:
+        r = ir_emit_index_handle_decode_call(idx, node, callee_idx, callee_node, decode_hooks, hooks)
+    if r >= 0:
+        ir_release_owned_args(node, 1, ir_decode_last_args)
+    return r
+
+# consume a pair at an unwrap_or site with no box on either path. the ok
+# payload arrives owned, exactly as the owned-shell box path hands it out;
+# the err arm evaluates the fallback under the same retain rule the box
+# path applies, then drops the error by its kind, the same order the box
+# path uses.
+fn ir_emit_unwrap_or_pair(idx: Int, node: Node, flag_r: Int, val_r: Int, hooks: IrEmitHooks) -> Int:
+    recv_tid := c_get_expr_type(node.children[0])
+    temp_name := ir_new_temp_name("unwrap_or")
+    arg_idx := ir_method_call_arg_expr(node, 0)
+    ok_l := ir_label()
+    fallback_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + fallback_l)
+    ir_emit_label(ok_l)
+    ir_emit("store " + temp_name + " " + val_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(fallback_l)
+    fallback_r := hooks.emit_expr(arg_idx)
+    if not ir_expr_is_borrowed(idx) and ir_expr_is_borrowed(arg_idx):
+        ir_rc_retain_reg(fallback_r, ir_rc_kind(ir_result_field_kind(recv_tid, "ok")))
+    err_kind := ir_rc_kind(ir_result_field_kind(recv_tid, "err"))
+    if err_kind.len() > 0:
+        ir_rc_release_reg(val_r, err_kind)
+    ir_emit("store " + temp_name + " " + fallback_r.to_string())
+    ir_emit_label(merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+fn ir_emit_result_unwrap_or(idx: Int, node: Node, hooks: IrEmitHooks) -> Int:
+    saved_defer := ir_rcall_defer_idx
+    ir_rcall_defer_idx = node.children[0]
+    ir_rcall_pair_ready = false
+    recv_r := hooks.emit_expr(node.children[0])
+    ir_rcall_defer_idx = saved_defer
+    if ir_rcall_pair_ready:
+        ir_rcall_pair_ready = false
+        return ir_emit_unwrap_or_pair(idx, node, ir_rcall_flag_reg, ir_rcall_val_reg, hooks)
+    recv_tid := c_get_expr_type(node.children[0])
+    operand_class := ir_extraction_operand_class(node.children[0])
+    cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
+    temp_name := ir_new_temp_name("unwrap_or")
+    arg_idx := ir_method_call_arg_expr(node, 0)
+    ok_l := ir_label()
+    fallback_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
+    ir_emit_label(ok_l)
+    ok_value_r := ir_emit_result_value_field(recv_r, recv_tid, "ok")
+    if operand_class == "borrowed":
+        # the operand's owner keeps the shell and its payload count.
+        # consumers treat a heap-kind unwrap_or value as owned (see the
+        # method_call cases in ir_expr_is_borrowed), so hand them
+        # their own count instead of the one the shell holds; a string
+        # payload stays classified borrowed and keeps the retain-at-escape
+        # convention, exactly like a `.ok` read.
+        if not ir_expr_is_borrowed(idx):
+            ir_rc_retain_reg(ok_value_r, ir_rc_kind(ir_result_field_kind(recv_tid, "ok")))
+    else:
+        # a fresh shell: the extracted payload carries the count out, and
+        # the destructor-less tuple frees as just its three slots.
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
+    ir_emit("store " + temp_name + " " + ok_value_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(fallback_l)
+    # build the fallback INSIDE the error arm: on the ok path it is never
+    # needed, and evaluating it eagerly before the branch leaked a heap default
+    # (`r.unwrap_or(bytes.empty())`) every ok iteration. this mirrors the
+    # optional unwrap_or, which already defers its default into the none arm.
+    fallback_r := hooks.emit_expr(arg_idx)
+    # consumers treat a heap-kind unwrap_or value as owned and release it, so
+    # a fallback that arrives borrowed (a named local, a field) needs a count
+    # of its own here. without one that release strips the owner's count and
+    # the owner's next use reads freed memory. a string fallback is excluded
+    # because a string unwrap_or stays classified borrowed (the escape site
+    # retains), mirroring the ok arm.
+    if not ir_expr_is_borrowed(idx) and ir_expr_is_borrowed(arg_idx):
+        ir_rc_retain_reg(fallback_r, ir_rc_kind(ir_result_field_kind(recv_tid, "ok")))
+    if operand_class != "borrowed":
+        ir_emit_release_result_error(recv_r, recv_tid)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
+    ir_emit("store " + temp_name + " " + fallback_r.to_string())
+    ir_emit_label(merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+fn ir_emit_result_to_string(node: Node, hooks: IrEmitHooks) -> Int:
+    recv_r := hooks.emit_expr(node.children[0])
+    recv_tid := c_get_expr_type(node.children[0])
+    text_r := ir_emit_result_value_to_string(recv_r, recv_tid)
+    ir_release_fresh_result_arg(node.children[0], recv_r)
+    return text_r
+
+fn ir_emit_named_handler_call(handler_idx: Int, arg_r: Int, ret_type: String, hooks: IrEmitHooks) -> Int:
+    handler_node := get_node(handler_idx)
+    callee := ir_resolve_static_callee(handler_idx)
+    mut call_name := callee.name
+    if call_name.len() == 0 and handler_node.kind == "ident":
+        call_name = handler_node.value
+    if call_name.len() > 0:
+        out_r := ir_reg()
+        if ir_call_returns_pair(call_name):
+            # a pair-returning handler: bind the pair and fold it into the
+            # box this consumer expects.
+            return ir_emit_result_reg_call(out_r, call_name, 1, " " + arg_r.to_string())
+        legacy_kind := ir_builtin_result_retkind(call_name)
+        mut call_type := ret_type
+        if legacy_kind.len() > 0:
+            call_type = legacy_kind
+        ir_emit_call_text(out_r, call_name, call_type, 1, " " + arg_r.to_string())
+        if legacy_kind.len() > 0 and ret_type == "tuple":
+            return ir_emit_wrapped_legacy_result(out_r, legacy_kind, call_name, 0 - 1)
+        return out_r
+    handler_r := hooks.emit_expr(handler_idx)
+    handler_name := ir_new_temp_name("handler")
+    ir_emit("store " + handler_name + " " + handler_r.to_string())
+    out_r := ir_reg()
+    ir_emit_call_text(out_r, handler_name, ret_type, 1, " " + arg_r.to_string())
+    return out_r
+
+fn ir_emit_result_or_else(idx: Int, node: Node, hooks: IrEmitHooks) -> Int:
+    recv_r := hooks.emit_expr(node.children[0])
+    recv_tid := c_get_expr_type(node.children[0])
+    cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
+    temp_name := ir_new_temp_name("or_else")
+    ir_var_types.insert(temp_name, "tuple")
+    handler_idx := ir_method_call_arg_expr(node, 0)
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    ir_emit("store " + temp_name + " " + recv_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(err_l)
+    err_r := ir_emit_result_value_field(recv_r, recv_tid, "err")
+    handled_r := ir_emit_named_handler_call(handler_idx, err_r, ir_checked_type(idx), hooks)
+    # the handler borrowed the error; the original result is spent now,
+    # so drop the error value and the tuple shell before continuing
+    ir_emit_release_result_error(recv_r, recv_tid)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
+    ir_emit("store " + temp_name + " " + handled_r.to_string())
+    ir_emit_label(merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+# a call whose callee is an expression rather than a name: a function
+# value fetched from a list, a field, or another call. emit the callee
+# to a register, stash it in a fresh temp so the consumer sees a named
+# closure handle, and dispatch through it. without this the callee's
+# base name was mistaken for the target (`ops[0](x)` called `ops`, the
+# list itself, and segfaulted).
+fn ir_emit_indirect_expr_call(idx: Int, node: Node, callee_idx: Int, hooks: IrEmitHooks) -> Int:
+    callee_r := hooks.emit_expr(callee_idx)
+    tmp := ir_new_temp_name("__callee")
+    ir_emit("store " + tmp + " " + callee_r.to_string())
+    # a closure read out of a field or an element is pinned like an argument
+    # read from one: its body can drop the owner's count while it runs
+    callee_pin := ir_arg_pin_kind(callee_idx)
+    if callee_pin.len() > 0:
+        ir_rc_retain_reg(callee_r, callee_pin)
+    mut arg_pins: List[String] := []
+    arg_regs := ir_collect_call_arg_regs(node, 1, [], true, arg_pins, hooks)
+    mut ret_kind := ir_function_return_kind(callee_idx)
+    if ret_kind == "unknown":
+        ret_kind = "int"
+    r := ir_reg()
+    ir_emit_call_text(r, tmp, ret_kind, arg_regs.len(), ir_join_arg_regs(arg_regs))
+    ir_release_owned_args(node, 1, arg_regs)
+    ir_unpin_args(arg_regs, arg_pins)
+    if callee_pin.len() > 0:
+        ir_rc_release_reg(callee_r, callee_pin)
+    # the callee expression is a value like any other, and this call is its
+    # only consumer. a lambda literal, a named function, a call that built a
+    # closure and a payload pulled out of an optional all arrive owned, so
+    # without this release the whole environment allocation stranded per
+    # call, around 190 bytes a round for `mk(i)(1)`, and every extraction
+    # spelling that calls what it pulled out. a borrowed callee (a local, a
+    # struct field, a container element) belongs to its owner: left alone.
+    if not ir_expr_is_borrowed(callee_idx):
+        ir_rc_release_reg(callee_r, "closure")
+    return r
+
+## lower a static or indirect call expression.
+# lower a call whose callee is written as a name. after the special forms
+# (an indexed decode call, a call through a function-valued expression) it
+# resolves the callee: a loop variable, a local bound to a known lambda, a
+# module global holding a fn value. then the builtin shortcuts (`ord` on a
+# byte, higher-order list calls, struct construction, the assertions) get
+# their chance before the plain call, which is followed by the release of
+# owned arguments and, for a legacy single-register result, its wrapping.
+pub fn ir_emit_static_call(idx: Int, node: Node, hooks: IrEmitHooks, decode_hooks: IrDecodeHooks) -> Int:
+    mut explicit_generic_types: List[String] := []
+    if node.children.len() > 0:
+        callee_node := get_node(node.children[0])
+        if callee_node.kind == "index":
+            special_r := ir_emit_index_decode_call(idx, node, node.children[0], callee_node, hooks, decode_hooks)
+            if special_r >= 0:
+                return special_r
+            explicit_generic_types = ir_explicit_generic_concrete_types(callee_node)
+        if ir_callee_is_function_expr(node.children[0], callee_node):
+            return ir_emit_indirect_expr_call(idx, node, node.children[0], hooks)
+
+    mut callee := ResolvedCallee("unknown", false)
+    # set when the callee is a local holding a known lambda: the call names the
+    # lambda directly and passes the closure handle as its hidden first argument
+    mut devirt_name := ""
+    if node.children.len() > 0:
+        callee = ir_resolve_static_callee(node.children[0])
+        if callee.name.len() == 0:
+            callee = ResolvedCallee("unknown", false)
+        # a call through a loop variable: `for f in fns:` binds f to a loop
+        # slot, so the call has to name that slot or the consumer will look up
+        # a variable that does not exist and fall through to the error stub.
+        # only a name that is not a declared function can be a variable call,
+        # which keeps a loop variable that shadows nothing extra out of this.
+        callee_n := get_node(node.children[0])
+        bound := ir_bound_fn_target(callee.name)
+        if bound.starts_with("fn:"):
+            callee = ResolvedCallee(bound.substring(3, bound.len()), false)
+        elif bound.starts_with("lambda:"):
+            devirt_name = callee.name
+            callee = ResolvedCallee(bound.substring(7, bound.len()), false)
+        elif callee_n.kind == "ident" and not ir_is_declared_callable(callee.name):
+            direct := ir_devirtualized_lambda_target(callee.name)
+            if direct.len() > 0:
+                devirt_name = callee.name
+                callee = ResolvedCallee(direct, false)
+            loop_slot := ir_loop_var_slot(callee.name)
+            if loop_slot.len() > 0:
+                callee = ResolvedCallee(loop_slot, callee.imported)
+            elif not callee.imported and ir_name_is_threadlocal(callee.name):
+                # a threadlocal holding a fn value has no data slot to call
+                # through: this thread's value is read into a slot of the
+                # function's own, and the call goes through that. the
+                # threadlocal keeps its count; a callee that replaces it
+                # mid-call is no different from one replacing a global.
+                fn_r := ir_reg()
+                ir_emit_tls_load(fn_r, callee.name)
+                fn_slot := ir_new_temp_name("tlfn")
+                ir_emit("store " + fn_slot + " " + fn_r.to_string())
+                callee = ResolvedCallee(fn_slot, false)
+            elif not callee.imported and not ir_name_is_func_local(callee.name) and ir_global_slot_names.contains(callee.name):
+                # a module global holding a fn value, called by its own name.
+                # the consumer resolves a callee it cannot find among the
+                # functions against the global data slots, and those are keyed
+                # by the global's storage symbol rather than its written name.
+                callee = ResolvedCallee(ir_global_storage_symbol(callee.name), false)
+    # ord of any byte operand is just that byte: ord(s[i]) reads it with byte_at
+    # instead of minting a one-character string, and ord("/") folds to a
+    # constant. the argument is wrapped in an "arg" node, so unwrap it first.
+    if callee.name == "ord" and node.children.len() >= 2:
+        byte_r := ir_emit_byte_operand_with(ir_call_arg_expr_index(node.children[1]), hooks)
+        if byte_r >= 0:
+            return byte_r
+    higher_order_r := ir_emit_higher_order_list_call(idx, node, callee.name, hooks)
+    if higher_order_r >= 0:
+        return higher_order_r
+    struct_r := ir_static_struct_init_call(idx, node, callee.name, hooks)
+    if struct_r >= 0:
+        return struct_r
+    local_fn_positions := ir_local_closure_arg_positions(node, callee.name)
+    is_generic_callee := ir_is_generic_function_name(callee.name)
+    callee = ir_specialize_static_callee(idx, node, callee, explicit_generic_types)
+    mut arg_pins: List[String] := []
+    pins_args := ir_callee_runs_user_code(node.children[0]) and not ir_call_needs_no_pins(callee.name)
+    arg_regs := ir_collect_call_arg_regs(node, 1, local_fn_positions, pins_args, arg_pins, hooks)
+    if is_generic_callee and local_fn_positions.len() > 0:
+        callee = ResolvedCallee(ir_bind_fn_specialization(callee.name, ir_fn_arg_bindings(node, local_fn_positions, arg_regs)), callee.imported)
+    if callee.name == "Channel":
+        ir_push_channel_ctor_args(arg_regs, explicit_generic_types)
+
+    # the built-in assertions lower the same way in every build, not only under
+    # the test runner: a helper holding a table's assertions is compiled once
+    # and may be reached from a test block or from ordinary code, and it has to
+    # mean the same thing on both paths. a module that declares its own function
+    # by one of these names keeps it; ir_is_declared_callable is that check.
+    # a passing assertion releases its owned arguments like any call: the
+    # failing path ends the process. `assert_eq(encoding.to_hex(tag), want)`
+    # leaked the hex string on every pass.
+    mut assert_r := 0 - 1
+    if callee.name == "assert" and arg_regs.len() >= 1 and not ir_is_declared_callable("assert"):
+        assert_r = ir_emit_test_assert(node, arg_regs)
+    elif callee.name == "assert_eq" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_eq"):
+        assert_r = ir_emit_test_assert_eq(node, arg_regs, true)
+    elif callee.name == "assert_ne" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_ne"):
+        assert_r = ir_emit_test_assert_eq(node, arg_regs, false)
+    if assert_r >= 0:
+        ir_release_owned_args(node, 1, arg_regs)
+        ir_unpin_args(arg_regs, arg_pins)
+        return assert_r
+
+    return ir_finish_static_or_alias_call(idx, node, callee, devirt_name, arg_regs, arg_pins, true)
+
+# a method call on an interface value: load the method's pointer from its
+# slot and call it with the concrete value as the receiver. -1 when the
+# receiver is not an interface value.
+fn ir_emit_interface_method_call(idx: Int, hooks: IrEmitHooks) -> Int:
+    node := get_node(idx)
+    if node.children.len() == 0:
+        return 0 - 1
+    recv_idx := node.children[0]
+    recv_tid := c_get_expr_type(recv_idx)
+    if recv_tid < 0 or not c_is_interface_value_type(recv_tid):
+        return 0 - 1
+    mname := ir_plain_method_name(node_value(idx))
+    mut slot := 0 - 1
+    for m, i in ir_interface_method_names(get_type_info(recv_tid).name):
+        if m == mname:
+            slot = i
+    if slot < 0:
+        return 0 - 1
+    recv_r := hooks.emit_expr(recv_idx)
+    # the method runs user code that could drop the last other count on the
+    # receiver, so it is pinned for the call, as a closure field is. the pin
+    # is in flight while the arguments run, so a `!` among them that returns
+    # early releases it.
+    ir_rc_retain_reg(recv_r, "struct")
+    ir_inflight_push(recv_r, "struct")
+    value_r := ir_reg()
+    ir_emit("field " + value_r.to_string() + " " + recv_r.to_string() + " 8 int value")
+    fn_r := ir_reg()
+    ir_emit("field " + fn_r.to_string() + " " + recv_r.to_string() + " " + ((slot + 2) * 8).to_string() + " int slot")
+    mut arg_regs: List[Int] := [value_r]
+    mut arg_pins: List[String] := [""]
+    mut ai := 0
+    while ai < node.children.len() - 1:
+        arg_idx := ir_method_call_arg_expr(node, ai)
+        arg_r := ir_emit_call_arg_with(arg_idx, hooks)
+        arg_regs.push(arg_r)
+        arg_pins.push(ir_pin_operand(arg_idx, arg_r, true))
+        ai = ai + 1
+    r := ir_reg()
+    ir_emit("calli " + r.to_string() + " " + fn_r.to_string() + " " + ir_retkind(ir_infer_type(idx)) + " " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
+    mut plain_args: List[Int] := []
+    for reg, i in arg_regs:
+        if i > 0:
+            plain_args.push(reg)
+    ir_release_owned_method_args(node, plain_args, 0 - 1)
+    ir_unpin_args(arg_regs, arg_pins)
+    ir_inflight_drop(recv_r)
+    ir_rc_release_reg(recv_r, "struct")
+    if ir_field_receiver_is_owned_temp(recv_idx):
+        ir_rc_release_reg(recv_r, "struct")
+    return r
+
+# `Shape.Circle(2.5)` parses as a method call on the enum type name but is
+# really a variant construction. Handles both the local form and the
+# module-qualified `mod.Enum.Variant(...)` form. returns -1 when the receiver
+# is not a (possibly aliased) boxed-enum name.
+fn ir_emit_variant_ctor_method(idx: Int, hooks: IrEmitHooks) -> Int:
+    node := get_node(idx)
+    # first child is the receiver, then args; value is the method name (with a
+    # possible leading dot stripped by ir_plain_method_name).
+    mname := ir_plain_method_name(node_value(idx))
+    if node.children.len() > 0:
+        ctor_recv := get_node(node.children[0])
+        if ctor_recv.kind == "ident" and ir_boxed_enums.contains_key(ctor_recv.value):
+            ctor_key := ctor_recv.value + "." + mname
+            if ir_struct_field_index_lookup.contains_key(ctor_key):
+                return ir_emit_variant_construction(idx, node, ctor_recv.value, ctor_key, hooks)
+        # a module-qualified variant, `mod.Enum.Variant(...)`: the receiver is a
+        # field access `mod.Enum` where mod is an import alias and Enum is a
+        # boxed enum. resolve it the same as the local `Enum.Variant(...)` form,
+        # under the name the aliased module's declaration is filed by.
+        if ctor_recv.kind == "field_access" and ctor_recv.children.len() > 0:
+            if ir_ident_names_module(ctor_recv.children[0]):
+                ename := ir_qualified_enum_name(node.children[0])
+                qual_key := ename + "." + mname
+                if ir_boxed_enums.contains_key(ename) and ir_struct_field_index_lookup.contains_key(qual_key):
+                    return ir_emit_variant_construction(idx, node, ename, qual_key, hooks)
+    return 0 - 1
+
+# methods whose lowering is chosen by the receiver's static type rather than by
+# name resolution: unsigned `to_string`, the `Result` combinators, and the
+# `Optional` accessors. returns -1 when none apply.
+fn ir_emit_typed_receiver_method(idx: Int, hooks: IrEmitHooks, emit_opt_check: fn(Int, Bool)) -> Int:
+    node := get_node(idx)
+    mname := ir_plain_method_name(node_value(idx))
+    if node.children.len() > 0:
+        recv_tid := c_get_expr_type(node.children[0])
+        if recv_tid >= 0:
+            recv_info := get_type_info(recv_tid)
+            if recv_info.kind == "primitive" and (mname == "wrapping_add" or mname == "wrapping_sub" or mname == "wrapping_mul"):
+                # the plain op wraps at 64 bits, and a narrow type then
+                # wraps into its own range
+                obj_r := hooks.emit_expr(node.children[0])
+                arg_r := hooks.emit_expr(ir_method_call_arg_expr(node, 0))
+                out_r := ir_reg()
+                ir_emit_simple_binary(out_r, mname.replace("wrapping_", ""), obj_r, arg_r)
+                return ir_wrap_to_tid(recv_tid, out_r)
+            wrap_target := wrapping_conversion_target(mname)
+            if recv_info.kind == "primitive" and wrap_target.len() > 0:
+                obj_r := hooks.emit_expr(node.children[0])
+                return ir_wrap_to_tid(lookup_type_id(wrap_target), obj_r)
+            if recv_info.kind == "primitive" and mname == "to_string":
+                if recv_info.name == "UInt" or recv_info.name == "UInt8" or recv_info.name == "UInt16" or recv_info.name == "UInt32" or recv_info.name == "UInt64":
+                    obj_r := hooks.emit_expr(node.children[0])
+                    out_r := ir_reg()
+                    ir_emit_call1(out_r, "uint_to_string", "string", obj_r)
+                    return out_r
+            if recv_info.kind == "result":
+                if mname == "unwrap_or":
+                    return ir_emit_result_unwrap_or(idx, node, hooks)
+                if mname == "or_else":
+                    return ir_emit_result_or_else(idx, node, hooks)
+                if mname == "to_string":
+                    return ir_emit_result_to_string(node, hooks)
+            if recv_info.kind == "optional" and mname == "value":
+                # extraction of the inner value, for a caller that has checked
+                # the optional is Some; used by iterator adapters in std.iter.
+                # counted on exactly the terms the unwrap_or arm below uses:
+                # the payload leaves with a count of its own, so a bind, an
+                # argument position or an owned receiver may release it
+                # without touching the count its owner still needs.
+                ir_getter_consumed_idx = node.children[0]
+                obj_r := hooks.emit_expr(node.children[0])
+                owns_subject := ir_optional_subject_is_owned(node.children[0])
+                emit_opt_check(obj_r, owns_subject)
+                val_r := ir_optional_value_field(obj_r, recv_tid)
+                inner_kind := ir_rc_kind(ir_type_from_tid(recv_info.inner))
+                if ir_extraction_retains(node.children[0], inner_kind, owns_subject):
+                    ir_rc_retain_reg(val_r, inner_kind)
+                # a fresh shell (a call or method result) is this expression's
+                # to free; the retain above kept its payload alive past it.
+                if owns_subject:
+                    ir_emit_call1(ir_reg(), "pith_struct_release", "void", obj_r)
+                return val_r
+            if recv_info.kind == "optional" and mname == "unwrap_or":
+                # some(v) -> v, none -> the default argument
+                ir_getter_consumed_idx = node.children[0]
+                obj_r := hooks.emit_expr(node.children[0])
+                # a fresh optional (a call/method result) is an owned shell that
+                # would otherwise leak; release it once at the merge below.
+                owns_subject := ir_optional_subject_is_owned(node.children[0])
+                inner_kind := ir_rc_kind(ir_type_from_tid(recv_info.inner))
+                flag_r := ir_optional_flag_field(obj_r)
+                tmp := ir_new_temp_name("unwrap_or")
+                some_l := ir_label()
+                none_l := ir_label()
+                end_l := ir_label()
+                ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
+                ir_emit_label(some_l)
+                inner_r := ir_optional_value_field(obj_r, recv_tid)
+                if ir_extraction_retains(node.children[0], inner_kind, owns_subject):
+                    ir_rc_retain_reg(inner_r, inner_kind)
+                ir_emit("store " + tmp + " " + inner_r.to_string())
+                ir_emit("jmp " + end_l)
+                ir_emit_label(none_l)
+                default_idx := ir_method_call_arg_expr(node, 0)
+                default_r := hooks.emit_expr(default_idx)
+                # consumers treat a heap-kind unwrap_or value as owned and
+                # release it, so a default that arrives borrowed (a named
+                # local, a field) needs its own count here. without one that
+                # release strips the owner's count and the owner's next use
+                # reads freed memory. a fresh default already owns its single
+                # count and is stored as-is. string payloads classify owned
+                # like every other heap kind (see ir_expr_is_borrowed), so
+                # the same gate covers them.
+                if inner_kind.len() > 0 and not ir_expr_is_borrowed(idx) and ir_expr_is_borrowed(default_idx):
+                    ir_rc_retain_reg(default_r, inner_kind)
+                ir_emit("store " + tmp + " " + default_r.to_string())
+                ir_emit_label(end_l)
+                if owns_subject:
+                    ir_emit_call1(ir_reg(), "pith_struct_release", "void", obj_r)
+                out_r := ir_reg()
+                ir_emit("load " + out_r.to_string() + " " + tmp)
+                return out_r
+    return 0 - 1
+
+# a module-qualified call, `mod.member(...)`, where `mod` is an import alias.
+# resolves to the target name and emits it, as an inline struct construction
+# when the member is a struct type, otherwise as a plain (possibly generic)
+# static call. returns -1 when the receiver is not a module alias.
+fn ir_emit_module_alias_method(idx: Int, hooks: IrEmitHooks) -> Int:
+    node := get_node(idx)
+    alias_fname := ir_resolve_module_alias_method_call_name(idx)
+    if alias_fname.len() > 0:
+        mut call_name := alias_fname
+        # `mod.Box(...)` where Box is a generic struct comes back as the bare
+        # written name. when a second module declares a generic with that name
+        # too, the aliased module's declaration is the one this call means, and
+        # its identity is what the struct decl and its methods are keyed by.
+        call_name = ir_alias_generic_base_identity(idx, call_name)
+        # a module-qualified struct construction (`mod.Struct(...)`) resolves the
+        # alias member to the struct name. emit it through the same inline path as
+        # a same-module construction so each field takes ownership and the struct
+        # gets its destructor. the generic function-call path below would instead
+        # emit a backend constructor call and then release the owned args the
+        # struct just stored, dropping a fresh heap value (e.g. `body: bytes...`).
+        # a generic struct's checked type names the instance (`Box[String]`),
+        # which is also the name the same-module path builds under, so the
+        # instance destructor is attached either way.
+        alias_expr_tid := c_get_expr_type(idx)
+        if alias_expr_tid >= 0:
+            alias_expr_info := get_type_info(alias_expr_tid)
+            if alias_expr_info.kind == "struct" and ir_struct_base_name(alias_expr_info.name) == call_name:
+                mut ctor_args: List[Int] := []
+                for child, ci in node.children:
+                    if ci == 0:
+                        continue
+                    ctor_args.push(child)
+                return ir_emit_struct_positional_init(alias_expr_info.name, ctor_args, alias_expr_tid, hooks)
+        if ir_is_generic_function_name(call_name):
+            generic_ret_type := ir_infer_type(idx)
+            mut no_explicit_types: List[String] := []
+            call_name = ir_queue_generic_call(call_name, idx, no_explicit_types, generic_ret_type)
+        mut arg_pins: List[String] := []
+        arg_regs := ir_collect_call_arg_regs(node, 1, [], not ir_call_needs_no_pins(call_name), arg_pins, hooks)
+        return ir_finish_static_or_alias_call(idx, node, ResolvedCallee(call_name, true), "", arg_regs, arg_pins, false)
+    return 0 - 1
+
+struct IrStoreCallSpec:
+    call_name: String
+    store_value_pos: Int
+    store_tag_r: Int
+
+# `recv.f(args)` where `f` is a closure-typed field of recv's struct: load the
+# field into a named temp, pin the closure handle and arguments across the call,
+# dispatch through the closure ABI, and release owned args/receiver.
+fn ir_emit_closure_field_call(node: Node, mname: String, obj_type: String, hooks: IrEmitHooks) -> Int:
+    field_key := ir_strip_type_args(obj_type) + "." + mname
+    recv_r := hooks.emit_expr(node.children[0])
+    field_idx := ir_unpack_field_index(ir_struct_field_index_lookup[field_key])
+    handle_r := ir_reg()
+    ir_emit("field " + handle_r.to_string() + " " + recv_r.to_string() + " " + (field_idx * 8).to_string() + " unknown " + mname)
+    tmp_name := ir_temp_name("__cl_field")
+    ir_emit("store " + tmp_name + " " + handle_r.to_string())
+    ir_rc_retain_reg(handle_r, "closure")
+    ir_inflight_push(handle_r, "closure")
+    mut arg_regs: List[Int] := []
+    mut arg_pins: List[String] := []
+    mut ai := 0
+    while ai < node.children.len() - 1:
+        arg_idx := ir_method_call_arg_expr(node, ai)
+        arg_r := ir_emit_call_arg_with(arg_idx, hooks)
+        arg_regs.push(arg_r)
+        arg_pins.push(ir_pin_operand(arg_idx, arg_r, true))
+        ai = ai + 1
+    r := ir_reg()
+    ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
+    ir_release_owned_method_args(node, arg_regs, 0 - 1)
+    ir_unpin_args(arg_regs, arg_pins)
+    ir_inflight_drop(handle_r)
+    ir_rc_release_reg(handle_r, "closure")
+    if ir_field_receiver_is_owned_temp(node.children[0]):
+        ir_rc_release_reg(recv_r, ir_rc_kind(ir_infer_type(node.children[0])))
+    return r
+
+# classify container-store methods (`push`, `insert`, `set`, channel `send`):
+# rewrite borrowed values to kind-carrying stores, transfer counts for owned
+# values, mark sent values shared, and attach result-box dtors.
+fn ir_resolve_container_store_call(node: Node, emit_name: String, impl_dispatch: Bool, arg_regs: List[Int]) -> IrStoreCallSpec:
+    mut store_value_pos := 0 - 1
+    if ir_is_channel_send_name(emit_name) or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
+        store_value_pos = 0
+    elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "map_insert_bkey" or emit_name == "set" or emit_name == "pith_list_set_value" or emit_name == "list_insert":
+        store_value_pos = 1
+    mut call_name := emit_name
+    mut store_tag_r := 0 - 1
+    if not impl_dispatch and store_value_pos >= 0 and store_value_pos < arg_regs.len():
+        value_expr := ir_method_call_arg_expr(node, store_value_pos)
+        if value_expr >= 0:
+            mut store_kind := ir_rc_kind(ir_infer_type(value_expr))
+            mut borrowed := ir_expr_is_borrowed(value_expr)
+            if ir_expr_is_fresh_optional_shell(value_expr):
+                store_kind = "tuple"
+                borrowed = false
+            mut kind_store := ir_map_kind_store_name(emit_name, not borrowed)
+            if kind_store.len() == 0 and borrowed:
+                kind_store = ir_list_kind_store_name(emit_name)
+            if kind_store.len() > 0 and ir_store_learns_kind(store_kind):
+                call_name = kind_store
+                store_tag_r = ir_emit_element_tag_const(store_kind)
+            elif borrowed:
+                if ir_channel_send_needs_retain(emit_name, store_kind):
+                    ir_rc_retain_reg(arg_regs[store_value_pos], store_kind)
+            elif ir_container_store_takes_count(store_kind):
+                owned_store := ir_owned_container_store_name(emit_name)
+                if owned_store.len() > 0:
+                    call_name = owned_store
+            if ir_is_channel_send_name(emit_name):
+                ir_emit_share_expr(arg_regs[store_value_pos], value_expr)
+            else:
+                ir_attach_result_box_dtor(arg_regs[store_value_pos], value_expr)
+    return IrStoreCallSpec(call_name, store_value_pos, store_tag_r)
+
+# attach payload destructors to optional shells returned by transferring or
+# owned-receiver runtime getters (`pop`, `get`, `recv`, etc.).
+fn ir_attach_method_result_opt_dtor(idx: Int, emit_name: String, call_name: String, obj_type: String, r: Int):
+    runtime_opt_kind := ir_runtime_opt_producer_payload_kind(call_name, obj_type)
+    if runtime_opt_kind.len() > 0:
+        if runtime_opt_kind == "tuple":
+            ir_optional_tuple_dtor_needed = true
+        ir_emit_optional_attach_dtor(r, runtime_opt_kind)
+    owned_getter_kind := ir_owned_receiver_getter_payload_kind(idx, emit_name)
+    if owned_getter_kind.len() > 0:
+        payload_r := ir_optional_value_as(r, "unknown")
+        ir_rc_retain_reg(payload_r, owned_getter_kind)
+        if owned_getter_kind == "tuple":
+            ir_optional_tuple_dtor_needed = true
+        ir_emit_optional_attach_dtor(r, owned_getter_kind)
+
+# the general method dispatch: self-hosted list builtins, closure-typed struct
+# fields, and ordinary impl/builtin methods with ARC bookkeeping.
+fn ir_emit_general_method_call(idx: Int, hooks: IrEmitHooks) -> Int:
+    node := get_node(idx)
+    mname := ir_plain_method_name(node_value(idx))
+    obj_type := ir_method_receiver_type(node)
+    self_hosted_list_r := ir_emit_self_hosted_list_method(idx, node, mname, obj_type, hooks)
+    if self_hosted_list_r >= 0:
+        return self_hosted_list_r
+    if ir_method_call_is_closure_field(node, mname, obj_type):
+        return ir_emit_closure_field_call(node, mname, obj_type, hooks)
+    mut emit_name := ir_method_emit_name(mname, obj_type)
+    if emit_name == "list_join" and ir_list_element_kind(node.children[0]) == "int":
+        emit_name = "list_join_int"
+    if ir_is_bool_returning_method(emit_name):
+        ir_var_types.insert("__last_call", "bool")
+
+    mut impl_name := ir_lookup_specialized_method(obj_type, mname)
+    if impl_name.len() == 0:
+        impl_name = ir_lookup_impl_method_for(node.children[0], obj_type, mname)
+    impl_dispatch := impl_name.len() > 0
+    if impl_dispatch:
+        emit_name = impl_name
+        if ir_is_generic_method_name(impl_name):
+            emit_name = ir_queue_generic_method_call(idx, node, impl_name)
+
+    mut call_pins: List[String] := []
+    call_regs := ir_collect_method_call_regs(node, impl_dispatch and not ir_call_needs_no_pins(impl_name), call_pins, hooks)
+    obj_r := call_regs[0]
+    mut arg_regs: List[Int] := []
+    mut ci := 0
+    while ci + 1 < call_regs.len():
+        arg_regs.push(call_regs[ci + 1])
+        ci = ci + 1
+    mut r := ir_reg()
+    uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(emit_name, impl_dispatch), idx)
+    mut ret_type := ir_call_retkind_for_name(idx, uses_result_abi, emit_name)
+    if ir_is_void_method(emit_name):
+        ret_type = "void"
+    store_spec := ir_resolve_container_store_call(node, emit_name, impl_dispatch, arg_regs)
+    mut call_name := store_spec.call_name
+    if not impl_dispatch and ir_obj_type_is_primitive(obj_type):
+        call_name = ir_primitive_method_call_name(call_name)
+    call_args := ir_method_call_arg_regs(obj_r, arg_regs)
+    if emit_name == "identity" and not impl_dispatch:
+        return obj_r
+    mut call_arg_text := ir_join_arg_regs(call_args)
+    mut call_arg_count := call_args.len()
+    if store_spec.store_tag_r >= 0:
+        call_arg_text = call_arg_text + " " + store_spec.store_tag_r.to_string()
+        call_arg_count = call_arg_count + 1
+    if ir_call_returns_pair(call_name):
+        ir_rcall_current_idx = idx
+        r = ir_emit_result_reg_call(r, call_name, call_arg_count, call_arg_text)
+        ir_rcall_current_idx = 0 - 1
+    else:
+        ir_emit_call_text(r, call_name, ret_type, call_arg_count, call_arg_text)
+    if not impl_dispatch:
+        ir_attach_method_result_opt_dtor(idx, emit_name, call_name, obj_type, r)
+    if not impl_dispatch and ir_method_result_retains_over_args(emit_name):
+        ir_rc_retain_reg(r, ir_rc_kind(ir_infer_type(idx)))
+    ir_release_owned_method_args(node, arg_regs, store_spec.store_value_pos)
+    ir_unpin_args(call_regs, call_pins)
+    if node.children.len() > 0:
+        recv_idx := node.children[0]
+        recv_kind := ir_rc_kind(ir_infer_type(recv_idx))
+        if recv_kind.len() > 0 and not ir_expr_is_borrowed(recv_idx):
+            if not ir_is_void_method(emit_name):
+                ir_rc_release_reg(obj_r, recv_kind)
+    if ir_is_void_method(emit_name) and not ir_legacy_call_result_wraps(idx, uses_result_abi, ret_type):
+        return obj_r
+    return ir_wrap_legacy_call_result(r, ret_type, emit_name, idx, uses_result_abi)
+
+## lower a method call expression (after fused map-upsert check).
+pub fn ir_emit_method_call(idx: Int, hooks: IrEmitHooks, emit_opt_check: fn(Int, Bool)) -> Int:
+    # a method call is lowered by a handful of specialized emitters tried in
+    # order; each returns a register or -1 ("not my shape, keep looking"). the
+    # order matters; an earlier shape shadows the ones after it:
+    #   1. enum variant construction   Shape.Circle(2.5) / mod.Enum.Variant(..)
+    #   2. type-directed builtins       Int.to_string, Result.*, Optional.*
+    #   3. module-qualified call        mod.Struct(..) / mod.some_fn(..)
+    #   4. general dispatch             impl methods, closure-typed fields
+    # the fused map update comes first, because it is a shape rather than a
+    # name: it only matches `m.insert(k, m[k] + d)` on an integer-valued map
+    # and declines everything else, including every other `insert`.
+    variant_r := ir_emit_variant_ctor_method(idx, hooks)
+    if variant_r >= 0:
+        return variant_r
+    iface_r := ir_emit_interface_method_call(idx, hooks)
+    if iface_r >= 0:
+        return iface_r
+    typed_r := ir_emit_typed_receiver_method(idx, hooks, emit_opt_check)
+    if typed_r >= 0:
+        return typed_r
+    alias_r := ir_emit_module_alias_method(idx, hooks)
+    if alias_r >= 0:
+        return alias_r
+    return ir_emit_general_method_call(idx, hooks)

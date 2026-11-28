@@ -1,0 +1,1009 @@
+# ir_state.pith: centralized IR emitter state & atomic frame lifecycle
+#
+# all mutable state shared across the IR lowering layers lives here,
+# grouped into three explicit lifetime tiers:
+#   1. Build config & cross-module registries (persist across emit_ir calls)
+#   2. Per-module registries (reset atomically by ir_reset_module_state)
+#   3. Per-function & transient expression state (reset by ir_reset_func_frame,
+#      saved and restored atomically via IrFuncFrame for nested lambdas,
+#      spawn wrappers, and named fn-value wrappers)
+#
+# keeping all state at Layer 1 eliminates circular-dependency workarounds
+# (*_with_state trampolines) and ensures nested function emission cannot
+# forget to save or restore a per-function variable.
+
+from ast import Node
+from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines
+from ir_common import ir_push_string
+
+# ===========================================================================
+# Shared lowering callback hooks
+# ===========================================================================
+
+## callbacks handed to Layer 3-4 lowering satellites so they can emit nested
+## expressions, values, blocks, returns, or default returns without creating
+## an import cycle back into ir_lower.
+pub struct IrEmitHooks:
+    pub emit_expr: fn(Int) -> Int
+    pub emit_value: fn(Int) -> Int
+    pub emit_block: fn(Int) -> Int
+    pub emit_ret: fn(Int)
+
+## callbacks handed to decode lowering for expressions, target-typed values,
+## and function default returns.
+pub struct IrDecodeHooks:
+    pub emit_expr: fn(Int) -> Int
+    pub emit_value_for_target: fn(Int, String) -> Int
+    pub emit_default_ret: fn() -> Int
+
+# ===========================================================================
+# Tier 1 — Build-level config & cross-module persistent registries
+# ===========================================================================
+
+## direct import AST roots for the module about to be emitted (consumed by emit_ir).
+pub mut ir_preloaded_import_roots: List[Int] := []
+## resolved module paths parallel to ir_preloaded_import_roots.
+pub mut ir_preloaded_import_paths: List[String] := []
+## every module AST root in the build (persists across emit_ir calls).
+pub mut ir_all_module_roots: List[Int] := []
+## resolved module paths parallel to ir_all_module_roots.
+pub mut ir_all_module_paths: List[String] := []
+## entry file AST root index, or -1.
+pub mut ir_entry_root := 0 - 1
+## resolved module path of the module currently being emitted ("" for entry).
+pub mut ir_current_module_path := ""
+## true when emitting a `pith test` module build.
+pub mut ir_emit_tests := false
+## source file path reported in test output and assertion failures.
+pub mut ir_test_source_file := ""
+## when true, emit `mark` directives for the static count checker.
+pub mut ir_count_marks := false
+## monotonic counter bumped after each emit_ir call for module-unique symbols.
+pub mut ir_module_count := 0
+
+## arena high-water mark for the one-pass index-offset overflow scan.
+pub mut ir_index_offsets_scanned := 0
+## index offset node -> indexed container node for unchecked offset arithmetic.
+pub mut ir_index_offset_targets: Map[Int, Int] := {}
+
+## cached PITH_RESULT_REG flag (-1 uninitialized, 0 disabled, 1 enabled).
+pub mut ir_result_reg_flag := 0 - 1
+## monotonic counter for generated lambda, spawn, and fn-value wrapper symbols.
+pub mut ir_lambda_count := 0
+## monotonic counter for unique `for` loop slot prefixes across modules.
+pub mut ir_for_count := 0
+
+## process-unique threadlocal slot ids keyed by qualified global name.
+pub mut ir_threadlocal_slots: Map[String, Int] := {}
+## IR retkind for each threadlocal global.
+pub mut ir_threadlocal_kinds: Map[String, String] := {}
+## next threadlocal slot id to assign across the build.
+pub mut ir_next_tls_slot := 0
+
+## exported borrow-param proofs ("<sym>/<pos>" -> "result"|"optional").
+pub mut ir_borrow_param_exported: Map[String, String] := {}
+## exported storage-keeper proofs (qualified symbol -> true).
+pub mut ir_storage_keepers_exported: Map[String, Bool] := {}
+## exported CAS-return keeper proofs (qualified symbol -> true).
+pub mut ir_cas_return_fns_exported: Map[String, Bool] := {}
+## concrete type name -> interface runtime type id (persistent across modules).
+pub mut ir_interface_type_ids: Map[String, Int] := {}
+
+# --- public driver configuration setters ---
+
+## declare the direct import roots and paths for the next emit_ir call.
+pub fn set_import_roots(roots: List[Int], paths: List[String]):
+    ir_preloaded_import_roots = roots
+    ir_preloaded_import_paths = paths
+
+## declare every module root and path in the build for cross-module impl collection.
+pub fn set_all_module_roots(roots: List[Int], paths: List[String]):
+    ir_all_module_roots = roots
+    ir_all_module_paths = paths
+
+## declare the entry file's AST root for cross-module generic impl dispatch.
+pub fn set_entry_root(root: Int):
+    ir_entry_root = root
+
+## set the resolved module path of the module about to be emitted ("" for entry).
+pub fn set_current_module_path(path: String):
+    ir_current_module_path = path
+
+## enable or disable test-mode lowering for the next emit_ir call.
+pub fn set_test_mode(enabled: Bool):
+    ir_emit_tests = enabled
+
+## enable or disable count-checker `mark` lines for subsequent emissions.
+pub fn set_count_marks(enabled: Bool):
+    ir_count_marks = enabled
+
+## set the source file path embedded into generated test binaries.
+pub fn set_test_source_file(path: String):
+    ir_test_source_file = path
+
+# ===========================================================================
+# Tier 2 — Per-module registries (reset at emit_ir entry)
+# ===========================================================================
+
+## module global name -> emission kind ("int", "string", "list", ...); O(1) lookup.
+pub mut ir_global_kinds: Map[String, String] := {}
+## module global map name -> recorded value-type emission kind.
+pub mut ir_global_map_value_types: Map[String, String] := {}
+## every module-level global this module declares (regardless of type).
+pub mut ir_global_slot_names: List[String] := []
+## module globals declared `mut` in the current module.
+pub mut ir_mutable_global_names: Map[String, Bool] := {}
+
+## type alias name -> target type text.
+pub mut ir_type_aliases: Map[String, String] := {}
+## type alias name -> target type AST node index.
+pub mut ir_type_alias_nodes: Map[String, Int] := {}
+## bare imported identifier -> module-qualified IR symbol.
+pub mut ir_import_renames: Map[String, String] := {}
+## module alias name -> resolved dotted module path.
+pub mut ir_module_aliases: Map[String, String] := {}
+## "module.fn" -> true for every function declared by preloaded imports.
+pub mut ir_import_declared_functions: Map[String, Bool] := {}
+## "module.global" -> true for every global declared by preloaded imports.
+pub mut ir_import_declared_globals: Map[String, Bool] := {}
+## qualified storage symbols of imported `mut` globals.
+pub mut ir_import_mutable_global_symbols: Map[String, Bool] := {}
+
+## boxed enum names (enums with at least one payload variant).
+pub mut ir_boxed_enums: Map[String, Bool] := {}
+## "Enum.Variant" -> comma-joined payload kinds.
+pub mut ir_enum_payload_kinds: Map[String, String] := {}
+## "Enum" -> comma-joined variant names in declaration order.
+pub mut ir_enum_variant_lists: Map[String, String] := {}
+## registered struct/enum name -> field or variant count.
+pub mut ir_struct_names: Map[String, Int] := {}
+## "Struct.field" -> emission kind string.
+pub mut ir_struct_field_lookup: Map[String, String] := {}
+## "Struct.field" -> decimal field index string.
+pub mut ir_struct_field_index_lookup: Map[String, String] := {}
+## struct name -> declaration AST node index.
+pub mut ir_struct_decl_nodes: Map[String, Int] := {}
+## "Struct.field" -> default expression AST node index.
+pub mut ir_struct_field_default_nodes: Map[String, Int] := {}
+## struct declaration node index -> Drop method flat IR symbol.
+pub mut ir_struct_drop_symbols: Map[Int, String] := {}
+## structs declared by the current module.
+pub mut ir_local_struct_names: List[String] := []
+## memo for ir_struct_needs_dtor (1 = needs dtor, 2 = no/visiting).
+pub mut ir_dtor_memo: Map[String, Int] := {}
+## memo for ir_struct_needs_tracer (1 = needs tracer, 2 = no/visiting).
+pub mut ir_tracer_memo: Map[String, Int] := {}
+
+## declared callable name -> recorded return-type hint.
+pub mut ir_func_returns: Map[String, String] := {}
+## "Type.method" or "#tid.method" -> emitted method IR symbol.
+pub mut ir_impl_methods: Map[String, String] := {}
+## "Type.method" -> owning declaration checked tid.
+pub mut ir_impl_method_owner: Map[String, Int] := {}
+## "InstanceType.method" -> specialized method IR symbol.
+pub mut ir_impl_method_specializations: Map[String, String] := {}
+## interface base name -> interface_decl AST node index.
+pub mut ir_interface_decl_index: Map[String, Int] := {}
+## "ConcreteType.Assoc" -> bound concrete type name.
+pub mut ir_assoc_bindings: Map[String, String] := {}
+## "ConcreteType" -> comma-joined associated type names.
+pub mut ir_type_assoc_names: Map[String, String] := {}
+
+## generic declaration symbol -> declaration AST node index.
+pub mut ir_generic_decl_indices: Map[String, Int] := {}
+## generic declaration symbol -> declaring module path.
+pub mut ir_generic_decl_module_paths: Map[String, String] := {}
+## queued specialization keys in first-request order.
+pub mut ir_generic_specialization_keys: List[String] := []
+## specialization key -> emitted IR function symbol.
+pub mut ir_generic_specialization_names: Map[String, String] := {}
+## specialization key -> tab-joined concrete kind list.
+pub mut ir_generic_specialization_type_lists: Map[String, String] := {}
+## specialization key -> 1 once emitted.
+pub mut ir_generic_emitted_specializations: Map[String, Int] := {}
+## generic method symbol -> owning impl type name.
+pub mut ir_generic_method_owners: Map[String, String] := {}
+## generic method symbol -> number of owner type parameters.
+pub mut ir_generic_method_owner_param_counts: Map[String, Int] := {}
+## specialization symbol -> first requesting key (deduplication).
+pub mut ir_generic_specialization_by_symbol: Map[String, String] := {}
+## specialization key -> comma-joined checker type-argument tids.
+pub mut ir_generic_specialization_subst_tids: Map[String, String] := {}
+## specialization key -> bound closure-parameter specialization descriptor.
+pub mut ir_generic_spec_fn_bindings: Map[String, String] := {}
+
+## active generic parameter names during specialization emission.
+pub mut ir_active_generic_params: List[String] := []
+## active concrete emission kinds parallel to ir_active_generic_params.
+pub mut ir_active_generic_concrete_types: List[String] := []
+## declaring module path of the generic body currently being specialized.
+pub mut ir_active_generic_module_path := ""
+
+## function/method symbols using the two-register result ABI (ret2/rcall).
+pub mut ir_result_reg_funcs: Map[String, Bool] := {}
+## result-returning symbol -> ok payload kind.
+pub mut ir_func_result_ok_kinds: Map[String, String] := {}
+## method symbols excluded from the register-pair result ABI.
+pub mut ir_result_reg_blocked: Map[String, Bool] := {}
+## AST nodes whose interface coercion is currently being emitted.
+pub mut ir_interface_coercion_bypass: Map[Int, Bool] := {}
+## register-pair method symbols requiring boxing interface adapters -> param count.
+pub mut ir_interface_adapters: Map[String, Int] := {}
+
+## RC tuple destructor signatures registered during this module.
+pub mut ir_tuple_dtor_sigs: List[String] := []
+## (ok,err) signatures needing a heap tuple cascade release helper.
+pub mut ir_tuple_cascade_sigs: List[String] := []
+## (ok,err) signatures needing a stack tuple cascade release helper.
+pub mut ir_tuple_stack_cascade_sigs: List[String] := []
+## (ok,err) signatures needing a result-argument release helper.
+pub mut ir_result_arg_release_sigs: List[String] := []
+## (ok,err) signatures needing a result-box unshare helper.
+pub mut ir_result_unshare_sigs: List[String] := []
+## true when any optional in this module wraps a genuine tuple.
+pub mut ir_optional_tuple_dtor_needed := false
+## module-unique symbol name for the kind-dispatching release helper.
+pub mut ir_kinded_release_symbol := ""
+## true when any function in this module called the kinded release helper.
+pub mut ir_kinded_release_used := false
+## named function symbol -> generated `__fnval_N` closure wrapper symbol.
+pub mut ir_named_fn_value_wrappers: Map[String, String] := {}
+## deferred lambda/spawn/fn-value wrapper IR lines appended after module bodies.
+pub mut ir_lambda_bodies: List[String] := []
+
+## generic enum instance dtor symbol -> base enum name.
+pub mut ir_generic_enum_dtor_base: Map[String, String] := {}
+## generic enum instance dtor symbol -> packed variant payload kinds.
+pub mut ir_generic_enum_dtor_kinds: Map[String, String] := {}
+## generic struct instance dtor symbol -> base struct name.
+pub mut ir_generic_struct_dtor_base: Map[String, String] := {}
+## generic struct instance dtor symbol -> packed field release kinds.
+pub mut ir_generic_struct_dtor_kinds: Map[String, String] := {}
+## generic struct instance dtor symbol -> specialized Drop method symbol.
+pub mut ir_generic_struct_dtor_drop: Map[String, String] := {}
+
+## module root currently being lowered (for same-module cascade/borrow walks).
+pub mut ir_tuple_walk_root := 0 - 1
+## cycle guard for recursive borrow-parameter walks.
+pub mut ir_tuple_borrow_walk_active: List[String] := []
+## true while borrow walk inspects a register-pair returning callee.
+pub mut ir_tuple_walk_pair_callee := false
+## return expression nodes collected for a register-pair borrow walk.
+pub mut ir_tuple_walk_pair_returns: List[Int] := []
+## local module borrow-param proofs ("<sym>/<pos>" -> "result"|"optional").
+pub mut ir_borrow_param_local: Map[String, String] := {}
+## local module storage-keeper proofs.
+pub mut ir_storage_keepers_local: Map[String, Bool] := {}
+## local module CAS-return keeper proofs.
+pub mut ir_cas_return_fns_local: Map[String, Bool] := {}
+## flag set while ir_record_storage_keepers detects a CAS-return body.
+pub mut ir_keeper_pass_cas := false
+
+## enclosing match subject tids during the RC prepass walk.
+pub mut ir_prepass_subject_tids: List[Int] := []
+## true while collecting entry-file impls during another module's emission.
+pub mut ir_collecting_entry_impls := false
+## true while emitting a `test` block body.
+pub mut ir_emitting_test_func := false
+## impl block target type currently being emitted, or "".
+pub mut ir_current_impl_type := ""
+## generic struct parameter names during specialized impl method emission.
+pub mut ir_current_impl_subst_params: List[String] := []
+## concrete type names parallel to ir_current_impl_subst_params.
+pub mut ir_current_impl_subst_args: List[String] := []
+
+# ===========================================================================
+# Tier 3 — Per-function & transient expression state
+# ===========================================================================
+
+## current function variable name -> last emitted IR register.
+pub mut ir_var_regs: Map[String, Int] := {}
+## current function variable name -> emission kind string.
+pub mut ir_var_types: Map[String, String] := {}
+## current function's emitted return kind.
+pub mut ir_current_func_return_kind := ""
+## inner kind of the current function's `T?` return type, or "".
+pub mut ir_current_func_optional_inner_kind := ""
+## true when the current function returns a Result (`T!` or `T!E`).
+pub mut ir_current_func_returns_result := false
+## true when index/key/.value() misses propagate as String errors.
+pub mut ir_current_func_miss_fails := false
+## true when the current function uses the two-register result ABI (ret2).
+pub mut ir_result_abi_pair_return := false
+## true when the last emitted instruction terminated the current block with ret.
+pub mut ir_last_was_ret := false
+## true while emitting the user `main` function body.
+pub mut ir_emitting_main_body := false
+## name of the function currently being emitted (for ARC diagnostics/tracing).
+pub mut ir_current_arc_func := ""
+
+## current function map variable name -> value emission kind.
+pub mut ir_map_value_types: Map[String, String] := {}
+## current function closure parameter name -> declared return kind.
+pub mut ir_closure_return_kinds: Map[String, String] := {}
+## non-mut locals bound once to a lambda -> lambda symbol (devirtualization).
+pub mut ir_local_lambda_targets: Map[String, String] := {}
+## symbol of the most recently emitted lambda literal.
+pub mut ir_last_lambda_symbol := ""
+
+## RC-tracked locals owned by the current function, in prologue order.
+pub mut ir_rc_locals: List[String] := []
+## RC kinds parallel to ir_rc_locals.
+pub mut ir_rc_local_kinds: List[String] := []
+## names the RC prologue could not track under a single kind.
+pub mut ir_untracked_rc_binds: List[String] := []
+## subset of ir_untracked_rc_binds tracked dynamically via a tag side slot.
+pub mut ir_kinded_rc_binds: List[String] := []
+## locals that own a spawned task handle detached on rebind/exit.
+pub mut ir_task_owner_locals: List[String] := []
+## lambda capture names while the lambda's RC prologue runs.
+pub mut ir_rc_prologue_captures: List[String] := []
+## closure locals eligible for stack allocation.
+pub mut ir_stack_closure_names: List[String] := []
+## transient request from bind/call to allocate the next lambda on the stack.
+pub mut ir_lambda_on_stack := false
+## transient companion to ir_lambda_on_stack when captures are borrowed across a call.
+pub mut ir_lambda_borrows_captures := false
+## closure parameter bindings active in the current generic specialization.
+pub mut ir_active_fn_bindings: Map[String, String] := {}
+## lambda argument register -> lambda symbol for generic specialization binding.
+pub mut ir_fn_arg_lambda_symbols: Map[Int, String] := {}
+## registers holding stack-allocated closures (must not be released).
+pub mut ir_stack_closure_regs: List[Int] := []
+
+## tuple/result local name -> producing expression tid.
+pub mut ir_tuple_local_tid: Map[String, Int] := {}
+## tuple/result locals safe to cascade-release at scope exit.
+pub mut ir_tuple_cascade_names: List[String] := []
+## cascade-eligible result locals allocated in stack slots.
+pub mut ir_stack_tuple_names: List[String] := []
+## call node index whose pair result should materialize into a stack box.
+pub mut ir_stack_box_call_idx := 0 - 1
+## set true when the stack-box call actually built a stack box.
+pub mut ir_stack_box_built := false
+## every local name bound inside the current function body.
+pub mut ir_func_local_names: Set[String] := {}
+## captured weak binding names inside the current lambda body.
+pub mut ir_weak_capture_names: List[String] := []
+## getter call node whose owned receiver was already released by the getter.
+pub mut ir_getter_consumed_idx := 0 - 1
+
+## in-flight owned registers held across sub-expressions (released on early exit).
+pub mut ir_inflight_regs: List[Int] := []
+## RC kinds (or "result:TID") parallel to ir_inflight_regs.
+pub mut ir_inflight_kinds: List[String] := []
+
+## enclosing loop break target labels, innermost last.
+pub mut ir_break_stack: List[String] := []
+## enclosing loop continue target labels, innermost last.
+pub mut ir_continue_stack: List[String] := []
+## active `for` loop variable name -> private loop slot name (or "").
+pub mut ir_loop_var_slots: Map[String, String] := {}
+## active `for` loop owned iterable variable names.
+pub mut ir_loop_iter_vars: List[String] := []
+## RC kinds parallel to ir_loop_iter_vars.
+pub mut ir_loop_iter_kinds: List[String] := []
+
+## flat stack of deferred statement AST node indices in scope.
+pub mut ir_defer_nodes: List[Int] := []
+## parallel stack marking each defer as errdefer (1) or plain defer (0).
+pub mut ir_defer_is_err: List[Int] := []
+## loop-variable slot snapshot in force where each defer was registered.
+pub mut ir_defer_loop_slots: List[Map[String, String]] := []
+## block-scope start offsets into ir_defer_nodes.
+pub mut ir_defer_scope_starts: List[Int] := []
+## loop-entry base offsets into ir_defer_nodes.
+pub mut ir_defer_loop_base_stack: List[Int] := []
+## upper bound on defer indices while emitting a defer body (-1 = uncapped).
+pub mut ir_defer_emit_limit := 0 - 1
+
+## loop counter step nodes proven not to overflow.
+pub mut ir_counter_steps: Map[Int, Bool] := {}
+## true while emitting unchecked integer arithmetic.
+pub mut ir_plain_int_arith := false
+## true while emitting exact non-wrapping counter arithmetic (`addnsw`).
+pub mut ir_exact_int_arith := false
+## register holding the caught error inside a `catch err:` block.
+pub mut ir_caught_error_reg := 0
+## true when the active `select` expression lands owned arm values.
+pub mut ir_select_takes_counts := false
+
+## register-pair rcall handshake state.
+pub mut ir_rcall_defer_idx := 0 - 1
+## current call node index in rcall evaluation.
+pub mut ir_rcall_current_idx := 0 - 1
+## true when the deferred rcall delivered a live (flag, val) pair.
+pub mut ir_rcall_pair_ready := false
+## flag register from the deferred rcall.
+pub mut ir_rcall_flag_reg := 0
+## value register from the deferred rcall.
+pub mut ir_rcall_val_reg := 0
+
+## checked tid of the active match subject (-1 outside match).
+pub mut ir_match_subject_tid := 0 - 1
+## pending match subject pin slot name (consumed when match starts).
+pub mut ir_match_pin_slot := ""
+## RC kind parallel to ir_match_pin_slot.
+pub mut ir_match_pin_slot_kind := ""
+## AST node index of the current function's implicit tail match, or -1.
+pub mut ir_tail_match_node := 0 - 1
+
+## global kinds seeded at function entry, used to filter `mark kind` lines.
+pub mut ir_count_marks_seeded: Map[String, String] := {}
+## registers collected for the most recent decode call's arguments.
+pub mut ir_decode_last_args: List[Int] := []
+## held decoded field registers released on a subsequent field failure.
+pub mut ir_decode_partial_regs: List[Int] := []
+## RC kinds parallel to ir_decode_partial_regs.
+pub mut ir_decode_partial_kinds: List[String] := []
+## floor index in ir_decode_partial_regs for the active struct decode.
+pub mut ir_decode_partial_floor := 0
+
+# ===========================================================================
+# Atomic nested-function frame snapshot (lambdas, spawn wrappers, fn-values)
+# ===========================================================================
+
+## complete snapshot of every per-function and transient expression variable,
+## captured by ir_enter_nested_func and restored by ir_leave_nested_func.
+pub struct IrFuncFrame:
+    pub builder: IrBuilderSnapshot
+    pub var_regs: Map[String, Int]
+    pub var_types: Map[String, String]
+    pub current_func_return_kind: String
+    pub current_func_optional_inner_kind: String
+    pub current_func_returns_result: Bool
+    pub current_func_miss_fails: Bool
+    pub result_abi_pair_return: Bool
+    pub last_was_ret: Bool
+    pub emitting_main_body: Bool
+    pub current_arc_func: String
+    pub map_value_types: Map[String, String]
+    pub closure_return_kinds: Map[String, String]
+    pub local_lambda_targets: Map[String, String]
+    pub rc_locals: List[String]
+    pub rc_local_kinds: List[String]
+    pub untracked_rc_binds: List[String]
+    pub kinded_rc_binds: List[String]
+    pub task_owner_locals: List[String]
+    pub rc_prologue_captures: List[String]
+    pub stack_closure_names: List[String]
+    pub active_fn_bindings: Map[String, String]
+    pub fn_arg_lambda_symbols: Map[Int, String]
+    pub stack_closure_regs: List[Int]
+    pub tuple_local_tid: Map[String, Int]
+    pub tuple_cascade_names: List[String]
+    pub stack_tuple_names: List[String]
+    pub stack_box_call_idx: Int
+    pub stack_box_built: Bool
+    pub func_local_names: Set[String]
+    pub weak_capture_names: List[String]
+    pub getter_consumed_idx: Int
+    pub inflight_regs: List[Int]
+    pub inflight_kinds: List[String]
+    pub break_stack: List[String]
+    pub continue_stack: List[String]
+    pub loop_var_slots: Map[String, String]
+    pub loop_iter_vars: List[String]
+    pub loop_iter_kinds: List[String]
+    pub defer_nodes: List[Int]
+    pub defer_is_err: List[Int]
+    pub defer_loop_slots: List[Map[String, String]]
+    pub defer_scope_starts: List[Int]
+    pub defer_loop_base_stack: List[Int]
+    pub defer_emit_limit: Int
+    pub counter_steps: Map[Int, Bool]
+    pub plain_int_arith: Bool
+    pub exact_int_arith: Bool
+    pub caught_error_reg: Int
+    pub select_takes_counts: Bool
+    pub rcall_defer_idx: Int
+    pub rcall_current_idx: Int
+    pub rcall_pair_ready: Bool
+    pub rcall_flag_reg: Int
+    pub rcall_val_reg: Int
+    pub match_subject_tid: Int
+    pub match_pin_slot: String
+    pub match_pin_slot_kind: String
+    pub tail_match_node: Int
+    pub count_marks_seeded: Map[String, String]
+    pub decode_partial_regs: List[Int]
+    pub decode_partial_kinds: List[String]
+    pub decode_partial_floor: Int
+
+## save the entire active function frame and initialize a clean nested frame
+## (for a lambda body, spawn wrapper, or named function-value wrapper).
+pub fn ir_enter_nested_func() -> IrFuncFrame:
+    saved := IrFuncFrame(
+        ir_builder_snapshot(),
+        ir_var_regs,
+        ir_var_types,
+        ir_current_func_return_kind,
+        ir_current_func_optional_inner_kind,
+        ir_current_func_returns_result,
+        ir_current_func_miss_fails,
+        ir_result_abi_pair_return,
+        ir_last_was_ret,
+        ir_emitting_main_body,
+        ir_current_arc_func,
+        ir_map_value_types,
+        ir_closure_return_kinds,
+        ir_local_lambda_targets,
+        ir_rc_locals,
+        ir_rc_local_kinds,
+        ir_untracked_rc_binds,
+        ir_kinded_rc_binds,
+        ir_task_owner_locals,
+        ir_rc_prologue_captures,
+        ir_stack_closure_names,
+        ir_active_fn_bindings,
+        ir_fn_arg_lambda_symbols,
+        ir_stack_closure_regs,
+        ir_tuple_local_tid,
+        ir_tuple_cascade_names,
+        ir_stack_tuple_names,
+        ir_stack_box_call_idx,
+        ir_stack_box_built,
+        ir_func_local_names,
+        ir_weak_capture_names,
+        ir_getter_consumed_idx,
+        ir_inflight_regs,
+        ir_inflight_kinds,
+        ir_break_stack,
+        ir_continue_stack,
+        ir_loop_var_slots,
+        ir_loop_iter_vars,
+        ir_loop_iter_kinds,
+        ir_defer_nodes,
+        ir_defer_is_err,
+        ir_defer_loop_slots,
+        ir_defer_scope_starts,
+        ir_defer_loop_base_stack,
+        ir_defer_emit_limit,
+        ir_counter_steps,
+        ir_plain_int_arith,
+        ir_exact_int_arith,
+        ir_caught_error_reg,
+        ir_select_takes_counts,
+        ir_rcall_defer_idx,
+        ir_rcall_current_idx,
+        ir_rcall_pair_ready,
+        ir_rcall_flag_reg,
+        ir_rcall_val_reg,
+        ir_match_subject_tid,
+        ir_match_pin_slot,
+        ir_match_pin_slot_kind,
+        ir_tail_match_node,
+        ir_count_marks_seeded,
+        ir_decode_partial_regs,
+        ir_decode_partial_kinds,
+        ir_decode_partial_floor
+    )
+    ir_builder_reset_function()
+    ir_var_regs = {}
+    ir_var_types = {}
+    ir_current_func_return_kind = ""
+    ir_current_func_optional_inner_kind = ""
+    ir_current_func_returns_result = false
+    ir_current_func_miss_fails = false
+    ir_result_abi_pair_return = false
+    ir_last_was_ret = false
+    ir_emitting_main_body = false
+    ir_current_arc_func = ""
+    ir_map_value_types = {}
+    ir_closure_return_kinds = {}
+    ir_local_lambda_targets = {}
+    ir_rc_locals = []
+    ir_rc_local_kinds = []
+    ir_untracked_rc_binds = []
+    ir_kinded_rc_binds = []
+    ir_task_owner_locals = []
+    ir_rc_prologue_captures = []
+    ir_stack_closure_names = []
+    ir_active_fn_bindings = {}
+    ir_fn_arg_lambda_symbols = {}
+    ir_stack_closure_regs = []
+    ir_tuple_local_tid = {}
+    ir_tuple_cascade_names = []
+    ir_stack_tuple_names = []
+    ir_stack_box_call_idx = 0 - 1
+    ir_stack_box_built = false
+    ir_func_local_names = {}
+    ir_weak_capture_names = []
+    ir_getter_consumed_idx = 0 - 1
+    ir_inflight_regs = []
+    ir_inflight_kinds = []
+    ir_break_stack = []
+    ir_continue_stack = []
+    ir_loop_var_slots = {}
+    ir_loop_iter_vars = []
+    ir_loop_iter_kinds = []
+    ir_defer_nodes = []
+    ir_defer_is_err = []
+    ir_defer_loop_slots = []
+    ir_defer_scope_starts = []
+    ir_defer_loop_base_stack = []
+    ir_defer_emit_limit = 0 - 1
+    ir_counter_steps = {}
+    ir_plain_int_arith = false
+    ir_exact_int_arith = false
+    ir_caught_error_reg = 0
+    ir_select_takes_counts = false
+    ir_rcall_defer_idx = 0 - 1
+    ir_rcall_current_idx = 0 - 1
+    ir_rcall_pair_ready = false
+    ir_rcall_flag_reg = 0
+    ir_rcall_val_reg = 0
+    ir_match_subject_tid = 0 - 1
+    ir_match_pin_slot = ""
+    ir_match_pin_slot_kind = ""
+    ir_tail_match_node = 0 - 1
+    ir_count_marks_seeded = {}
+    ir_decode_partial_regs = []
+    ir_decode_partial_kinds = []
+    ir_decode_partial_floor = 0
+    return saved
+
+## flush the nested function's emitted lines into ir_lambda_bodies and restore
+## the enclosing function's complete IrFuncFrame.
+pub fn ir_leave_nested_func(saved: IrFuncFrame):
+    ir_append_deferred_lambda_body()
+    ir_builder_restore(saved.builder)
+    ir_var_regs = saved.var_regs
+    ir_var_types = saved.var_types
+    ir_current_func_return_kind = saved.current_func_return_kind
+    ir_current_func_optional_inner_kind = saved.current_func_optional_inner_kind
+    ir_current_func_returns_result = saved.current_func_returns_result
+    ir_current_func_miss_fails = saved.current_func_miss_fails
+    ir_result_abi_pair_return = saved.result_abi_pair_return
+    ir_last_was_ret = saved.last_was_ret
+    ir_emitting_main_body = saved.emitting_main_body
+    ir_current_arc_func = saved.current_arc_func
+    ir_map_value_types = saved.map_value_types
+    ir_closure_return_kinds = saved.closure_return_kinds
+    ir_local_lambda_targets = saved.local_lambda_targets
+    ir_rc_locals = saved.rc_locals
+    ir_rc_local_kinds = saved.rc_local_kinds
+    ir_untracked_rc_binds = saved.untracked_rc_binds
+    ir_kinded_rc_binds = saved.kinded_rc_binds
+    ir_task_owner_locals = saved.task_owner_locals
+    ir_rc_prologue_captures = saved.rc_prologue_captures
+    ir_stack_closure_names = saved.stack_closure_names
+    ir_active_fn_bindings = saved.active_fn_bindings
+    ir_fn_arg_lambda_symbols = saved.fn_arg_lambda_symbols
+    ir_stack_closure_regs = saved.stack_closure_regs
+    ir_tuple_local_tid = saved.tuple_local_tid
+    ir_tuple_cascade_names = saved.tuple_cascade_names
+    ir_stack_tuple_names = saved.stack_tuple_names
+    ir_stack_box_call_idx = saved.stack_box_call_idx
+    ir_stack_box_built = saved.stack_box_built
+    ir_func_local_names = saved.func_local_names
+    ir_weak_capture_names = saved.weak_capture_names
+    ir_getter_consumed_idx = saved.getter_consumed_idx
+    ir_inflight_regs = saved.inflight_regs
+    ir_inflight_kinds = saved.inflight_kinds
+    ir_break_stack = saved.break_stack
+    ir_continue_stack = saved.continue_stack
+    ir_loop_var_slots = saved.loop_var_slots
+    ir_loop_iter_vars = saved.loop_iter_vars
+    ir_loop_iter_kinds = saved.loop_iter_kinds
+    ir_defer_nodes = saved.defer_nodes
+    ir_defer_is_err = saved.defer_is_err
+    ir_defer_loop_slots = saved.defer_loop_slots
+    ir_defer_scope_starts = saved.defer_scope_starts
+    ir_defer_loop_base_stack = saved.defer_loop_base_stack
+    ir_defer_emit_limit = saved.defer_emit_limit
+    ir_counter_steps = saved.counter_steps
+    ir_plain_int_arith = saved.plain_int_arith
+    ir_exact_int_arith = saved.exact_int_arith
+    ir_caught_error_reg = saved.caught_error_reg
+    ir_select_takes_counts = saved.select_takes_counts
+    ir_rcall_defer_idx = saved.rcall_defer_idx
+    ir_rcall_current_idx = saved.rcall_current_idx
+    ir_rcall_pair_ready = saved.rcall_pair_ready
+    ir_rcall_flag_reg = saved.rcall_flag_reg
+    ir_rcall_val_reg = saved.rcall_val_reg
+    ir_match_subject_tid = saved.match_subject_tid
+    ir_match_pin_slot = saved.match_pin_slot
+    ir_match_pin_slot_kind = saved.match_pin_slot_kind
+    ir_tail_match_node = saved.tail_match_node
+    ir_count_marks_seeded = saved.count_marks_seeded
+    ir_decode_partial_regs = saved.decode_partial_regs
+    ir_decode_partial_kinds = saved.decode_partial_kinds
+    ir_decode_partial_floor = saved.decode_partial_floor
+
+# ===========================================================================
+# Module & function lifecycle helpers
+# ===========================================================================
+
+## append the current builder buffer into ir_lambda_bodies.
+pub fn ir_append_deferred_lambda_body():
+    lines := ir_builder_lines()
+    mut bodies: List[String] := ir_lambda_bodies
+    for line in lines:
+        bodies.push(line)
+    ir_lambda_bodies = bodies
+
+## file a global under its name regardless of type so assignments recognize it.
+pub fn ir_record_global_slot(name: String):
+    ir_global_slot_names = ir_push_string(ir_global_slot_names, name)
+
+## file a global under its emission kind for per-function type seeding and O(1) lookup.
+pub fn ir_record_global_type(name: String, global_type: String):
+    if global_type == "int" or global_type == "string" or global_type == "list_string" or global_type == "list" or global_type == "map_int" or global_type == "map" or global_type == "set" or global_type == "set_int" or global_type == "bool":
+        ir_global_kinds.insert(name, global_type)
+
+## seed the current function's variable and map-value type maps from module globals.
+pub fn ir_seed_global_types():
+    for name in ir_global_kinds.keys():
+        ir_var_types.insert(name, ir_global_kinds[name])
+    for name in ir_global_map_value_types.keys():
+        ir_map_value_types.insert(name, ir_global_map_value_types[name])
+
+## clear cached ir_struct_needs_dtor answers when the struct registry resets.
+pub fn ir_reset_dtor_memo():
+    ir_dtor_memo = {}
+
+## declare whether the current function returns the two-register result pair.
+pub fn ir_set_pair_return(active: Bool):
+    ir_result_abi_pair_return = active
+
+## reset all per-module state at emit_ir entry, preserving Tier 1 build config.
+pub fn ir_reset_module_state():
+    ir_builder_reset()
+    ir_builder_set_string_module_count(ir_module_count)
+    ir_var_regs = {}
+    ir_var_types = {}
+    ir_closure_return_kinds = {}
+    ir_local_lambda_targets = {}
+    ir_map_value_types = {}
+    ir_global_kinds = {}
+    ir_global_map_value_types = {}
+    ir_global_slot_names = []
+    ir_mutable_global_names = {}
+    ir_local_struct_names = []
+    ir_reset_dtor_memo()
+    ir_tracer_memo = {}
+    ir_tuple_dtor_sigs = []
+    ir_interface_coercion_bypass = {}
+    ir_optional_tuple_dtor_needed = false
+    ir_tuple_cascade_sigs = []
+    ir_tuple_stack_cascade_sigs = []
+    ir_kinded_release_used = false
+    ir_result_arg_release_sigs = []
+    ir_result_unshare_sigs = []
+    ir_struct_names = {}
+    ir_struct_field_lookup = {}
+    ir_struct_field_index_lookup = {}
+    ir_struct_decl_nodes = {}
+    ir_struct_drop_symbols = {}
+    ir_struct_field_default_nodes = {}
+    ir_impl_methods = {}
+    ir_impl_method_owner = {}
+    ir_import_renames = {}
+    ir_func_returns = {}
+    ir_func_result_ok_kinds = {}
+    ir_result_reg_funcs = {}
+    ir_result_reg_blocked = {}
+    ir_interface_adapters = {}
+    ir_rcall_defer_idx = 0 - 1
+    ir_rcall_current_idx = 0 - 1
+    ir_rcall_pair_ready = false
+    ir_named_fn_value_wrappers = {}
+    ir_module_aliases = {}
+    ir_import_declared_functions = {}
+    ir_import_declared_globals = {}
+    ir_import_mutable_global_symbols = {}
+    ir_current_func_return_kind = ""
+    ir_current_func_optional_inner_kind = ""
+    ir_current_func_returns_result = false
+    ir_current_func_miss_fails = false
+    ir_generic_decl_indices = {}
+    ir_generic_decl_module_paths = {}
+    ir_generic_method_owners = {}
+    ir_generic_method_owner_param_counts = {}
+    ir_generic_specialization_keys = []
+    ir_generic_specialization_names = {}
+    ir_generic_specialization_type_lists = {}
+    ir_generic_emitted_specializations = {}
+    ir_generic_specialization_subst_tids = {}
+    ir_generic_specialization_by_symbol = {}
+    ir_active_generic_params = []
+    ir_active_generic_concrete_types = []
+    ir_active_generic_module_path = ""
+    ir_break_stack = []
+    ir_continue_stack = []
+
+## reset per-function state at the start of emitting a top-level function or method.
+pub fn ir_reset_func_frame(ret_type: String):
+    ir_builder_reset_registers()
+    ir_var_regs = {}
+    ir_var_types = {}
+    ir_closure_return_kinds = {}
+    ir_local_lambda_targets = {}
+    ir_map_value_types = {}
+    ir_rc_locals = []
+    ir_rc_local_kinds = []
+    ir_untracked_rc_binds = []
+    ir_kinded_rc_binds = []
+    ir_task_owner_locals = []
+    ir_tuple_local_tid = {}
+    ir_tuple_cascade_names = []
+    ir_stack_tuple_names = []
+    ir_func_local_names = {}
+    ir_defer_nodes = []
+    ir_defer_is_err = []
+    ir_defer_loop_slots = []
+    ir_defer_scope_starts = []
+    ir_defer_loop_base_stack = []
+    ir_defer_emit_limit = 0 - 1
+    ir_loop_iter_vars = []
+    ir_loop_iter_kinds = []
+    ir_loop_var_slots = {}
+    ir_seed_global_types()
+    if ir_count_marks:
+        ir_count_marks_seeded = {}
+        for name in ir_var_types.keys():
+            ir_count_marks_seeded.insert(name, ir_var_types[name])
+    ir_current_func_return_kind = ret_type
+    ir_set_pair_return(ret_type == "result_reg")
+    ir_current_func_optional_inner_kind = ""
+
+## reset import metadata maps before collecting preloaded roots.
+pub fn ir_reset_import_metadata():
+    ir_import_renames = {}
+    ir_import_declared_functions = {}
+    ir_import_declared_globals = {}
+    ir_import_mutable_global_symbols = {}
+
+## reset phase-one callable, alias, and generic declaration registries.
+pub fn ir_reset_phase_one_metadata():
+    ir_func_returns = {}
+    ir_type_aliases = {}
+    ir_type_alias_nodes = {}
+    ir_generic_decl_indices = {}
+    ir_generic_decl_module_paths = {}
+    ir_generic_method_owners = {}
+    ir_generic_method_owner_param_counts = {}
+
+## reset phase-two struct, impl, interface, and drop registries.
+pub fn ir_reset_phase_two_metadata():
+    ir_local_struct_names = []
+    ir_reset_dtor_memo()
+    ir_tracer_memo = {}
+    ir_struct_names = {}
+    ir_struct_field_lookup = {}
+    ir_struct_field_index_lookup = {}
+    ir_struct_decl_nodes = {}
+    ir_struct_drop_symbols = {}
+    ir_impl_methods = {}
+    ir_impl_method_owner = {}
+    ir_interface_decl_index = {}
+    ir_assoc_bindings = {}
+    ir_type_assoc_names = {}
+
+## reset per-module generic instance destructor maps before emitting bodies.
+pub fn ir_reset_generic_dtor_maps():
+    ir_generic_enum_dtor_base = {}
+    ir_generic_enum_dtor_kinds = {}
+    ir_generic_struct_dtor_base = {}
+    ir_generic_struct_dtor_kinds = {}
+    ir_generic_struct_dtor_drop = {}
+
+## advance module ordinal and consume per-module driver flags at emit_ir exit.
+pub fn ir_finish_module_emit():
+    ir_module_count = ir_module_count + 1
+    ir_preloaded_import_roots = []
+    ir_preloaded_import_paths = []
+    ir_emit_tests = false
+    ir_emitting_test_func = false
+
+# ===========================================================================
+# Small scoped-state helpers (in-flight pins, loop slots, defers, decode, match)
+# ===========================================================================
+
+## push an owned in-flight register onto the early-exit release stack.
+pub fn ir_inflight_push(r: Int, kind: String):
+    ir_inflight_regs.push(r)
+    ir_inflight_kinds.push(kind)
+
+## remove register `r` from the in-flight release stack.
+pub fn ir_inflight_drop(r: Int):
+    mut i := ir_inflight_regs.len() - 1
+    while i >= 0:
+        if ir_inflight_regs[i] == r:
+            ir_inflight_regs.remove(i)
+            ir_inflight_kinds.remove(i)
+            return
+        i = i - 1
+
+## pop the top entry from the in-flight release stack.
+pub fn ir_inflight_pop():
+    ir_inflight_regs.remove(ir_inflight_regs.len() - 1)
+    ir_inflight_kinds.remove(ir_inflight_kinds.len() - 1)
+
+## return the private `for`-loop slot for `name`, or "" if not shadowed by a loop.
+pub fn ir_loop_var_slot(name: String) -> String:
+    if ir_loop_var_slots.contains_key(name):
+        return ir_loop_var_slots[name]
+    return ""
+
+## bind `name` to a loop variable slot and return the previous mapping.
+pub fn ir_loop_var_push(name: String, slot: String) -> String:
+    if name.len() == 0:
+        return ""
+    previous := ir_loop_var_slot(name)
+    ir_loop_var_slots.insert(name, slot)
+    return previous
+
+## restore `name`'s previous loop variable slot mapping.
+pub fn ir_loop_var_pop(name: String, previous: String):
+    if name.len() > 0:
+        ir_loop_var_slots.insert(name, previous)
+
+## the local name a return/fail expression transfers ownership from, or "".
+pub fn ir_returned_local_name(node: Node) -> String:
+    if node.kind != "ident" or ir_loop_var_slot(node.value).len() > 0:
+        return ""
+    return node.value
+
+## the private slot name allocated for one `for` loop variable.
+pub fn ir_loop_var_slot_name(fid: Int, name: String) -> String:
+    return "__loopvar_" + fid.to_string() + "_" + name
+
+## record a block-scope start on the defer stack.
+pub fn ir_defer_push_scope():
+    ir_defer_scope_starts.push(ir_defer_nodes.len())
+
+## register one `defer` (is_err=0) or `errdefer` (is_err=1) statement on the active scope stack.
+pub fn ir_defer_register(stmt_idx: Int, is_err: Int):
+    ir_defer_nodes.push(stmt_idx)
+    ir_defer_is_err.push(is_err)
+    mut snap: Map[String, String] := {}
+    for k in ir_loop_var_slots.keys():
+        snap.insert(k, ir_loop_var_slots[k])
+    ir_defer_loop_slots.push(snap)
+
+## record loop-entry defer depth so break/continue only emit loop-local defers.
+pub fn ir_defer_loop_enter():
+    ir_defer_loop_base_stack.push(ir_defer_nodes.len())
+
+## pop the loop-entry defer depth mark at loop exit.
+pub fn ir_defer_loop_exit():
+    n := ir_defer_loop_base_stack.len()
+    if n > 0:
+        ir_defer_loop_base_stack.remove(n - 1)
+
+## hold a decoded field register until its owning struct is allocated.
+pub fn ir_decode_partial_push(r: Int, kind: String):
+    if kind.len() == 0:
+        return
+    ir_decode_partial_regs.push(r)
+    ir_decode_partial_kinds.push(kind)
+
+## begin holding decoded field values for one struct decode; return previous floor.
+pub fn ir_decode_partial_begin() -> Int:
+    saved := ir_decode_partial_floor
+    ir_decode_partial_floor = ir_decode_partial_regs.len()
+    return saved
+
+## commit held decoded values into their struct and restore the outer floor.
+pub fn ir_decode_partial_end(saved: Int):
+    while ir_decode_partial_regs.len() > ir_decode_partial_floor:
+        ir_decode_partial_regs.remove(ir_decode_partial_regs.len() - 1)
+        ir_decode_partial_kinds.remove(ir_decode_partial_kinds.len() - 1)
+    ir_decode_partial_floor = saved
+
+## ask the next match expression to pin its subject in `slot` under RC `kind`.
+pub fn ir_set_match_pin(slot: String, kind: String):
+    ir_match_pin_slot = slot
+    ir_match_pin_slot_kind = kind
+
+## enter a nested match scope with `subject_tid`, returning the saved outer tid.
+pub fn ir_match_enter(subject_tid: Int) -> Int:
+    saved := ir_match_subject_tid
+    ir_match_subject_tid = subject_tid
+    return saved
+
+## restore the outer match subject tid when leaving a match expression/return.
+pub fn ir_match_leave(saved_tid: Int):
+    ir_match_subject_tid = saved_tid

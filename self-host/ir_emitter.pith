@@ -1,10 +1,11 @@
 # ir_emitter.pith - public IR emitter entrypoint
 #
 # the driver's whole view of the emitter: the per-build and per-module
-# setters and emit_ir. the lowering itself lives in ir_emitter_core and
+# setters and emit_ir. the lowering itself lives in ir_module_emit and ir_lower and
 # its satellites, which can change shape without touching the driver.
 
-import ir_emitter_core as core
+import ir_state as state
+import ir_module_emit as module_emit
 
 # declare the modules this one imports directly, as parallel lists of
 # ast root index and resolved module path. their strings are interned
@@ -12,7 +13,7 @@ import ir_emitter_core as core
 # resolvable names, so a call the checker accepted has a symbol to
 # lower to. emit_ir clears this, so set it again before every module.
 pub fn set_import_roots(roots: List[Int], paths: List[String]):
-    core.set_import_roots(roots, paths)
+    state.set_import_roots(roots, paths)
 
 # declare every module in the build, not just the current module's
 # direct imports. impl-method collection needs the whole graph, since a
@@ -21,14 +22,14 @@ pub fn set_import_roots(roots: List[Int], paths: List[String]):
 # roots, this survives emit_ir. when left empty, impl collection falls
 # back to the direct import roots.
 pub fn set_all_module_roots(roots: List[Int], paths: List[String]):
-    core.set_all_module_roots(roots, paths)
+    state.set_all_module_roots(roots, paths)
 
 # declare the entry file's root. a generic struct's per-instance methods
 # are emitted in the generic's own module, and when a type argument is a
 # type the entry declares, that module needs the entry's impl methods to
 # call them. set once per build.
 pub fn set_entry_root(root: Int):
-    core.set_entry_root(root)
+    state.set_entry_root(root)
 
 # the resolved path of the module about to be emitted; "" for the entry
 # file. it lets an impl target declared in this module win over another
@@ -36,7 +37,7 @@ pub fn set_entry_root(root: Int):
 # emit_ir, so a caller emitting several modules must set it each time
 # or the previous module's path leaks into the next.
 pub fn set_current_module_path(path: String):
-    core.set_current_module_path(path)
+    state.set_current_module_path(path)
 
 # switch the next emit_ir to a test build: `test` blocks are lowered to
 # functions and a generated main runs them, while the module's own main
@@ -44,19 +45,19 @@ pub fn set_current_module_path(path: String):
 # off, so set it per module, and only for the module under test, which
 # is why imported modules are emitted with it false.
 pub fn set_test_mode(enabled: Bool):
-    core.set_test_mode(enabled)
+    state.set_test_mode(enabled)
 
 # add the count checker's `mark` lines to everything emitted after this.
 # see docs/ir-contract.md.
 pub fn set_count_marks(enabled: Bool):
-    core.set_count_marks(enabled)
+    state.set_count_marks(enabled)
 
 # the path of the file under test, as it was named on the command line.
 # a test build reports it with every result and names it as the file of a
 # failing assertion's position, neither of which the built binary could
 # work out for itself. set once per build; emit_ir does not clear it.
 pub fn set_test_source_file(path: String):
-    core.set_test_source_file(path)
+    state.set_test_source_file(path)
 
 # lower one checked module, given its ast root, to text ir as
 # newline-joined lines. the module must already have passed the
@@ -69,4 +70,4 @@ pub fn set_test_source_file(path: String):
 # per module; per-module state is reset on entry and the import roots
 # and test mode are consumed on the way out.
 pub fn emit_ir(root_idx: Int) -> String:
-    return core.emit_ir(root_idx)
+    return module_emit.emit_ir(root_idx)

@@ -1,0 +1,778 @@
+# ir_primitives.pith: low-level IR instruction emission primitives
+#
+# consolidates call/label emission, literals, operators, field loads,
+# RC retain/release/visit/kinded ops, optionals, weak reads, Result ABI
+# helpers, Result control-flow branches, and struct-result packing.
+
+from ast import Node, get_node
+from checker import c_get_expr_type
+from lexer import int_literal_value
+from types import get_type_info, get_type_name
+from ir_builder import ir_emit, ir_reg, ir_str, ir_label, ir_new_temp_name, ir_zero_reg
+from ir_common import ir_parse_field_index, ir_unpack_field_index
+from ir_metadata import ir_runtime_call_name
+from ir_state import ir_last_was_ret, ir_var_types, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_boxed_enums, ir_kinded_release_symbol, ir_kinded_release_used, ir_result_reg_funcs, ir_func_result_ok_kinds, ir_result_abi_pair_return, ir_decode_partial_regs, ir_decode_partial_kinds, ir_decode_partial_floor
+from ir_types import ir_is_declared_callable, ir_retkind, ir_resolve_type_hint, ir_type_from_tid, ir_struct_base_name, ir_struct_needs_dtor
+
+# ===========================================================================
+# Call & label emission
+# ===========================================================================
+
+## emit one `call` line, giving user declarations priority over runtime names.
+pub fn ir_emit_call_text(result_reg: Int, fname: String, ret_type: String, arg_count: Int, arg_text: String):
+    mut emit_name := fname
+    if not ir_is_declared_callable(fname):
+        emit_name = ir_runtime_call_name(fname)
+    if fname == "tcp_read" and arg_count == 2:
+        emit_name = "tcp_read2"
+    mut call_line := "call " + result_reg.to_string() + " " + emit_name + " " + ir_retkind(ret_type) + " " + arg_count.to_string()
+    if arg_text.len() > 0:
+        call_line = call_line + arg_text
+    ir_emit(call_line)
+
+## emit a zero-argument call.
+pub fn ir_emit_call0(result_reg: Int, fname: String, ret_type: String):
+    ir_emit_call_text(result_reg, fname, ret_type, 0, "")
+
+## emit a one-argument call.
+pub fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int):
+    ir_emit_call_text(result_reg, fname, ret_type, 1, " " + arg0.to_string())
+
+## emit a two-argument call.
+pub fn ir_emit_call2(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int):
+    ir_emit_call_text(result_reg, fname, ret_type, 2, " " + arg0.to_string() + " " + arg1.to_string())
+
+## emit a three-argument call.
+pub fn ir_emit_call3(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int, arg2: Int):
+    ir_emit_call_text(result_reg, fname, ret_type, 3, " " + arg0.to_string() + " " + arg1.to_string() + " " + arg2.to_string())
+
+## emit a four-argument call.
+pub fn ir_emit_call4(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int, arg2: Int, arg3: Int):
+    ir_emit_call_text(result_reg, fname, ret_type, 4, " " + arg0.to_string() + " " + arg1.to_string() + " " + arg2.to_string() + " " + arg3.to_string())
+
+## emit a raw runtime call line mapped unconditionally through ir_runtime_call_name.
+pub fn ir_emit_call_text_raw(result_reg: Int, fname: String, ret_kind: String, arg_count: Int, arg_text: String):
+    mut call_line := "call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " " + arg_count.to_string()
+    if arg_text.len() > 0:
+        call_line = call_line + arg_text
+    ir_emit(call_line)
+
+## emit a raw zero-argument runtime call.
+pub fn ir_emit_call0_raw(result_reg: Int, fname: String, ret_kind: String):
+    ir_emit_call_text_raw(result_reg, fname, ret_kind, 0, "")
+
+## emit a raw one-argument runtime call.
+pub fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
+    ir_emit_call_text_raw(result_reg, fname, ret_kind, 1, " " + arg0.to_string())
+
+## emit a raw two-argument runtime call.
+pub fn ir_emit_call2_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int, arg1: Int):
+    ir_emit_call_text_raw(result_reg, fname, ret_kind, 2, " " + arg0.to_string() + " " + arg1.to_string())
+
+## render argument registers with leading spaces for appending onto a call line.
+pub fn ir_join_arg_regs(arg_regs: List[Int]) -> String:
+    mut call_text := ""
+    for arg_reg in arg_regs:
+        call_text = call_text + " " + arg_reg.to_string()
+    return call_text
+
+## prepend receiver register `obj_r` onto a copy of `arg_regs`.
+pub fn ir_method_call_arg_regs(obj_r: Int, arg_regs: List[Int]) -> List[Int]:
+    mut call_args := [obj_r]
+    for arg_reg in arg_regs:
+        call_args.push(arg_reg)
+    return call_args
+
+## unwrap an `arg` wrapper node to its underlying expression node index.
+pub fn ir_call_arg_expr_index(arg_idx: Int) -> Int:
+    arg_node := get_node(arg_idx)
+    if arg_node.kind == "arg" and arg_node.children.len() > 0:
+        return arg_node.children[0]
+    return arg_idx
+
+## emit a basic-block label and reset return tracking.
+pub fn ir_emit_label(l: String):
+    ir_emit("label " + l)
+    ir_last_was_ret = false
+
+## emit a cold basic-block label (laid out after hot blocks by the backend).
+pub fn ir_emit_cold_label(l: String):
+    ir_emit("label " + l + " cold")
+    ir_last_was_ret = false
+
+# ===========================================================================
+# Literals & scalar operators
+# ===========================================================================
+
+## materialize an integer literal node into a fresh register.
+pub fn ir_emit_int_literal(node: Node) -> Int:
+    return ir_emit_int_literal_text(node.value)
+
+## materialize integer literal text into a fresh register.
+pub fn ir_emit_int_literal_text(text: String) -> Int:
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " " + int_literal_value(text).to_string())
+    return r
+
+## materialize a string literal node as a strref in a fresh register.
+pub fn ir_emit_string_literal(node: Node) -> Int:
+    si := ir_str(node.value)
+    r := ir_reg()
+    ir_emit("strref " + r.to_string() + " " + si)
+    return r
+
+## materialize a float literal node as an fconst in a fresh register.
+pub fn ir_emit_float_literal(node: Node) -> Int:
+    r := ir_reg()
+    ir_emit("fconst " + r.to_string() + " " + node.value)
+    return r
+
+## materialize a bool literal node (1 for true, 0 for false) in a fresh register.
+pub fn ir_emit_bool_literal(node: Node) -> Int:
+    r := ir_reg()
+    if node.value == "true":
+        ir_emit("iconst " + r.to_string() + " 1")
+    else:
+        ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
+## emit a unary operator (`not`, `negate`) into a fresh register.
+pub fn ir_emit_unary_op(op: String, operand_r: Int) -> Int:
+    r := ir_reg()
+    if op == "not":
+        one := ir_reg()
+        ir_emit("iconst " + one.to_string() + " 1")
+        ir_emit("sub " + r.to_string() + " " + one.to_string() + " " + operand_r.to_string())
+    elif op == "negate":
+        zero := ir_reg()
+        ir_emit("iconst " + zero.to_string() + " 0")
+        ir_emit("sub " + r.to_string() + " " + zero.to_string() + " " + operand_r.to_string())
+    else:
+        ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
+## emit one three-address binary instruction.
+pub fn ir_emit_simple_binary(result_reg: Int, op: String, left_r: Int, right_r: Int):
+    ir_emit(op + " " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+
+## true for binary operators with dedicated `f`-prefixed float opcodes.
+pub fn ir_is_float_arithmetic(op: String) -> Bool:
+    return op == "add" or op == "sub" or op == "mul" or op == "div"
+
+## emit the `f`-prefixed floating-point binary instruction.
+pub fn ir_emit_float_binary(result_reg: Int, op: String, left_r: Int, right_r: Int):
+    ir_emit("f" + op + " " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+
+## map an AST binary operator name to its single-instruction IR opcode, or "".
+pub fn ir_binary_simple_ir_op(op: String) -> String:
+    if op == "add" or op == "sub" or op == "mul" or op == "div" or op == "mod" or op == "lt" or op == "gt" or op == "lte" or op == "gte" or op == "shl" or op == "shr":
+        return op
+    if op == "bit_and":
+        return "band"
+    if op == "bit_or":
+        return "bor"
+    if op == "bit_xor":
+        return "bxor"
+    return ""
+
+## map a compound-assignment token (`+=`, `-=`, `*=`, `/=`) to its IR opcode, or "".
+pub fn ir_compound_assignment_ir_op(op: String) -> String:
+    if op == "+=":
+        return "add"
+    if op == "-=":
+        return "sub"
+    if op == "*=":
+        return "mul"
+    if op == "/=":
+        return "div"
+    return ""
+
+# ===========================================================================
+# Field access emission
+# ===========================================================================
+
+## byte offset of `field_name` if unambiguous across all registered structs, else -1.
+pub fn ir_unique_field_offset(field_name: String) -> Int:
+    keys := ir_struct_field_index_lookup.keys()
+    mut matched := false
+    mut offset := 0
+    for key in keys:
+        if key.ends_with("." + field_name):
+            next_offset := ir_unpack_field_index(ir_struct_field_index_lookup[key]) * 8
+            if not matched:
+                matched = true
+                offset = next_offset
+            elif offset != next_offset:
+                return 0 - 1
+            continue
+    if not matched:
+        return 0 - 1
+    return offset
+
+## emission kind of `field_name` if unambiguous across all registered structs, else "unknown".
+pub fn ir_unique_field_kind(field_name: String) -> String:
+    keys := ir_struct_field_lookup.keys()
+    mut matched := false
+    mut field_kind := "unknown"
+    for key in keys:
+        if key.ends_with("." + field_name):
+            next_kind := ir_retkind(ir_struct_field_lookup[key])
+            if not matched:
+                matched = true
+                field_kind = next_kind
+            elif field_kind != next_kind:
+                return "unknown"
+            continue
+    return field_kind
+
+## emit a `field` load on a named struct or result box.
+pub fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: String, field_name: String, field_kind_override: String):
+    if ir_struct_field_index_lookup.contains_key(lookup_key):
+        field_offset := ir_unpack_field_index(ir_struct_field_index_lookup[lookup_key]) * 8
+        mut field_kind := "unknown"
+        if field_kind_override.len() > 0:
+            field_kind = field_kind_override
+        elif ir_struct_field_lookup.contains_key(lookup_key):
+            field_kind = ir_retkind(ir_struct_field_lookup[lookup_key])
+        ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_offset.to_string() + " " + field_kind + " " + field_name)
+    else:
+        unique_offset := ir_unique_field_offset(field_name)
+        if unique_offset >= 0:
+            unique_kind := ir_unique_field_kind(field_name)
+            ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + unique_offset.to_string() + " " + unique_kind + " " + field_name)
+        elif field_name == "is_ok" or field_name == "is_err" or field_name == "ok" or field_name == "err":
+            if field_name == "is_err":
+                flag_r := ir_reg()
+                ir_emit("field " + flag_r.to_string() + " " + obj_r.to_string() + " 0 bool is_ok")
+                zero_r := ir_reg()
+                ir_emit("iconst " + zero_r.to_string() + " 0")
+                ir_emit("eq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
+            else:
+                mut offset := 0
+                mut kind := "bool"
+                if field_name == "ok":
+                    offset = 8
+                    kind = "unknown"
+                elif field_name == "err":
+                    offset = 16
+                    kind = "unknown"
+                ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + offset.to_string() + " " + kind + " " + field_name)
+        else:
+            ir_emit("iconst " + result_reg.to_string() + " 0")
+
+## emit a tuple element read (`t.0`, `t.1`), returning true if handled.
+pub fn ir_emit_tuple_field_access(result_reg: Int, obj_r: Int, recv_idx: Int, field_name: String) -> Bool:
+    recv_tid := c_get_expr_type(recv_idx)
+    if recv_tid < 0:
+        return false
+    recv_info := get_type_info(recv_tid)
+    if recv_info.kind != "tuple":
+        return false
+    field_index := ir_parse_field_index(field_name)
+    if field_index < 0 or field_index >= recv_info.elements.len():
+        return false
+    field_tid := recv_info.elements[field_index]
+    field_offset := field_index * 8
+    ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_offset.to_string() + " " + ir_type_from_tid(field_tid) + " " + field_name)
+    return true
+
+# ===========================================================================
+# Ownership: RC retain, release, cycle-collector visit, and kinded locals
+# ===========================================================================
+
+## retain the string in register `r`.
+pub fn ir_string_retain_reg(r: Int):
+    ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
+
+## release the string in register `r`.
+pub fn ir_string_release_reg(r: Int):
+    ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
+
+## true when `kind` lives behind a struct header (`struct` or `tuple`).
+pub fn ir_kind_is_struct_header(kind: String) -> Bool:
+    return kind == "struct" or kind == "tuple"
+
+## true when `kind` names a reference-counted value.
+pub fn ir_rc_release_enabled(kind: String) -> Bool:
+    return kind.len() > 0
+
+## emit a retain call for register `r` of RC `kind`.
+pub fn ir_rc_retain_reg(r: Int, kind: String):
+    if kind == "string":
+        ir_string_retain_reg(r)
+    elif kind == "list":
+        ir_emit_call1(ir_reg(), "pith_list_retain_handle", "void", r)
+    elif kind == "map":
+        ir_emit_call1(ir_reg(), "pith_map_retain_handle", "void", r)
+    elif kind == "set":
+        ir_emit_call1(ir_reg(), "pith_set_retain_handle", "void", r)
+    elif kind == "bytes":
+        ir_emit_call1(ir_reg(), "pith_bytes_retain", "void", r)
+    elif ir_kind_is_struct_header(kind):
+        ir_emit_call1(ir_reg(), "pith_struct_retain", "void", r)
+    elif kind == "closure":
+        ir_emit_call1(ir_reg(), "pith_closure_retain", "void", r)
+    elif kind == "channel":
+        ir_emit_call1(ir_reg(), "pith_channel_retain", "void", r)
+    elif kind == "sync":
+        ir_emit_call1(ir_reg(), "pith_sync_retain", "void", r)
+    elif kind == "weak":
+        ir_emit_call1(ir_reg(), "pith_struct_weak_retain", "void", r)
+
+## runtime cycle-collector child kind code for `kind`, or 0 if non-visitable.
+pub fn ir_cc_visit_code(kind: String) -> Int:
+    if kind == "string":
+        return 1
+    if kind == "list":
+        return 2
+    if kind == "map":
+        return 3
+    if kind == "set":
+        return 4
+    if kind == "bytes":
+        return 5
+    if ir_kind_is_struct_header(kind):
+        return 6
+    if kind == "closure":
+        return 7
+    return 0
+
+## report an RC child register to the cycle collector's visit callback.
+pub fn ir_rc_visit_reg(r: Int, kind: String):
+    code := ir_cc_visit_code(kind)
+    if code == 0:
+        return
+    code_r := ir_reg()
+    ir_emit("iconst " + code_r.to_string() + " " + code.to_string())
+    ir_emit_call2(ir_reg(), "pith_cc_visit", "void", r, code_r)
+
+## emit a release call for register `r` of RC `kind`.
+pub fn ir_rc_release_reg(r: Int, kind: String):
+    if kind == "string":
+        ir_string_release_reg(r)
+    elif kind == "list":
+        ir_emit_call1(ir_reg(), "pith_list_release_handle", "void", r)
+    elif kind == "map":
+        ir_emit_call1(ir_reg(), "pith_map_release_handle", "void", r)
+    elif kind == "set":
+        ir_emit_call1(ir_reg(), "pith_set_release_handle", "void", r)
+    elif kind == "bytes":
+        ir_emit_call1(ir_reg(), "pith_bytes_release", "void", r)
+    elif ir_kind_is_struct_header(kind):
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
+    elif kind == "closure":
+        ir_emit_call1(ir_reg(), "pith_closure_release", "void", r)
+    elif kind == "channel":
+        ir_emit_call1(ir_reg(), "pith_channel_release", "void", r)
+    elif kind == "sync":
+        ir_emit_call1(ir_reg(), "pith_sync_release", "void", r)
+    elif kind == "weak":
+        ir_emit_call1(ir_reg(), "pith_struct_weak_release", "void", r)
+
+## side-slot kind code for dynamically tracked mixed-kind locals (0 = uncounted).
+pub fn ir_kinded_code(kind: String) -> Int:
+    if kind == "string":
+        return 1
+    if kind == "list":
+        return 2
+    if kind == "map":
+        return 3
+    if kind == "set":
+        return 4
+    if kind == "bytes":
+        return 5
+    if ir_kind_is_struct_header(kind):
+        return 6
+    if kind == "closure":
+        return 7
+    if kind == "channel":
+        return 8
+    if kind == "sync":
+        return 9
+    return 0
+
+## map a kinded-local side-slot code back to its RC kind, or "".
+pub fn ir_kinded_code_kind(code: Int) -> String:
+    kinds := ["", "string", "list", "map", "set", "bytes", "struct", "closure", "channel", "sync"]
+    if code < 0 or code >= kinds.len():
+        return ""
+    return kinds[code]
+
+## one past the highest code ir_kinded_code returns.
+pub fn ir_kinded_code_count() -> Int:
+    return 10
+
+## side-slot storage name holding the RC kind code for a mixed-kind local.
+pub fn ir_kinded_tag_slot(name: String) -> String:
+    return "__rck_" + name
+
+## release whatever value a mixed-kind local currently holds via the module dispatch helper.
+pub fn ir_kinded_release_slot(name: String):
+    val_r := ir_reg()
+    ir_emit("load " + val_r.to_string() + " " + name)
+    code_r := ir_reg()
+    ir_emit("load " + code_r.to_string() + " " + ir_kinded_tag_slot(name))
+    ir_kinded_release_used = true
+    ir_emit_call2(ir_reg(), ir_kinded_release_symbol, "void", val_r, code_r)
+
+## release the previous value of a mixed-kind local and store its new kind code.
+pub fn ir_kinded_rebind(name: String, kind: String):
+    ir_kinded_release_slot(name)
+    code_r := ir_reg()
+    ir_emit("iconst " + code_r.to_string() + " " + ir_kinded_code(kind).to_string())
+    ir_emit("store " + ir_kinded_tag_slot(name) + " " + code_r.to_string())
+
+# ===========================================================================
+# Optionals & weak references
+# ===========================================================================
+
+## emit `optflag` to test whether an optional shell is Some (1) or none (0).
+pub fn ir_optional_flag_field(obj_r: Int) -> Int:
+    r := ir_reg()
+    ir_emit("optflag " + r.to_string() + " " + obj_r.to_string())
+    return r
+
+## load the payload of an optional shell using `opt_tid`'s inner kind.
+pub fn ir_optional_value_field(obj_r: Int, opt_tid: Int) -> Int:
+    info := get_type_info(opt_tid)
+    if info.kind != "optional" or info.inner < 0:
+        return ir_zero_reg()
+    return ir_optional_value_as(obj_r, ir_type_from_tid(info.inner))
+
+## load the payload of an optional shell under an explicit IR `kind`.
+pub fn ir_optional_value_as(obj_r: Int, kind: String) -> Int:
+    r := ir_reg()
+    ir_emit("optval " + r.to_string() + " " + obj_r.to_string() + " " + kind + " value")
+    return r
+
+## emit `optional == none` or `!= none` into `result_reg`.
+pub fn ir_emit_optional_none_compare(result_reg: Int, op: String, optional_r: Int):
+    flag_r := ir_optional_flag_field(optional_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    if op == "eq":
+        ir_emit("eq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
+    else:
+        ir_emit("neq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
+
+## emit structural equality between two Optionals of type `opt_tid`.
+pub fn ir_emit_optional_optional_compare(result_reg: Int, op: String, left_r: Int, right_r: Int, opt_tid: Int):
+    info := get_type_info(opt_tid)
+    lf := ir_optional_flag_field(left_r)
+    rf := ir_optional_flag_field(right_r)
+    lv := ir_optional_value_field(left_r, opt_tid)
+    rv := ir_optional_value_field(right_r, opt_tid)
+    flag_eq := ir_reg()
+    ir_emit("eq " + flag_eq.to_string() + " " + lf.to_string() + " " + rf.to_string())
+    val_eq := ir_emit_inner_value_eq(info.inner, lv, rv)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    both_none := ir_reg()
+    ir_emit("eq " + both_none.to_string() + " " + lf.to_string() + " " + zero_r.to_string())
+    tail := ir_reg()
+    ir_emit("or " + tail.to_string() + " " + both_none.to_string() + " " + val_eq.to_string())
+    ir_emit_guarded_eq(result_reg, op, flag_eq, tail)
+
+## emit `opt == plain_val` or `opt != plain_val`.
+pub fn ir_emit_optional_plain_compare(result_reg: Int, op: String, opt_r: Int, plain_r: Int, opt_tid: Int):
+    info := get_type_info(opt_tid)
+    flag := ir_optional_flag_field(opt_r)
+    value := ir_optional_value_field(opt_r, opt_tid)
+    val_eq := ir_emit_inner_value_eq(info.inner, value, plain_r)
+    ir_emit_guarded_eq(result_reg, op, flag, val_eq)
+
+## emit equality matching Pith `==` semantics for type `tid`.
+pub fn ir_emit_value_eq_for_tid(tid: Int, a_r: Int, b_r: Int) -> Int:
+    info := get_type_info(tid)
+    if info.kind == "optional":
+        out_r := ir_reg()
+        ir_emit_optional_optional_compare(out_r, "eq", a_r, b_r, tid)
+        return out_r
+    return ir_emit_inner_value_eq(tid, a_r, b_r)
+
+fn ir_emit_inner_value_eq(inner_tid: Int, a_r: Int, b_r: Int) -> Int:
+    inner_kind := ir_type_from_tid(inner_tid)
+    inner_name := get_type_name(inner_tid)
+    val_eq := ir_reg()
+    if inner_kind == "string":
+        str_eq_name := ir_runtime_call_name("__str_eq")
+        ir_emit("call " + val_eq.to_string() + " " + str_eq_name + " bool 2 " + a_r.to_string() + " " + b_r.to_string())
+    elif inner_kind == "bytes":
+        ir_emit_call2(val_eq, "bytes_eq", "bool", a_r, b_r)
+    elif ir_boxed_enums.contains_key(inner_name):
+        ir_emit_call2(val_eq, "__enum_eq_" + inner_name, "bool", a_r, b_r)
+    else:
+        ir_emit("eq " + val_eq.to_string() + " " + a_r.to_string() + " " + b_r.to_string())
+    return val_eq
+
+fn ir_emit_guarded_eq(result_reg: Int, op: String, guard_r: Int, val_eq_r: Int):
+    if op == "eq":
+        ir_emit("and " + result_reg.to_string() + " " + guard_r.to_string() + " " + val_eq_r.to_string())
+    else:
+        eq_result := ir_reg()
+        ir_emit("and " + eq_result.to_string() + " " + guard_r.to_string() + " " + val_eq_r.to_string())
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        ir_emit("neq " + result_reg.to_string() + " " + eq_result.to_string() + " " + one_r.to_string())
+
+fn ir_emit_some_shell(value_r: Int) -> Int:
+    flag_r := ir_reg()
+    ir_emit("iconst " + flag_r.to_string() + " 1")
+    tuple_r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " 2")
+    ir_emit_call1_raw(tuple_r, "__struct_alloc", "tuple", field_count_r)
+    ir_emit("sstore " + tuple_r.to_string() + " 0 " + flag_r.to_string())
+    ir_emit("sstore " + tuple_r.to_string() + " 1 " + value_r.to_string())
+    return tuple_r
+
+## emit a `none` optional value (null pointer).
+pub fn ir_emit_optional_none_value() -> Int:
+    return ir_zero_reg()
+
+## wrap `value_r` in a non-owning Some shell.
+pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
+    return ir_emit_some_shell(value_r)
+
+## atomically upgrade a weak local pointer into an owning `T?` optional.
+pub fn ir_emit_weak_read(raw_r: Int) -> Int:
+    alive_r := ir_reg()
+    ir_emit("call " + alive_r.to_string() + " pith_struct_weak_upgrade int 1 " + raw_r.to_string())
+    return ir_emit_weak_shell(alive_r)
+
+## atomically load and upgrade a weak struct field into an owning `T?` optional.
+pub fn ir_emit_weak_field_read(obj_r: Int, offset: Int) -> Int:
+    off_r := ir_reg()
+    ir_emit("iconst " + off_r.to_string() + " " + offset.to_string())
+    alive_r := ir_reg()
+    ir_emit("call " + alive_r.to_string() + " pith_struct_weak_load_field int 2 " + obj_r.to_string() + " " + off_r.to_string())
+    return ir_emit_weak_shell(alive_r)
+
+fn ir_emit_weak_shell(alive_r: Int) -> Int:
+    tmp := ir_new_temp_name("weak_read")
+    ir_emit("store " + tmp + " " + alive_r.to_string())
+    some_l := ir_label()
+    done_l := ir_label()
+    ir_emit("brif " + alive_r.to_string() + " " + some_l + " " + done_l)
+    ir_emit_label(some_l)
+    shell_r := ir_emit_optional_owned_some(alive_r, "struct")
+    ir_emit("store " + tmp + " " + shell_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit_label(done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + tmp)
+    return r
+
+## wrap `value_r` in a Some shell that owns its RC payload via `__opt_dtor_<kind>`.
+pub fn ir_emit_optional_owned_some(value_r: Int, payload_kind: String) -> Int:
+    tuple_r := ir_emit_some_shell(value_r)
+    ir_emit_optional_attach_dtor(tuple_r, payload_kind)
+    return tuple_r
+
+## attach `__opt_dtor_<payload_kind>` to an existing optional shell.
+pub fn ir_emit_optional_attach_dtor(tuple_r: Int, payload_kind: String):
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " __opt_dtor_" + payload_kind)
+    dr := ir_reg()
+    ir_emit("call " + dr.to_string() + " pith_struct_set_dtor void 2 " + tuple_r.to_string() + " " + fr.to_string())
+
+# ===========================================================================
+# Struct result packing, Result ABI, and Result control-flow branches
+# ===========================================================================
+
+fn ir_emit_attach_result_dtor(struct_r: Int, struct_kind: String):
+    if not struct_kind.starts_with("struct:"):
+        return
+    raw_name := struct_kind.substring(7, struct_kind.len())
+    if raw_name == "tuple" or not ir_struct_needs_dtor(raw_name):
+        return
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " __dtor_" + ir_struct_base_name(raw_name))
+    ir_emit("call " + ir_reg().to_string() + " pith_struct_set_dtor void 2 " + struct_r.to_string() + " " + fr.to_string())
+
+fn ir_emit_result_tuple_raw(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " 3")
+    result_r := ir_reg()
+    ir_emit_call1_raw(result_r, "__struct_alloc", "struct:tuple", count_r)
+    ir_emit("sstore " + result_r.to_string() + " 0 " + is_ok_r.to_string())
+    ir_emit("sstore " + result_r.to_string() + " 1 " + ok_r.to_string())
+    ir_emit("sstore " + result_r.to_string() + " 2 " + err_r.to_string())
+    return result_r
+
+## build a 3-slot ok Result box around `ok_r`.
+pub fn ir_emit_ok_result_tuple_raw(ok_r: Int) -> Int:
+    one := ir_reg()
+    ir_emit("iconst " + one.to_string() + " 1")
+    return ir_emit_result_tuple_raw(one, ok_r, ir_zero_reg())
+
+## build a 3-slot error Result box around `err_r`.
+pub fn ir_emit_err_result_tuple_raw(err_r: Int) -> Int:
+    zero := ir_zero_reg()
+    return ir_emit_result_tuple_raw(zero, zero, err_r)
+
+## allocate a struct from `field_regs`, attach its dtor, wrap in ok box, and store into `temp_name`.
+pub fn ir_emit_struct_result_store(field_regs: List[Int], struct_kind: String, temp_name: String):
+    struct_r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + field_regs.len().to_string())
+    ir_emit_call1_raw(struct_r, "__struct_alloc", struct_kind, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + struct_r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit_attach_result_dtor(struct_r, struct_kind)
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(struct_r).to_string())
+
+## allocate a struct from `field_regs`, attach its dtor, return its ok box, and emit `endfunc`.
+pub fn ir_emit_struct_result_return(field_regs: List[Int], struct_kind: String):
+    struct_r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + field_regs.len().to_string())
+    ir_emit_call1_raw(struct_r, "__struct_alloc", struct_kind, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + struct_r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit_attach_result_dtor(struct_r, struct_kind)
+    result_r := ir_emit_ok_result_tuple_raw(struct_r)
+    ir_emit("ret " + result_r.to_string())
+    ir_emit("endfunc")
+
+## true when a fallible call uses a single-register sentinel result kind.
+pub fn ir_uses_result_abi(result_kind: String) -> Bool:
+    return result_kind.len() > 0 and result_kind != "tuple"
+
+## emit an rcall to a pair-returning function and fold (flag, payload) into a result box in `result_reg`.
+pub fn ir_emit_registered_rcall_boxed_into(result_reg: Int, fname: String, arg_count: Int, arg_text: String):
+    flag_r := ir_reg()
+    val_r := ir_reg()
+    mut payload_kind := "int"
+    if ir_func_result_ok_kinds.contains_key(fname):
+        payload_kind = ir_func_result_ok_kinds[fname]
+    mut line := "rcall " + flag_r.to_string() + " " + val_r.to_string() + " " + fname + " " + payload_kind + " " + arg_count.to_string()
+    if arg_text.len() > 0:
+        line = line + arg_text
+    ir_emit(line)
+    temp_name := ir_new_temp_name("rreg_box")
+    ir_var_types.insert(temp_name, "tuple")
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + ok_l)
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(val_r).to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit("label " + err_l)
+    ir_emit("store " + temp_name + " " + ir_emit_err_result_tuple_raw(val_r).to_string())
+    ir_emit("label " + merge_l)
+    ir_emit("load " + result_reg.to_string() + " " + temp_name)
+
+## return a known error result box, unpacking to ret2 when the current function uses the pair ABI.
+pub fn ir_emit_ret_known_err_box(result_r: Int):
+    if not ir_result_abi_pair_return:
+        ir_emit("ret " + result_r.to_string())
+        return
+    err_r := ir_reg()
+    ir_emit("field " + err_r.to_string() + " " + result_r.to_string() + " 16 unknown err")
+    rel_r := ir_reg()
+    ir_emit("call " + rel_r.to_string() + " pith_struct_release void 1 " + result_r.to_string())
+    zf_r := ir_reg()
+    ir_emit("iconst " + zf_r.to_string() + " 0")
+    ir_emit("ret2 " + zf_r.to_string() + " " + err_r.to_string())
+
+## unbias a single-register `+1` sentinel ok value.
+pub fn ir_decode_result_value(value_reg: Int, result_kind: String) -> Int:
+    if ir_uses_result_abi(result_kind):
+        one := ir_reg()
+        ir_emit("iconst " + one.to_string() + " 1")
+        decoded := ir_reg()
+        ir_emit("sub " + decoded.to_string() + " " + value_reg.to_string() + " " + one.to_string())
+        return decoded
+    return value_reg
+
+## load a result box's `is_ok` flag (negated for `is_err`).
+pub fn ir_emit_result_flag_field(obj_r: Int, fname: String) -> Int:
+    flag_r := ir_reg()
+    ir_emit("field " + flag_r.to_string() + " " + obj_r.to_string() + " 0 bool is_ok")
+    if fname == "is_ok":
+        return flag_r
+    zero := ir_zero_reg()
+    r := ir_reg()
+    ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero.to_string())
+    return r
+
+## load the interned `"<callee> failed"` message for a sentinel builtin failure.
+pub fn ir_emit_result_error_message(callee_name: String) -> Int:
+    msg_r := ir_reg()
+    ir_emit("strref " + msg_r.to_string() + " " + ir_str(callee_name + " failed"))
+    return msg_r
+
+## IR kind for a slot (`is_ok`, `is_err`, `ok`, `err`) of a Result tid.
+pub fn ir_result_field_kind(obj_tid: Int, fname: String) -> String:
+    if obj_tid < 0:
+        if fname == "is_ok" or fname == "is_err":
+            return "bool"
+        return "unknown"
+    obj_info := get_type_info(obj_tid)
+    if obj_info.kind != "result":
+        if fname == "is_ok" or fname == "is_err":
+            return "bool"
+        return "unknown"
+    if fname == "ok":
+        return ir_type_from_tid(obj_info.inner)
+    if fname == "err":
+        return ir_type_from_tid(obj_info.value_type)
+    return "bool"
+
+## load the `ok` (offset 8) or `err` (offset 16) slot from a Result box.
+pub fn ir_emit_result_value_field(obj_r: Int, obj_tid: Int, fname: String) -> Int:
+    mut offset := 8
+    if fname == "err":
+        offset = 16
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + offset.to_string() + " " + ir_result_field_kind(obj_tid, fname) + " " + fname)
+    return r
+
+## load the `ok` slot (offset 8) typed by the payload's own tid.
+pub fn ir_emit_json_field_ok(result_r: Int, field_tid: Int) -> Int:
+    ok_r := ir_reg()
+    ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_type_from_tid(field_tid) + " ok")
+    return ok_r
+
+## load the `ok` slot (offset 8) typed by a written type name (alias-aware).
+pub fn ir_emit_result_ok_field_typed(result_r: Int, field_type_name: String) -> Int:
+    ok_r := ir_reg()
+    ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_resolve_type_hint(field_type_name) + " ok")
+    return ok_r
+
+## branch on `result_r`: on err store into `temp_name` and jump to `done_l`; continue on ok.
+pub fn ir_emit_result_store_error_branch(result_r: Int, temp_name: String, done_l: String):
+    ok_flag_r := ir_emit_result_flag_field(result_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + err_l)
+    ir_emit("store " + temp_name + " " + result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + ok_l)
+
+## branch on a struct-decode field result: on err release earlier decoded fields, store into `temp_name`, jump to `done_l`.
+pub fn ir_emit_decode_field_error_branch(result_r: Int, temp_name: String, done_l: String):
+    ok_flag_r := ir_emit_result_flag_field(result_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + err_l)
+    for held_r, hi in ir_decode_partial_regs:
+        if hi >= ir_decode_partial_floor:
+            ir_rc_release_reg(held_r, ir_decode_partial_kinds[hi])
+    ir_emit("store " + temp_name + " " + result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + ok_l)
+
+## branch on `result_r`: on err return the error box immediately; continue on ok.
+pub fn ir_emit_result_return_error_branch(result_r: Int):
+    ok_flag_r := ir_emit_result_flag_field(result_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + err_l)
+    ir_emit_ret_known_err_box(result_r)
+    ir_emit("label " + ok_l)

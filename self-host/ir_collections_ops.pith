@@ -1,0 +1,533 @@
+# ir_collections_ops.pith: collection runtime dispatch names, list higher-order
+# & query loop emitters, and dotted-path traversal emitters.
+#
+# consolidates ir_collection_helpers, ir_list_helpers, and ir_path_helpers.
+
+from ast import get_node, Node
+from ir_builder import ir_emit, ir_reg, ir_label, ir_str
+from ir_state import ir_map_value_types, ir_result_reg_funcs
+from ir_primitives import ir_emit_call_text_raw, ir_emit_call0_raw, ir_emit_call1_raw, ir_emit_call2_raw, ir_emit_value_eq_for_tid, ir_rc_release_reg, ir_emit_result_flag_field, ir_emit_result_value_field, ir_emit_ret_known_err_box, ir_emit_registered_rcall_boxed_into
+
+# ===========================================================================
+# Collection literal, indexing, upsert, and for-loop dispatch names
+# ===========================================================================
+
+## true when a map literal's first entry uses an integer literal key.
+pub fn ir_map_uses_int_keys(node: Node) -> Bool:
+    if node.children.len() == 0:
+        return false
+    first_entry := get_node(node.children[0])
+    if first_entry.kind != "entry" or first_entry.children.len() == 0:
+        return false
+    key_node := get_node(first_entry.children[0])
+    return key_node.kind == "int_lit" or key_node.kind == "int"
+
+## runtime constructor symbol for a set literal flavor.
+pub fn ir_set_new_name(literal_type: String) -> String:
+    if literal_type == "set_int":
+        return "__set_new_int"
+    if literal_type == "set_bytes":
+        return "__set_new_bytes"
+    return "__set_new"
+
+## runtime insert symbol matching ir_set_new_name.
+pub fn ir_set_add_name(literal_type: String) -> String:
+    if literal_type == "set_int":
+        return "set_add_int"
+    if literal_type == "set_bytes":
+        return "set_add_bytes"
+    return "set_add"
+
+## recorded map value-type kind for a map identifier expression, or "".
+pub fn ir_lookup_map_value_type_for_expr(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "ident" and ir_map_value_types.contains_key(node.value):
+        return ir_map_value_types[node.value]
+    return ""
+
+## strict runtime getter symbol behind `obj[i]`.
+pub fn ir_index_get_call_name(obj_type: String) -> String:
+    if obj_type == "string":
+        return "char_at_strict"
+    if obj_type == "bytes":
+        return "bytes_get_strict"
+    if obj_type == "map_int":
+        return "map_get_ikey_strict"
+    if obj_type == "map_bytes":
+        return "map_get_bkey_strict"
+    if obj_type == "map":
+        return "map_get_strict"
+    return "__list_get_strict"
+
+## runtime store symbol behind `obj[i] = v`.
+pub fn ir_index_set_call_name(obj_type: String) -> String:
+    if obj_type == "map_int":
+        return "map_insert_ikey"
+    if obj_type == "map_bytes":
+        return "map_insert_bkey"
+    if obj_type == "map":
+        return "map_insert"
+    return "pith_list_set_value"
+
+## fused runtime upsert-add symbol for `m[k] = m[k] + d`.
+pub fn ir_map_upsert_add_call_name(obj_type: String) -> String:
+    if obj_type == "map_int":
+        return "map_upsert_add_ikey"
+    if obj_type == "map_bytes":
+        return "map_upsert_add_bkey"
+    return "map_upsert_add"
+
+## propagating fused runtime upsert-add symbol for `-> T!` functions.
+pub fn ir_map_try_upsert_add_call_name(obj_type: String) -> String:
+    if obj_type == "map_int":
+        return "map_try_upsert_add_ikey"
+    if obj_type == "map_bytes":
+        return "map_try_upsert_add_bkey"
+    return "map_try_upsert_add"
+
+## fused runtime add-or-insert symbol for counting branches.
+pub fn ir_map_add_or_insert_call_name(obj_type: String) -> String:
+    if obj_type == "map_int":
+        return "map_add_or_insert_ikey"
+    if obj_type == "map_bytes":
+        return "map_add_or_insert_bkey"
+    return "map_add_or_insert"
+
+## runtime element getter for a counted `for` loop.
+pub fn ir_for_loop_item_call_name(item_kind: String) -> String:
+    if item_kind == "char":
+        return "char_at"
+    if item_kind == "string" or item_kind == "int" or item_kind == "bytes":
+        return "__list_get_unchecked"
+    return "__list_get"
+
+## IR return kind for one element read in a counted `for` loop.
+pub fn ir_for_loop_item_return_kind(item_kind: String) -> String:
+    if item_kind == "char" or item_kind == "string":
+        return "string"
+    if item_kind == "int":
+        return "int"
+    if item_kind == "bytes":
+        return "bytes"
+    return "unknown"
+
+## item kind yielded by iterating `iter_type` in a `for` loop.
+pub fn ir_for_iter_item_kind(iter_type: String) -> String:
+    if iter_type == "string":
+        return "char"
+    if iter_type == "list_string" or iter_type == "map" or iter_type == "set":
+        return "string"
+    if iter_type == "map_int" or iter_type == "set_int":
+        return "int"
+    if iter_type == "map_bytes" or iter_type == "set_bytes":
+        return "bytes"
+    return "unknown"
+
+## runtime call that flattens a map/set iterable into a list, or "".
+pub fn ir_for_iter_conversion_call(iter_type: String) -> String:
+    if iter_type == "map":
+        return "map_keys"
+    if iter_type == "map_int":
+        return "map_keys_ikey"
+    if iter_type == "map_bytes":
+        return "map_keys_bkey"
+    if iter_type == "set":
+        return "__set_to_list"
+    if iter_type == "set_int":
+        return "__set_to_list_int"
+    if iter_type == "set_bytes":
+        return "__set_to_list_bytes"
+    return ""
+
+## IR return kind of ir_for_iter_conversion_call, or "".
+pub fn ir_for_iter_conversion_return_kind(iter_type: String) -> String:
+    if iter_type == "map" or iter_type == "set":
+        return "list_string"
+    if iter_type == "map_int" or iter_type == "set_int" or iter_type == "map_bytes" or iter_type == "set_bytes":
+        return "list"
+    return ""
+
+## runtime length call for a counted `for` loop's trip count.
+pub fn ir_for_len_call_name(item_kind: String) -> String:
+    if item_kind == "char":
+        return "pith_cstring_len"
+    return "len"
+
+## runtime constructor for an empty collection literal bound to `target_type`, or "".
+pub fn ir_empty_collection_init_call_name(literal_kind: String, child_count: Int, target_type: String) -> String:
+    if child_count != 0:
+        return ""
+    if literal_kind == "map":
+        if target_type == "set":
+            return "__set_new"
+        if target_type == "set_int":
+            return "__set_new_int"
+        if target_type == "set_bytes":
+            return "__set_new_bytes"
+        if target_type == "map":
+            return "__map_new"
+        if target_type == "map_int":
+            return "__map_new_int"
+        if target_type == "map_bytes":
+            return "__map_new_bytes"
+        if target_type == "map_str_val":
+            return "__map_new_str_val"
+        if target_type == "map_int_str_val":
+            return "__map_new_int_str_val"
+        if target_type == "map_bytes_str_val":
+            return "__map_new_bytes_str_val"
+    if literal_kind == "set":
+        if target_type == "set":
+            return "__set_new"
+        if target_type == "set_int":
+            return "__set_new_int"
+        if target_type == "set_bytes":
+            return "__set_new_bytes"
+    if literal_kind == "list":
+        if target_type == "list_string":
+            return "__list_new_str"
+        if target_type == "list":
+            return "__list_new"
+    return ""
+
+## normalize composite empty-init targets back to their tracked container kind.
+pub fn ir_normalize_collection_target(target_type: String) -> String:
+    if target_type == "map_str_val" or target_type == "map_bytes_str_val" or target_type == "map_bytes":
+        return "map"
+    if target_type == "map_int_str_val":
+        return "map_int"
+    if target_type == "set_bytes":
+        return "set"
+    return target_type
+
+# ===========================================================================
+# Self-hosted list higher-order & query loop emitters
+# ===========================================================================
+
+fn ir_emit_list_loop_step(idx_name: String, i_r: Int, loop_l: String):
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_i_r := ir_reg()
+    ir_emit("add " + next_i_r.to_string() + " " + i_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_i_r.to_string())
+    ir_emit("jmp " + loop_l)
+
+## true for receiver types backed by the runtime list.
+pub fn ir_is_list_runtime_type(obj_type: String) -> Bool:
+    return obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
+
+## emit the loop behind `xs.map(f)`.
+pub fn ir_emit_list_map_loop(list_r: Int, ctor: String, mapper_name: String, result_kind: String, elem_kind: String, mapped_kind: String, idx_name: String) -> Int:
+    result_r := ir_reg()
+    ir_emit_call0_raw(result_r, ctor, result_kind)
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    loop_l := ir_label()
+    body_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    keep_loop_r := ir_reg()
+    ir_emit("lt " + keep_loop_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + keep_loop_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
+    mapped_r := ir_reg()
+    ir_emit_call_text_raw(mapped_r, mapper_name, mapped_kind, 1, " " + item_r.to_string())
+    ir_emit_call2_raw(ir_reg(), "pith_list_push_value_owned", "void", result_r, mapped_r)
+    ir_emit_list_loop_step(idx_name, i_r, loop_l)
+    ir_emit("label " + done_l)
+    return result_r
+
+## emit the loop behind `xs.filter(keep)`.
+pub fn ir_emit_list_filter_loop(list_r: Int, ctor: String, keep_name: String, result_kind: String, elem_kind: String, idx_name: String) -> Int:
+    result_r := ir_reg()
+    ir_emit_call0_raw(result_r, ctor, result_kind)
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    loop_l := ir_label()
+    body_l := ir_label()
+    push_l := ir_label()
+    step_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    keep_loop_r := ir_reg()
+    ir_emit("lt " + keep_loop_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + keep_loop_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
+    pred_r := ir_reg()
+    ir_emit_call_text_raw(pred_r, keep_name, "int", 1, " " + item_r.to_string())
+    ir_emit("brif " + pred_r.to_string() + " " + push_l + " " + step_l)
+    ir_emit("label " + push_l)
+    ir_emit_call2_raw(ir_reg(), "__list_push", "void", result_r, item_r)
+    ir_emit("label " + step_l)
+    ir_emit_list_loop_step(idx_name, i_r, loop_l)
+    ir_emit("label " + done_l)
+    return result_r
+
+## emit the loop behind `xs.reduce(init, f)`.
+pub fn ir_emit_list_reduce_loop(list_r: Int, reducer_name: String, acc_name: String, elem_kind: String, result_kind: String, acc_rc: String, idx_name: String) -> Int:
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    loop_l := ir_label()
+    body_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    keep_loop_r := ir_reg()
+    ir_emit("lt " + keep_loop_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + keep_loop_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
+    acc_r := ir_reg()
+    ir_emit("load " + acc_r.to_string() + " " + acc_name)
+    next_acc_r := ir_reg()
+    ir_emit_call_text_raw(next_acc_r, reducer_name, result_kind, 2, " " + acc_r.to_string() + " " + item_r.to_string())
+    ir_emit("store " + acc_name + " " + next_acc_r.to_string())
+    if acc_rc.len() > 0:
+        ir_rc_release_reg(acc_r, acc_rc)
+    ir_emit_list_loop_step(idx_name, i_r, loop_l)
+    ir_emit("label " + done_l)
+    out_r := ir_reg()
+    ir_emit("load " + out_r.to_string() + " " + acc_name)
+    return out_r
+
+## emit `xs.is_empty()` as `pith_list_len(xs) == 0`.
+pub fn ir_emit_list_is_empty(list_r: Int) -> Int:
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    out_r := ir_reg()
+    ir_emit("eq " + out_r.to_string() + " " + len_r.to_string() + " " + zero_r.to_string())
+    return out_r
+
+fn ir_emit_list_item_eq(elem_kind: String, elem_tid: Int, item_r: Int, target_r: Int) -> Int:
+    if elem_tid >= 0:
+        return ir_emit_value_eq_for_tid(elem_tid, item_r, target_r)
+    out_r := ir_reg()
+    if elem_kind == "string":
+        ir_emit_call2_raw(out_r, "__str_eq", "bool", item_r, target_r)
+        return out_r
+    ir_emit("eq " + out_r.to_string() + " " + item_r.to_string() + " " + target_r.to_string())
+    return out_r
+
+## emit the `-1` not-found sentinel register for index searches.
+pub fn ir_emit_list_missing_index_result() -> Int:
+    missing_r := ir_reg()
+    ir_emit("iconst " + missing_r.to_string() + " -1")
+    return missing_r
+
+## emit the linear scan behind `xs.index_of(v)` / `xs.contains(v)`.
+pub fn ir_emit_list_index_search_loop(list_r: Int, target_r: Int, elem_kind: String, elem_tid: Int, result_name: String, idx_name: String) -> Int:
+    missing_r := ir_emit_list_missing_index_result()
+    ir_emit("store " + result_name + " " + missing_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+    loop_l := ir_label()
+    body_l := ir_label()
+    match_l := ir_label()
+    step_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    in_range_r := ir_reg()
+    ir_emit("lt " + in_range_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + in_range_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
+    eq_r := ir_emit_list_item_eq(elem_kind, elem_tid, item_r, target_r)
+    ir_emit("brif " + eq_r.to_string() + " " + match_l + " " + step_l)
+    ir_emit("label " + match_l)
+    ir_emit("store " + result_name + " " + i_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + step_l)
+    ir_emit_list_loop_step(idx_name, i_r, loop_l)
+    ir_emit("label " + done_l)
+    out_r := ir_reg()
+    ir_emit("load " + out_r.to_string() + " " + result_name)
+    return out_r
+
+## convert an index-search register (`>= 0` or `-1`) into a boolean for `contains`.
+pub fn ir_emit_list_contains_from_index(index_r: Int) -> Int:
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    out_r := ir_reg()
+    ir_emit("gte " + out_r.to_string() + " " + index_r.to_string() + " " + zero_r.to_string())
+    return out_r
+
+# ===========================================================================
+# Dotted-path traversal for JSON/TOML/YAML decode_path
+# ===========================================================================
+
+fn ir_emit_path_parts_release(parts_name: String):
+    parts_r := ir_reg()
+    ir_emit("load " + parts_r.to_string() + " " + parts_name)
+    ir_emit_call1_raw(ir_reg(), "pith_list_release_handle", "void", parts_r)
+
+fn ir_emit_path_loop_step(idx_name: String, loop_l: String):
+    step_idx_r := ir_reg()
+    ir_emit("load " + step_idx_r.to_string() + " " + idx_name)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_idx_r := ir_reg()
+    ir_emit("add " + next_idx_r.to_string() + " " + step_idx_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_idx_r.to_string())
+    ir_emit("jmp " + loop_l)
+
+## walk a dotted path into a handle, storing errors into `temp_name` and jumping to `done_l`.
+pub fn ir_emit_dotted_path_lookup(handle_r: Int, dotted_path_r: Int, require_name: String, ok_tid: Int, current_name: String, parts_name: String, len_name: String, idx_name: String, temp_name: String, done_l: String) -> Int:
+    ir_emit("store " + current_name + " " + handle_r.to_string())
+    dot_r := ir_reg()
+    ir_emit("strref " + dot_r.to_string() + " " + ir_str("."))
+    parts_r := ir_reg()
+    ir_emit_call2_raw(parts_r, "pith_string_split_to_list", "list_string", dotted_path_r, dot_r)
+    ir_emit("store " + parts_name + " " + parts_r.to_string())
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_auto_len", "int", parts_r)
+    ir_emit("store " + len_name + " " + len_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    loop_l := ir_label()
+    body_l := ir_label()
+    lookup_l := ir_label()
+    step_l := ir_label()
+    loop_done_l := ir_label()
+    ir_emit("label " + loop_l)
+    loop_idx_r := ir_reg()
+    ir_emit("load " + loop_idx_r.to_string() + " " + idx_name)
+    loop_len_r := ir_reg()
+    ir_emit("load " + loop_len_r.to_string() + " " + len_name)
+    cond_r := ir_reg()
+    ir_emit("lt " + cond_r.to_string() + " " + loop_idx_r.to_string() + " " + loop_len_r.to_string())
+    ir_emit("brif " + cond_r.to_string() + " " + body_l + " " + loop_done_l)
+    ir_emit("label " + body_l)
+    parts_load_r := ir_reg()
+    ir_emit("load " + parts_load_r.to_string() + " " + parts_name)
+    idx_load_r := ir_reg()
+    ir_emit("load " + idx_load_r.to_string() + " " + idx_name)
+    part_r := ir_reg()
+    ir_emit_call2_raw(part_r, "pith_list_get_value_unchecked", "string", parts_load_r, idx_load_r)
+    part_len_r := ir_reg()
+    ir_emit_call1_raw(part_len_r, "pith_auto_len", "int", part_r)
+    empty_r := ir_reg()
+    ir_emit("iconst " + empty_r.to_string() + " 0")
+    skip_empty_r := ir_reg()
+    ir_emit("eq " + skip_empty_r.to_string() + " " + part_len_r.to_string() + " " + empty_r.to_string())
+    ir_emit("brif " + skip_empty_r.to_string() + " " + step_l + " " + lookup_l)
+    ir_emit("label " + lookup_l)
+    current_r := ir_reg()
+    ir_emit("load " + current_r.to_string() + " " + current_name)
+    child_result_r := ir_reg()
+    if ir_result_reg_funcs.contains_key(require_name):
+        ir_emit_registered_rcall_boxed_into(child_result_r, require_name, 2, " " + current_r.to_string() + " " + part_r.to_string())
+    else:
+        ir_emit_call2_raw(child_result_r, require_name, "tuple", current_r, part_r)
+    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
+    child_ok_l := ir_label()
+    child_err_l := ir_label()
+    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
+    ir_emit("label " + child_err_l)
+    ir_emit_path_parts_release(parts_name)
+    ir_emit("store " + temp_name + " " + child_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + child_ok_l)
+    child_handle_r := ir_emit_result_value_field(child_result_r, ok_tid, "ok")
+    ir_emit_call1_raw(ir_reg(), "pith_struct_release", "void", child_result_r)
+    ir_emit("store " + current_name + " " + child_handle_r.to_string())
+    ir_emit("label " + step_l)
+    ir_emit_path_loop_step(idx_name, loop_l)
+    ir_emit("label " + loop_done_l)
+    ir_emit_path_parts_release(parts_name)
+    final_handle_r := ir_reg()
+    ir_emit("load " + final_handle_r.to_string() + " " + current_name)
+    return final_handle_r
+
+## walk a dotted path into a handle, returning an error box directly on failure.
+pub fn ir_emit_dotted_path_lookup_or_return(handle_r: Int, dotted_path_r: Int, require_name: String, current_name: String, parts_name: String, len_name: String, idx_name: String) -> Int:
+    ir_emit("store " + current_name + " " + handle_r.to_string())
+    dot_r := ir_reg()
+    ir_emit("strref " + dot_r.to_string() + " " + ir_str("."))
+    parts_r := ir_reg()
+    ir_emit_call2_raw(parts_r, "pith_string_split_to_list", "list_string", dotted_path_r, dot_r)
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_auto_len", "int", parts_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    ir_emit("store " + len_name + " " + len_r.to_string())
+    ir_emit("store " + parts_name + " " + parts_r.to_string())
+    loop_l := ir_label()
+    body_l := ir_label()
+    step_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    loop_idx_r := ir_reg()
+    ir_emit("load " + loop_idx_r.to_string() + " " + idx_name)
+    loop_len_r := ir_reg()
+    ir_emit("load " + loop_len_r.to_string() + " " + len_name)
+    cond_r := ir_reg()
+    ir_emit("lt " + cond_r.to_string() + " " + loop_idx_r.to_string() + " " + loop_len_r.to_string())
+    ir_emit("brif " + cond_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    iter_r := ir_reg()
+    ir_emit("load " + iter_r.to_string() + " " + parts_name)
+    item_idx_r := ir_reg()
+    ir_emit("load " + item_idx_r.to_string() + " " + idx_name)
+    part_r := ir_reg()
+    ir_emit_call2_raw(part_r, "pith_list_get_value_unchecked", "string", iter_r, item_idx_r)
+    empty_r := ir_reg()
+    ir_emit("strref " + empty_r.to_string() + " " + ir_str(""))
+    is_empty_r := ir_reg()
+    ir_emit_call2_raw(is_empty_r, "pith_cstring_eq", "bool", part_r, empty_r)
+    non_empty_l := ir_label()
+    ir_emit("brif " + is_empty_r.to_string() + " " + step_l + " " + non_empty_l)
+    ir_emit("label " + non_empty_l)
+    current_r := ir_reg()
+    ir_emit("load " + current_r.to_string() + " " + current_name)
+    table_result_r := ir_reg()
+    if ir_result_reg_funcs.contains_key(require_name):
+        ir_emit_registered_rcall_boxed_into(table_result_r, require_name, 2, " " + current_r.to_string() + " " + part_r.to_string())
+    else:
+        ir_emit_call2_raw(table_result_r, require_name, "tuple", current_r, part_r)
+    table_ok_r := ir_emit_result_flag_field(table_result_r, "is_ok")
+    table_ok_l := ir_label()
+    table_err_l := ir_label()
+    ir_emit("brif " + table_ok_r.to_string() + " " + table_ok_l + " " + table_err_l)
+    ir_emit("label " + table_err_l)
+    ir_emit_path_parts_release(parts_name)
+    ir_emit_ret_known_err_box(table_result_r)
+    ir_emit("label " + table_ok_l)
+    next_current_r := ir_emit_result_value_field(table_result_r, 0, "ok")
+    ir_emit_call1_raw(ir_reg(), "pith_struct_release", "void", table_result_r)
+    ir_emit("store " + current_name + " " + next_current_r.to_string())
+    ir_emit("label " + step_l)
+    ir_emit_path_loop_step(idx_name, loop_l)
+    ir_emit("label " + done_l)
+    ir_emit_path_parts_release(parts_name)
+    final_handle_r := ir_reg()
+    ir_emit("load " + final_handle_r.to_string() + " " + current_name)
+    return final_handle_r

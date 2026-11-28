@@ -1,0 +1,568 @@
+# ir_symbols.pith: callee resolution, import/alias registries, generic
+# specialization queue, and generic type-node substitution.
+#
+# consolidates ir_callees, ir_generics, and the non-trampoline parts of
+# ir_alias_registry onto ir_state and ir_types with zero *_with_state wrappers.
+
+from ast import Node, get_node, from_import_names, from_import_name_aliases, from_import_alias_receiver
+from checker import c_ident_is_shadowed_alias
+from types import get_type_info, get_type_name
+from ir_ast_helpers import ir_binding_name, ir_is_binding_kind
+from ir_common import ir_base_decl_name, ir_import_target_name, ir_global_storage_symbol, ir_module_default_alias, ir_push_string, ir_root_items
+from ir_state import ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_import_mutable_global_symbols, ir_global_slot_names, ir_global_map_value_types, ir_record_global_type, ir_struct_names, ir_func_returns, ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_method_owners, ir_generic_method_owner_param_counts, ir_generic_specialization_by_symbol, ir_generic_specialization_subst_tids
+from ir_types import ir_alias_target_node, ir_resolve_type_hint, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid
+
+# ===========================================================================
+# Static callee & module-alias resolution
+# ===========================================================================
+
+## resolved callee symbol plus whether it came from an imported module.
+pub struct ResolvedCallee:
+    pub name: String
+    pub imported: Bool
+
+fn ir_import_key(module_path: String, name: String) -> String:
+    return module_path + "." + name
+
+## true when the preloaded import declares a function named `name`.
+pub fn ir_import_declares_function(module_path: String, name: String) -> Bool:
+    return ir_import_declared_functions.contains_key(ir_import_key(module_path, name))
+
+## true when the preloaded import declares a global named `name`.
+pub fn ir_import_declares_global(module_path: String, name: String) -> Bool:
+    return ir_import_declared_globals.contains_key(ir_import_key(module_path, name))
+
+## IR symbol for `alias.member`, or "" when `alias` is not a known module alias.
+pub fn ir_module_alias_member_name(alias: String, member: String) -> String:
+    if not ir_module_aliases.contains_key(alias):
+        return ""
+    module_path := ir_module_aliases[alias]
+    if ir_import_declares_function(module_path, member):
+        return ir_import_target_name(module_path, member)
+    if ir_import_declares_global(module_path, member):
+        return ir_import_target_name(module_path, ir_global_storage_symbol(member))
+    return member
+
+## method name with any leading "." stripped.
+pub fn ir_plain_method_name(name: String) -> String:
+    if name.starts_with("."):
+        return name.substring(1, name.len())
+    return name
+
+## resolve a bare callee identifier through import renames and active generic module scope.
+pub fn ir_ident_callee(name: String) -> ResolvedCallee:
+    if ir_import_renames.contains_key(name):
+        return ResolvedCallee(ir_import_renames[name], true)
+    if ir_active_generic_module_path.len() > 0 and ir_import_declares_function(ir_active_generic_module_path, name):
+        return ResolvedCallee(ir_import_target_name(ir_active_generic_module_path, name), true)
+    return ResolvedCallee(name, false)
+
+## qualified symbol for a `mod.fn` field-access callee node, or "".
+pub fn ir_resolve_module_alias_call_name(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind != "field_access" or node.children.len() == 0:
+        return ""
+    recv := get_node(node.children[0])
+    if recv.kind != "ident" or c_ident_is_shadowed_alias(node.children[0]):
+        return ""
+    return ir_module_alias_member_name(recv.value, node.value)
+
+## qualified symbol for a `mod.fn(...)` method-call node, or "".
+pub fn ir_resolve_module_alias_method_call_name(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind != "method_call" or node.children.len() == 0:
+        return ""
+    recv := get_node(node.children[0])
+    if recv.kind != "ident" or c_ident_is_shadowed_alias(node.children[0]):
+        return ""
+    return ir_module_alias_member_name(recv.value, ir_plain_method_name(node.value))
+
+## resolve any statically known callee node (ident, `f[T]`, `mod.f`, `mod.f[T]`).
+pub fn ir_resolve_static_callee(idx: Int) -> ResolvedCallee:
+    node := get_node(idx)
+    if node.kind == "ident":
+        return ir_ident_callee(node.value)
+    if node.kind == "index" and node.children.len() > 0:
+        base_node := get_node(node.children[0])
+        if base_node.kind == "ident" and base_node.value == "Channel":
+            return ResolvedCallee("Channel", false)
+        if base_node.kind == "ident":
+            return ir_ident_callee(base_node.value)
+        if base_node.kind == "field_access":
+            alias_name := ir_resolve_module_alias_call_name(node.children[0])
+            if alias_name.len() > 0:
+                return ResolvedCallee(alias_name, true)
+    if node.kind == "field_access":
+        alias_name := ir_resolve_module_alias_call_name(idx)
+        if alias_name.len() > 0:
+            return ResolvedCallee(alias_name, true)
+    return ResolvedCallee("", false)
+
+# ===========================================================================
+# Import & alias registration, capture blocklist, and type-node resolution
+# ===========================================================================
+
+## names a closure must never capture (aliases, renames, types, functions, globals, asserts).
+pub fn ir_capture_blocked_names() -> Map[String, Bool]:
+    mut blocked: Map[String, Bool] := {}
+    for name in ir_module_aliases.keys():
+        blocked.insert(name, true)
+    for name in ir_import_renames.keys():
+        blocked.insert(name, true)
+    for name in ir_struct_names.keys():
+        blocked.insert(name, true)
+    for name in ir_func_returns.keys():
+        blocked.insert(name, true)
+    for name in ir_global_slot_names:
+        blocked.insert(name, true)
+    blocked.insert("assert", true)
+    blocked.insert("assert_eq", true)
+    blocked.insert("assert_ne", true)
+    return blocked
+
+## record declarations and imported global kinds for one preloaded module root.
+pub fn ir_collect_preloaded_root_metadata(root_idx: Int, module_path: String):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if ir_is_fn_decl_kind(node.kind):
+            ir_import_declared_functions.insert(module_path + "." + ir_base_decl_name(node.value), true)
+        elif ir_is_binding_kind(node.kind):
+            ir_import_declared_globals.insert(module_path + "." + ir_binding_name(node), true)
+            if node.value.contains(" mut"):
+                ir_import_mutable_global_symbols.insert(ir_import_target_name(module_path, ir_global_storage_symbol(ir_binding_name(node))), true)
+            ir_record_imported_global_kind(node)
+
+## record an imported global's type kind so empty literals keep the right container flavor.
+pub fn ir_record_imported_global_kind(node: Node):
+    gname := ir_binding_name(node)
+    for gc in node.children:
+        gcn := get_node(gc)
+        if gcn.kind == "type" or gcn.kind == "generic_type" or gcn.kind == "optional_type":
+            kind := ir_resolve_type_node(gc)
+            if kind.len() > 0:
+                ir_record_global_type(gname, kind)
+            value_kind := ir_resolve_map_value_type_node(gc)
+            if value_kind.len() > 0:
+                ir_global_map_value_types.insert(gname, value_kind)
+
+## record one `import path [as alias]` directive into ir_module_aliases.
+pub fn ir_register_import_alias(value: String):
+    mut path := value
+    mut alias := ""
+    mut has_alias := false
+    mut i := 0
+    while i < value.len() - 3:
+        if value[i] == " " and value[i + 1] == "a" and value[i + 2] == "s" and value[i + 3] == " ":
+            path = value.substring(0, i)
+            alias = value.substring(i + 4, value.len())
+            has_alias = true
+            break
+        i = i + 1
+    if has_alias:
+        ir_module_aliases.insert(alias, path)
+    else:
+        ir_module_aliases.insert(ir_module_default_alias(path), path)
+
+## record `from mod import ...` renames and aliases for a module root.
+pub fn ir_collect_from_import_renames(value: String):
+    parts := value.split(" ")
+    if parts.len() <= 1:
+        return
+    mod_path := parts[0]
+    aliases := from_import_name_aliases(value)
+    for iname, i in from_import_names(value):
+        if i < aliases.len() and aliases[i].len() > 0:
+            ir_module_aliases.insert(from_import_alias_receiver(aliases[i]), mod_path)
+        elif iname.len() > 0:
+            mut renamed := iname
+            if ir_import_declares_function(mod_path, iname):
+                renamed = ir_import_target_name(mod_path, iname)
+            elif ir_import_declares_global(mod_path, iname):
+                renamed = ir_import_target_name(mod_path, ir_global_storage_symbol(iname))
+            ir_import_renames.insert(iname, renamed)
+
+## resolve a type annotation AST node to an emission kind, honoring active generic substitution.
+pub fn ir_resolve_type_node(type_idx: Int) -> String:
+    if ir_active_generic_params.len() > 0:
+        resolved := ir_resolve_type_node_with_subst(type_idx, ir_active_generic_params, ir_active_generic_concrete_types)
+        if resolved.len() > 0:
+            return resolved
+    tn := get_node(type_idx)
+    if tn.kind == "type":
+        target := ir_alias_target_node(type_idx)
+        if target != type_idx:
+            return ir_resolve_type_node(target)
+        return ir_resolve_type_hint(tn.value)
+    if tn.kind == "generic_type":
+        generic_type := ir_resolve_generic_type_node(tn)
+        if generic_type.len() > 0:
+            return generic_type
+        return ir_resolve_type_hint(tn.value)
+    if tn.kind == "result_type" and tn.children.len() > 0:
+        inner_type := ir_resolve_type_node(tn.children[0])
+        return ir_resolve_result_type_kind(inner_type)
+    if tn.kind == "optional_type" and tn.children.len() > 0:
+        return "tuple"
+    if tn.kind == "fn_type":
+        return "closure"
+    if tn.kind == "tuple_type":
+        return "tuple"
+    return ""
+
+## resolve a `Map[K, V]` annotation node's value-type kind, or "".
+pub fn ir_resolve_map_value_type_node(type_idx: Int) -> String:
+    tn := get_node(ir_alias_target_node(type_idx))
+    if tn.kind == "generic_type" and tn.value == "Map" and tn.children.len() > 1:
+        if ir_active_generic_params.len() > 0:
+            return ir_resolve_type_node_with_subst(tn.children[1], ir_active_generic_params, ir_active_generic_concrete_types)
+        return ir_resolve_type_node(tn.children[1])
+    return ""
+
+# ===========================================================================
+# Generic declarations, substitution, and specialization queue
+# ===========================================================================
+
+## true for any function-declaration AST node kind.
+pub fn ir_is_fn_decl_kind(kind: String) -> Bool:
+    return kind == "fn" or kind == "fn_decl"
+
+## true when a declaration node carries generic parameters.
+pub fn ir_has_generic_params(node: Node) -> Bool:
+    for child in node.children:
+        if get_node(child).kind == "generic_param":
+            return true
+    return false
+
+## generic parameter names of a declaration, in order.
+pub fn ir_collect_generic_param_names(node: Node) -> List[String]:
+    mut names: List[String] := []
+    mut i := 0
+    while i < node.children.len():
+        child := get_node(node.children[i])
+        if child.kind == "generic_param":
+            names.push(child.value)
+        i = i + 1
+    return names
+
+## the n-th parameter name of a function declaration node, or "".
+pub fn ir_param_name_at(fn_idx: Int, param_index: Int) -> String:
+    node := get_node(fn_idx)
+    mut seen := 0
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if seen == param_index:
+                return cn.value
+            seen = seen + 1
+    return ""
+
+## prefer `preferred` when it names a recorded generic declaration, else `fallback`.
+pub fn ir_generic_preferred_name(preferred: String, fallback: String) -> String:
+    if ir_generic_decl_indices.contains_key(preferred):
+        return preferred
+    return fallback
+
+## generic std.json decode helper name for `base_name`.
+pub fn ir_json_generic_name(base_name: String) -> String:
+    return ir_generic_preferred_name("std_json_" + base_name, base_name)
+
+## generic std.config decode helper name for `base_name`.
+pub fn ir_config_generic_name(base_name: String) -> String:
+    return ir_generic_preferred_name("std_config_" + base_name, base_name)
+
+## qualify a generic module call symbol against `module_path` when non-empty.
+pub fn ir_resolve_generic_module_call_name(module_path: String, member_name: String) -> String:
+    if module_path.len() > 0:
+        return ir_import_target_name(module_path, member_name)
+    return member_name
+
+## generic handle-pool decode helper name for `base_name` under `module_path`.
+pub fn ir_handle_generic_name(base_name: String, module_path: String) -> String:
+    preferred := ir_resolve_generic_module_call_name(module_path, base_name)
+    return ir_generic_preferred_name(preferred, base_name)
+
+## pack type names into one tab-joined string for map storage.
+pub fn ir_encode_type_list(type_names: List[String]) -> String:
+    return type_names.join(chr(9))
+
+## unpack a tab-joined type-name list.
+pub fn ir_decode_type_list(encoded: String) -> List[String]:
+    if encoded.len() == 0:
+        return []
+    return encoded.split(chr(9))
+
+## deduplication key for one kind-keyed generic specialization request.
+pub fn ir_generic_specialization_key(name: String, type_names: List[String]) -> String:
+    return name + chr(9) + ir_encode_type_list(type_names)
+
+fn ir_sanitize_symbol_part(name: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < name.len():
+        ch := name[i]
+        if ch == "[" or ch == "]" or ch == "," or ch == " " or ch == "." or ch == ":":
+            out = out + "_"
+        else:
+            out = out + ch
+        i = i + 1
+    return out
+
+## emitted symbol name for one kind-keyed generic specialization.
+pub fn ir_generic_specialization_name(name: String, type_names: List[String]) -> String:
+    mut suffix_parts: List[String] := []
+    for type_name in type_names:
+        suffix_parts.push(ir_sanitize_symbol_part(type_name))
+    return name + "__" + suffix_parts.join("_")
+
+## substitute generic parameters in a written type name.
+pub fn ir_specialize_type_name(name: String, generic_params: List[String], concrete_types: List[String]) -> String:
+    for generic_param, i in generic_params:
+        if i < concrete_types.len() and generic_param == name:
+            return concrete_types[i]
+    return ir_resolve_type_hint(name)
+
+## resolve a type or explicit type-argument AST node under a generic substitution.
+pub fn ir_resolve_type_node_with_subst(type_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
+    mut tn := get_node(type_idx)
+    if tn.kind == "type" and not generic_params.contains(tn.value):
+        tn = get_node(ir_alias_target_node(type_idx))
+    if tn.kind == "type" or tn.kind == "ident":
+        return ir_resolve_type_hint(ir_specialize_type_name(tn.value, generic_params, concrete_types))
+    if tn.kind == "generic_type":
+        if tn.value == "List":
+            if tn.children.len() > 0:
+                inner := ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+                if inner == "string":
+                    return "list_string"
+            return "list"
+        if tn.value == "Map":
+            if tn.children.len() > 0:
+                key_type := ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+                if key_type == "int":
+                    return "map_int"
+            return "map"
+        if tn.value == "Set":
+            if tn.children.len() > 0:
+                elem_type := ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+                if elem_type == "int":
+                    return "set_int"
+            return "set"
+        return ir_resolve_type_hint(tn.value)
+    if tn.kind == "index" and tn.children.len() > 1:
+        base := get_node(tn.children[0])
+        if base.kind != "ident":
+            return ""
+        if base.value == "List":
+            inner := ir_resolve_type_node_with_subst(tn.children[1], generic_params, concrete_types)
+            if inner == "string":
+                return "list_string"
+            return "list"
+        if base.value == "Map":
+            key_type := ir_resolve_type_node_with_subst(tn.children[1], generic_params, concrete_types)
+            if key_type == "int":
+                return "map_int"
+            return "map"
+        if base.value == "Set":
+            elem_type := ir_resolve_type_node_with_subst(tn.children[1], generic_params, concrete_types)
+            if elem_type == "int":
+                return "set_int"
+            return "set"
+        return ir_resolve_type_hint(base.value)
+    if tn.kind == "unwrap" or tn.kind == "tuple" or tn.kind == "tuple_type":
+        return "tuple"
+    if tn.kind == "grouped" and tn.children.len() == 1:
+        return ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+    if tn.kind == "result_type" and tn.children.len() > 0:
+        inner_type := ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+        return ir_resolve_result_type_kind(inner_type)
+    if tn.kind == "optional_type" and tn.children.len() > 0:
+        return "tuple"
+    if tn.kind == "fn_type":
+        return "closure"
+    return ""
+
+## return emission kind of a generic function node under a substitution.
+pub fn ir_extract_return_type_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(ir_alias_target_node(returns_child))
+                if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type" or rn.kind == "optional_type":
+                    return ir_resolve_type_node_with_subst(returns_child, generic_params, concrete_types)
+    return "unknown"
+
+## inner kind of an optional return under a generic substitution, or "".
+pub fn ir_extract_optional_inner_type_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(ir_alias_target_node(returns_child))
+                if rn.kind == "optional_type" and rn.children.len() > 0:
+                    return ir_resolve_type_node_with_subst(rn.children[0], generic_params, concrete_types)
+    return ""
+
+## parameter emission kinds of a generic function node under a substitution.
+pub fn ir_extract_param_types_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> List[String]:
+    node := get_node(fn_idx)
+    mut param_types: List[String] := []
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                param_types.push(ir_resolve_type_node_with_subst(cn.children[0], generic_params, concrete_types))
+            else:
+                param_types.push("")
+    return param_types
+
+## record a generic free-function declaration under its module-qualified symbol.
+pub fn ir_record_generic_function_decl(item_idx: Int, node: Node, module_path: String):
+    mut full_name := node.value
+    if module_path.len() > 0:
+        full_name = ir_import_target_name(module_path, node.value)
+    ir_generic_decl_indices.insert(full_name, item_idx)
+    ir_generic_decl_module_paths.insert(full_name, module_path)
+
+## true when `name` is a recorded generic declaration.
+pub fn ir_is_generic_function_name(name: String) -> Bool:
+    return ir_generic_decl_indices.contains_key(name)
+
+## record a generic impl method declaration under its dispatch symbol.
+pub fn ir_record_generic_method_decl(method_idx: Int, full_name: String, impl_type: String, module_path: String, owner_param_count: Int):
+    ir_generic_decl_indices.insert(full_name, method_idx)
+    ir_generic_decl_module_paths.insert(full_name, module_path)
+    ir_generic_method_owners.insert(full_name, impl_type)
+    ir_generic_method_owner_param_counts.insert(full_name, owner_param_count)
+
+## number of owner type parameters for a generic method, or 0.
+pub fn ir_generic_owner_param_count(name: String) -> Int:
+    if ir_generic_method_owner_param_counts.contains_key(name):
+        return ir_generic_method_owner_param_counts[name]
+    return 0
+
+## true when `name` is a recorded generic impl method.
+pub fn ir_is_generic_method_name(name: String) -> Bool:
+    return ir_generic_method_owners.contains_key(name)
+
+## request a kind-keyed generic specialization, returning its emitted symbol.
+pub fn ir_queue_generic_specialization(name: String, arg_types: List[String], ret_type: String) -> String:
+    key := ir_generic_specialization_key(name, arg_types)
+    if ir_generic_specialization_names.contains_key(key):
+        return ir_generic_specialization_names[key]
+    spec_name := ir_generic_specialization_name(name, arg_types)
+    if ir_generic_specialization_by_symbol.contains_key(spec_name):
+        return spec_name
+    ir_generic_specialization_by_symbol.insert(spec_name, key)
+    ir_generic_specialization_keys = ir_push_string(ir_generic_specialization_keys, key)
+    ir_generic_specialization_names.insert(key, spec_name)
+    ir_generic_specialization_type_lists.insert(key, ir_encode_type_list(arg_types))
+    ir_func_returns.insert(spec_name, ret_type)
+    return spec_name
+
+## stable symbol spelling for one concrete type argument tid.
+pub fn ir_tid_symbol_spelling(tid: Int) -> String:
+    if tid < 0:
+        return "unknown"
+    info := get_type_info(tid)
+    if info.kind == "optional":
+        return "opt_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "result":
+        if info.value_type >= 0:
+            return "res_" + ir_tid_symbol_spelling(info.inner) + "_" + ir_tid_symbol_spelling(info.value_type)
+        return "res_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "tuple":
+        mut parts: List[String] := []
+        for element in info.elements:
+            parts.push(ir_tid_symbol_spelling(element))
+        return "tup_" + parts.join("_") + "_end"
+    if info.kind == "list":
+        return "list_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "set":
+        return "set_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "map":
+        return "map_" + ir_tid_symbol_spelling(info.key_type) + "_" + ir_tid_symbol_spelling(info.value_type)
+    if info.kind == "task":
+        return "task_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "channel":
+        return "chan_" + ir_tid_symbol_spelling(info.inner)
+    if info.kind == "function":
+        mut parts: List[String] := []
+        for param in info.param_types:
+            parts.push(ir_tid_symbol_spelling(param))
+        return "fn_" + parts.join("_") + "_r_" + ir_tid_symbol_spelling(info.return_type)
+    if info.kind == "enum":
+        return ir_sanitize_symbol_part(info.name)
+    kind := ir_type_from_tid(tid)
+    if kind.len() > 0:
+        return ir_sanitize_symbol_part(kind)
+    return ir_sanitize_symbol_part(get_type_name(tid)) + "_t" + tid.to_string()
+
+## request a tid-keyed generic specialization, recording its substitution tids.
+pub fn ir_queue_generic_specialization_for_tids(name: String, tids: List[Int], ret_type: String) -> String:
+    mut spellings: List[String] := []
+    mut kinds: List[String] := []
+    for tid in tids:
+        spellings.push(ir_tid_symbol_spelling(tid))
+        mut kind := ir_type_from_tid(tid)
+        if kind.len() == 0:
+            kind = "unknown"
+        kinds.push(kind)
+    key := name + chr(9) + "tids" + chr(9) + spellings.join(chr(9))
+    if ir_generic_specialization_names.contains_key(key):
+        return ir_generic_specialization_names[key]
+    spec_name := ir_generic_specialization_symbol(name, spellings)
+    if ir_generic_specialization_by_symbol.contains_key(spec_name):
+        return spec_name
+    ir_generic_specialization_by_symbol.insert(spec_name, key)
+    ir_generic_specialization_keys = ir_push_string(ir_generic_specialization_keys, key)
+    ir_generic_specialization_names.insert(key, spec_name)
+    ir_generic_specialization_type_lists.insert(key, ir_encode_type_list(kinds))
+    mut parts: List[String] := []
+    for tid in tids:
+        parts.push(tid.to_string())
+    ir_generic_specialization_subst_tids.insert(key, parts.join(","))
+    ir_func_returns.insert(spec_name, ret_type)
+    return spec_name
+
+fn ir_generic_specialization_symbol(name: String, spellings: List[String]) -> String:
+    owner_count := ir_generic_owner_param_count(name)
+    if owner_count == 0 or owner_count >= spellings.len():
+        return name + "__" + spellings.join("_")
+    method_name := get_node(ir_generic_decl_indices[name]).value
+    owner_symbol := name.substring(0, name.len() - method_name.len() - 1)
+    mut owner_part: List[String] := []
+    mut method_part: List[String] := []
+    for spelling, i in spellings:
+        if i < owner_count:
+            owner_part.push(spelling)
+        else:
+            method_part.push(spelling)
+    return owner_symbol + "_" + owner_part.join("_") + "_" + method_name + "__" + method_part.join("_")
+
+## decode the comma-joined substitution tids recorded for a specialization key.
+pub fn ir_decode_generic_spec_subst_tids(key: String) -> List[Int]:
+    result: List[Int] := []
+    if not ir_generic_specialization_subst_tids.contains_key(key):
+        return result
+    encoded := ir_generic_specialization_subst_tids[key]
+    if encoded.len() == 0:
+        return result
+    for part in encoded.split(","):
+        mut val := 0
+        mut neg := false
+        mut i := 0
+        if part.len() > 0 and part[0] == "-":
+            neg = true
+            i = 1
+        while i < part.len():
+            c := part[i]
+            if c >= "0" and c <= "9":
+                val = val * 10 + (ord(c) - 48)
+            i = i + 1
+        if neg:
+            val = 0 - val
+        result.push(val)
+    return result

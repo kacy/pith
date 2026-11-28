@@ -748,6 +748,10 @@ fn enforce_message_limits(ws: WebSocket, message_buf: ByteBuffer, fragments: Int
     ws.close(WS_CLOSE_MESSAGE_TOO_BIG, "message too big") catch 0
     fail "websocket message exceeds the maximum size"
 
+# cap on consecutive control frames (PING/PONG) between data frames so a peer
+# sending endless 2-byte unsolicited PONG frames cannot pin receive_message().
+MAX_CONSECUTIVE_CONTROL_FRAMES := 64
+
 fn receive_message(ws: WebSocket) -> WebSocketMessage!:
     if ws.is_closed():
         fail "websocket is closed"
@@ -757,11 +761,16 @@ fn receive_message(ws: WebSocket) -> WebSocketMessage!:
     # every exit. the returned message copies its bytes, so freeing after is safe.
     defer message_buf.free()
     mut fragments := 0
+    mut control_frames := 0
     while true:
         frame := read_frame_buffered(ws.reader)!
         validate_frame_direction(ws, frame)!
         if handle_control_frame(ws, frame)!:
+            control_frames = control_frames + 1
+            if control_frames > MAX_CONSECUTIVE_CONTROL_FRAMES:
+                fail "too many consecutive websocket control frames"
             continue
+        control_frames = 0
         if frame.opcode == OP_CONTINUATION:
             if message_opcode == OP_CONTINUATION:
                 fail "unexpected websocket continuation frame"

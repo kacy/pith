@@ -259,9 +259,16 @@ fn caching_sha2_scramble(password: String, salt: Bytes) -> Bytes:
     seeded := hash.sha256_bytes(bytes.concat(double, salt))
     return xor_bytes(sha_pw, seeded)
 
-# the scramble for a given auth plugin. an empty password always scrambles to
-# nothing.
-fn scramble_for(plugin: String, password: String, salt: Bytes) -> Bytes:
+# cap on auth packets exchanged in finish_auth so a hostile server cannot loop
+# AuthSwitchRequest or AuthMoreData indefinitely.
+MAX_AUTH_ROUNDS := 8
+
+# the scramble for a given auth plugin. unknown plugins are refused rather than
+# silently downgraded to SHA-1 mysql_native_password. an empty password always
+# scrambles to nothing once the plugin is accepted.
+fn scramble_for(plugin: String, password: String, salt: Bytes) -> Bytes!:
+    if plugin != "caching_sha2_password" and plugin != "mysql_native_password":
+        fail "mysql: unsupported auth plugin '{plugin}'"
     if password.len() == 0:
         return bytes.empty()
     if plugin == "caching_sha2_password":
@@ -345,9 +352,13 @@ impl Conn:
         mut caps := CAPS_BASE
         if self.session != none:
             caps = caps + CAP_SSL
-        scramble := scramble_for(plugin, password, salt)
+        scramble := scramble_for(plugin, password, salt)!
+        user_bytes := cstring_bytes(user)!
+        db_bytes := cstring_bytes(database)!
+        plugin_bytes := cstring_bytes(plugin)!
 
         out := bytes.buffer()
+        defer out.free()
         out.write(le_int(caps, 4)) catch 0
         out.write(le_int(16777216, 4)) catch 0
         out.write_byte(45) catch 0
@@ -356,12 +367,12 @@ impl Conn:
         while reserved < 23:
             out.write_byte(0) catch 0
             reserved = reserved + 1
-        out.write(cstring_bytes(user)) catch 0
+        out.write(user_bytes) catch 0
         out.write_byte(bytes.len(scramble)) catch 0
         out.write(scramble) catch 0
-        out.write(cstring_bytes(database)) catch 0
-        out.write(cstring_bytes(plugin)) catch 0
-        self.send_packet(response_seq, out.take_bytes())!
+        out.write(db_bytes) catch 0
+        out.write(plugin_bytes) catch 0
+        self.send_packet(response_seq, out.bytes())!
         return self.finish_auth(password)
 
     # drive the post-response auth exchange: an OK ends it, an auth-switch
@@ -369,7 +380,12 @@ impl Conn:
     # signals a cache hit or asks for the password (sent in the clear, which is
     # why full auth is only allowed over tls).
     fn finish_auth(password: String) -> Bool!:
+        mut rounds := 0
+        mut switched := false
         while true:
+            rounds = rounds + 1
+            if rounds > MAX_AUTH_ROUNDS:
+                fail "mysql: auth exchange exceeded maximum rounds"
             reply := self.read_packet()!
             # bytes.get reads 0 past the end, so an empty packet would pass as
             # the OK marker. an empty auth reply is malformed, not success.
@@ -381,27 +397,35 @@ impl Conn:
             if marker == 255:
                 fail "mysql: {err_text(reply)}"
             if marker == 254:
+                if switched:
+                    fail "mysql: repeated auth switch request"
+                switched = true
                 r := Reader(data: reply, pos: 1)
                 switch_plugin := r.cstring()!
                 mut switch_salt := bytes.slice(reply, r.pos, bytes.len(reply))
                 if switch_salt.len() > 20:
                     switch_salt = bytes.slice(switch_salt, 0, 20)
-                self.send_packet(self.last_seq + 1, scramble_for(switch_plugin, password, switch_salt))!
+                self.send_packet(self.last_seq + 1, scramble_for(switch_plugin, password, switch_salt)!)!
             elif marker == 1:
+                if bytes.len(reply) < 2:
+                    fail "mysql: truncated auth data packet"
                 sub := bytes.get(reply, 1)
                 if sub == 3:
                     continue
                 elif sub == 4:
                     if self.session == none:
                         fail "mysql: caching_sha2_password full auth needs tls"
-                    self.send_packet(self.last_seq + 1, cstring_bytes(password))!
+                    self.send_packet(self.last_seq + 1, cstring_bytes(password)!)!
                 else:
                     fail "mysql: unexpected auth data {sub}"
             else:
                 fail "mysql: unexpected auth reply {marker}"
 
-# a string plus a null terminator.
-fn cstring_bytes(text: String) -> Bytes:
+# a string plus a null terminator. embedded null bytes are rejected so caller
+# input cannot truncate or inject protocol fields.
+fn cstring_bytes(text: String) -> Bytes!:
+    if text.contains(chr(0)):
+        fail "mysql: embedded null byte in string"
     out := bytes.buffer()
     out.write_string_utf8(text) catch 0
     out.write_byte(0) catch 0
@@ -518,18 +542,27 @@ pub fn query(conn: Conn, text: String) -> Rows!:
         types.push(def.kind)
         c = c + 1
 
-    conn.read_packet()!
+    eof_cols := conn.read_packet()!
+    if bytes.len(eof_cols) > 0 and bytes.get(eof_cols, 0) == 255:
+        fail "mysql: {err_text(eof_cols)}"
 
     # rows, until the trailing EOF packet (0xfe with a short payload).
     mut rows: List[sql.Row] := []
     while true:
         pkt := conn.read_packet()!
-        if bytes.get(pkt, 0) == 254 and bytes.len(pkt) < 9:
+        if bytes.len(pkt) == 0:
+            fail "mysql: empty row packet"
+        lead_row := bytes.get(pkt, 0)
+        if lead_row == 255:
+            fail "mysql: {err_text(pkt)}"
+        if lead_row == 254 and bytes.len(pkt) < 9:
             return Rows(rows: rows, pos: 0)
         r := Reader(data: pkt, pos: 0)
         mut values: List[sql.Value] := []
         mut i := 0
         while i < column_count:
+            if r.remaining() < 1:
+                fail "mysql: truncated row packet"
             if bytes.get(pkt, r.pos) == 251:
                 r.skip(1)
                 values.push(sql.null_value())
@@ -741,17 +774,28 @@ fn run_stmt(conn: Conn, stmt: Stmt, params: List[String]) -> BinaryResult!:
         names.push(def.name)
         types.push(def.kind)
         c = c + 1
-    conn.read_packet()!
+    eof_bin := conn.read_packet()!
+    if bytes.len(eof_bin) > 0 and bytes.get(eof_bin, 0) == 255:
+        fail "mysql: {err_text(eof_bin)}"
 
     # binary rows: a 0x00 header, a null bitmap offset by two reserved bits,
     # then each non-null value in binary form. an EOF packet ends the set.
     mut rows: List[sql.Row] := []
     while true:
         pkt := conn.read_packet()!
-        if bytes.get(pkt, 0) == 254 and bytes.len(pkt) < 9:
+        if bytes.len(pkt) == 0:
+            fail "mysql: empty binary row packet"
+        row_lead := bytes.get(pkt, 0)
+        if row_lead == 255:
+            fail "mysql: {err_text(pkt)}"
+        if row_lead == 254 and bytes.len(pkt) < 9:
             return BinaryResult(rows: rows, affected: 0, last_insert_id: 0)
+        if row_lead != 0:
+            fail "mysql: unexpected binary row header {row_lead}"
         r := Reader(data: pkt, pos: 1)
         null_bytes := (column_count + 9) / 8
+        if r.remaining() < null_bytes:
+            fail "mysql: truncated binary row null bitmap"
         bitmap := bytes.slice(pkt, r.pos, r.pos + null_bytes)
         r.skip(null_bytes)
         mut values: List[sql.Value] := []
@@ -920,8 +964,12 @@ test "caching_sha2_password scramble matches a known vector":
     salt := encoding.from_hex("000102030405060708090a0b0c0d0e0f10111213")!
     scramble := caching_sha2_scramble("secret", salt)
     assert_eq(encoding.to_hex(scramble), "6c84c617ec1f26456a02c42ed7cb02eca7d8511333f98bc9b31e5f68ce1665d5")
-    # an empty password scrambles to nothing regardless of plugin
-    assert_eq(scramble_for("caching_sha2_password", "", salt).len(), 0)
+    # an empty password scrambles to nothing for a supported plugin
+    assert_eq(scramble_for("caching_sha2_password", "", salt)!.len(), 0)
+    assert_eq(scramble_for("mysql_native_password", "", salt)!.len(), 0)
+    # unknown plugins must be rejected instead of downgraded to SHA-1
+    assert(scramble_for("unknown_auth_plugin", "secret", salt).is_err)
+    assert(scramble_for("", "secret", salt).is_err)
 
 test "little-endian integers round-trip":
     four := Reader(data: le_int(305419896, 4), pos: 0)
@@ -989,3 +1037,7 @@ test "reader rejects truncated or overflowing length-encoded strings and untermi
     # unterminated cstring must fail cleanly instead of reading past EOF
     r3 := Reader(data: bytes.from_string_utf8("no-nul"), pos: 0)
     assert(r3.cstring().is_err)
+
+test "cstring_bytes rejects embedded null bytes":
+    assert(cstring_bytes("ok").is_ok)
+    assert(cstring_bytes("bad" + chr(0) + "user").is_err)

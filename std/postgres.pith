@@ -297,7 +297,14 @@ impl Conn:
         mut server_signature := ""
         mut scram_verified := false
         mut auth_ok := false
+        mut sasl_started := false
+        mut sasl_continued := false
+        mut sasl_finished := false
+        mut startup_messages := 0
         while true:
+            startup_messages = startup_messages + 1
+            if startup_messages > 128:
+                fail "postgres: startup exchange exceeded message limit"
             msg := self.read_message()!
             if msg.mtype == 69:
                 fail "postgres: {error_text(msg.payload)}"
@@ -327,7 +334,10 @@ impl Conn:
                         fail "postgres: server asked for a cleartext password on an unencrypted connection"
                     self.send(112, cstring(password)!)!
                 elif auth == 10:
-                    # AuthenticationSASL: begin SCRAM-SHA-256.
+                    # AuthenticationSASL: begin SCRAM-SHA-256 (at most once).
+                    if sasl_started:
+                        fail "postgres: duplicate AuthenticationSASL message"
+                    sasl_started = true
                     client_nonce = encoding.b64_encode(random.bytes(18)!)
                     client_first_bare = "n=,r=" + client_nonce
                     client_first := "n,," + client_first_bare
@@ -338,7 +348,10 @@ impl Conn:
                     initial.write_string_utf8(client_first)!
                     self.send(112, initial.take_bytes())!
                 elif auth == 11:
-                    # AuthenticationSASLContinue: server-first-message.
+                    # AuthenticationSASLContinue: server-first-message (at most once).
+                    if not sasl_started or sasl_continued:
+                        fail "postgres: unexpected AuthenticationSASLContinue message"
+                    sasl_continued = true
                     server_first := bytes.to_string_utf8(bytes.slice(msg.payload, 4, bytes.len(msg.payload)))!
                     final := scram_client_final(server_first, client_first_bare, password)!
                     server_signature = final.server_signature
@@ -348,6 +361,9 @@ impl Conn:
                     # server key by echoing v=ServerSignature. a server that
                     # cannot produce it never had the credentials this client
                     # is authenticating against.
+                    if not sasl_continued or sasl_finished:
+                        fail "postgres: unexpected AuthenticationSASLFinal message"
+                    sasl_finished = true
                     server_final := bytes.to_string_utf8(bytes.slice(msg.payload, 4, bytes.len(msg.payload)))!
                     if not scram_server_verified(server_final, server_signature):
                         fail "postgres: SCRAM server signature verification failed"
@@ -393,10 +409,9 @@ fn scram_client_final(server_first: String, client_first_bare: String, password:
         elif part.starts_with("e="):
             fail "postgres: SCRAM error from server: " + part.substring(2, part.len())
 
-    # RFC 5802 5.1: the server nonce MUST begin with the client nonce, or a
-    # relayed server-first from another session would be accepted, destroying
-    # the freshness the nonce exists to guarantee.
-    if client_nonce == "" or not server_nonce.starts_with(client_nonce):
+    # RFC 5802 5.1: the server nonce MUST begin with the client nonce and add
+    # server entropy, or a relayed/zero-entropy server-first would be accepted.
+    if client_nonce == "" or not server_nonce.starts_with(client_nonce) or server_nonce.len() <= client_nonce.len():
         fail "postgres: SCRAM server nonce does not extend the client nonce"
     # RFC 7677: the iteration count floor is 4096. a server sending i=1 makes a
     # captured ClientProof brute-forceable at one HMAC per guess.
@@ -409,6 +424,8 @@ fn scram_client_final(server_first: String, client_first_bare: String, password:
         fail "postgres: SCRAM iteration count " + iterations.to_string() + " is above the client maximum of " + MAX_SCRAM_ITERATIONS.to_string()
 
     salt := encoding.b64_decode(salt_b64)!
+    if salt.len() == 0:
+        fail "postgres: SCRAM server sent an empty salt"
     pw := bytes.from_string_utf8(password)
     salted := kdf.pbkdf2_sha256(pw, salt, iterations, 32)!
     client_key := hmac.sha256(salted, bytes.from_string_utf8("Client Key"))
@@ -802,8 +819,11 @@ test "scram-sha-256 client-final matches the RFC 7677 vector":
 test "scram rejects a mismatched nonce, an iteration count out of range, and a server error":
     cfb := "n=user,r=clientnonce"
     salt := "W22ZaJ0SNY7soEsUEjb6gQ=="
-    # a server nonce that does not extend the client nonce (relayed/forged)
+    # a server nonce that does not extend the client nonce (relayed/forged or zero-entropy echo)
     assert(scram_client_final("r=DIFFERENT,s=" + salt + ",i=4096", cfb, "pencil").is_err)
+    assert(scram_client_final("r=clientnonce,s=" + salt + ",i=4096", cfb, "pencil").is_err)
+    # an empty salt is refused
+    assert(scram_client_final("r=clientnonceX,s=,i=4096", cfb, "pencil").is_err)
     # an iteration count below the RFC 7677 floor
     assert(scram_client_final("r=clientnonceX,s=" + salt + ",i=1", cfb, "pencil").is_err)
     # an iteration count past the client cap is refused before any pbkdf2 runs

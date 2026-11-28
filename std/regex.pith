@@ -45,6 +45,7 @@ MAX_REPEAT := 1000
 # a million instructions, and it bounds how deep the vm recurses through
 # a chain of control instructions.
 MAX_PROGRAM_LEN := 12288
+MAX_GROUP_DEPTH := 64
 TOO_LARGE := "pattern too large after expanding counted repeats"
 
 ## one compiled instruction: an opcode and up to two arguments.
@@ -80,6 +81,7 @@ struct Compiler:
     insts: List[Inst]
     classes: List[ClassDef]
     ngroups: Int
+    depth: Int
     error: String
 
 fn c_peek(c: Compiler) -> String:
@@ -343,6 +345,9 @@ fn copy_fragment(c: Compiler, frag: List[Inst], origin: Int):
 fn parse_atom(c: Compiler):
     ch := c_peek(c)
     if ch == "(":
+        if c.depth >= MAX_GROUP_DEPTH:
+            c_fail(c, "group nesting too deep")
+            return
         c.pos = c.pos + 1
         mut capture := true
         if c_peek(c) == "?":
@@ -355,7 +360,11 @@ fn parse_atom(c: Compiler):
         if capture:
             c.ngroups = c.ngroups + 1
             c_emit(c, OP_SAVE, group * 2, 0)
+        c.depth = c.depth + 1
         parse_alt(c)
+        c.depth = c.depth - 1
+        if c.error != "":
+            return
         if c_peek(c) != ")":
             c_fail(c, "unclosed group")
             return
@@ -562,7 +571,7 @@ pub fn compile(pattern: String) -> Regex!:
         fail "regex: pattern exceeds maximum length"
     mut insts: List[Inst] := []
     mut classes: List[ClassDef] := []
-    c := Compiler(pattern, 0, insts, classes, 1, "")
+    c := Compiler(pattern, 0, insts, classes, 1, 0, "")
     c_emit(c, OP_SAVE, 0, 0)
     parse_alt(c)
     if c.error == "" and c.pos < c.pattern.len():
@@ -587,39 +596,54 @@ fn class_matches(cd: ClassDef, code: Int) -> Bool:
     return hit
 
 # add a thread (and everything reachable through control instructions)
-# to the next thread list. `seen` dedupes by pc: the first arrival wins,
-# which preserves greedy priority because callers add in priority order.
+# to the next thread list iteratively so long control chains cannot overflow
+# the native stack. `seen` dedupes by pc: the first arrival wins, preserving
+# greedy priority by pushing OP_SPLIT's secondary branch before its primary.
 fn add_thread(re: Regex, list_pcs: List[Int], list_slots: List[List[Int]], seen: Set[Int], pc: Int, slots: List[Int], pos: Int, input_len: Int):
-    if seen.contains(pc):
-        return
-    seen.add(pc)
-    inst := re.insts[pc]
-    if inst.op == OP_JMP:
-        add_thread(re, list_pcs, list_slots, seen, inst.a, slots, pos, input_len)
-        return
-    if inst.op == OP_SPLIT:
-        add_thread(re, list_pcs, list_slots, seen, inst.a, slots, pos, input_len)
-        add_thread(re, list_pcs, list_slots, seen, inst.b, slots, pos, input_len)
-        return
-    if inst.op == OP_SAVE:
-        mut copied: List[Int] := []
-        for v in slots:
-            copied.push(v)
-        while copied.len() <= inst.a:
-            copied.push(0 - 1)
-        copied[inst.a] = pos
-        add_thread(re, list_pcs, list_slots, seen, pc + 1, copied, pos, input_len)
-        return
-    if inst.op == OP_BOL:
-        if pos == 0:
-            add_thread(re, list_pcs, list_slots, seen, pc + 1, slots, pos, input_len)
-        return
-    if inst.op == OP_EOL:
-        if pos == input_len:
-            add_thread(re, list_pcs, list_slots, seen, pc + 1, slots, pos, input_len)
-        return
-    list_pcs.push(pc)
-    list_slots.push(slots)
+    mut work_pcs: List[Int] := [pc]
+    mut work_slots: List[List[Int]] := [slots]
+    while work_pcs.len() > 0:
+        top := work_pcs.len() - 1
+        cur_pc := work_pcs[top]
+        cur_slots := work_slots[top]
+        work_pcs.remove(top)
+        work_slots.remove(top)
+        if seen.contains(cur_pc):
+            continue
+        seen.add(cur_pc)
+        inst := re.insts[cur_pc]
+        if inst.op == OP_JMP:
+            work_pcs.push(inst.a)
+            work_slots.push(cur_slots)
+            continue
+        if inst.op == OP_SPLIT:
+            work_pcs.push(inst.b)
+            work_slots.push(cur_slots)
+            work_pcs.push(inst.a)
+            work_slots.push(cur_slots)
+            continue
+        if inst.op == OP_SAVE:
+            mut copied: List[Int] := []
+            for v in cur_slots:
+                copied.push(v)
+            while copied.len() <= inst.a:
+                copied.push(0 - 1)
+            copied[inst.a] = pos
+            work_pcs.push(cur_pc + 1)
+            work_slots.push(copied)
+            continue
+        if inst.op == OP_BOL:
+            if pos == 0:
+                work_pcs.push(cur_pc + 1)
+                work_slots.push(cur_slots)
+            continue
+        if inst.op == OP_EOL:
+            if pos == input_len:
+                work_pcs.push(cur_pc + 1)
+                work_slots.push(cur_slots)
+            continue
+        list_pcs.push(cur_pc)
+        list_slots.push(cur_slots)
 
 # run the vm once from `start` to the end of the input. a fresh thread
 # enters at pc 0 at every character boundary until a match is recorded,
@@ -1273,3 +1297,11 @@ test "find_all reports every match a search that outlives its match finds":
     assert_eq(spans_of(".*y|x", "xxx"), "0-1 1-2 2-3")
     assert_eq(spans_of(".*y|x", "xxyx"), "0-3 3-4")
     assert_eq(compile(".*y|x")!.find_all("x".repeat(5000)).len(), 5000)
+
+test "deeply nested groups fail cleanly and long control chains do not overflow":
+    deep := "(".repeat(200) + "a" + ")".repeat(200)
+    assert(compile_error(deep).contains("group nesting too deep"))
+    # Long alternation/optional control chain exercises iterative add_thread.
+    re := compile("(?:a?){{200}}b")!
+    assert(re.is_match("b"))
+    assert(re.is_match("a".repeat(50) + "b"))

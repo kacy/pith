@@ -234,7 +234,10 @@ pub fn decompress_two_state(table: FseTable, reader: stream.BackReader, max_out:
         states[turn] = entry_base(entry) + reader.read(entry_nbits(entry))
         if reader.remaining() < 0:
             # the read ran past the start of the stream, so this is the end.
-            # the other state still holds one symbol that was never emitted.
+            # the other state still holds one symbol that was never emitted;
+            # refuse it if emitting it would exceed `max_out`.
+            if out.len() >= max_out:
+                fail "zstd: fse stream produced more symbols than expected"
             out.push(entry_symbol(table.entries[states[1 - turn]]))
             return out
         turn = 1 - turn

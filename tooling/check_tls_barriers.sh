@@ -50,22 +50,23 @@ fi
 # which is how both the legacy and the v0 mangling spell a path, so this
 # works whichever the toolchain emits. the length prefix makes each segment
 # exact: `7collect` cannot match `collect_from`.
-allowed='pith_runtime::runtime_core::pool_slot_slow
-pith_runtime::runtime_core::tls_globals_get
-pith_runtime::runtime_core::tls_globals_set
-pith_runtime::runtime_core::take_thread_tls
-pith_runtime::runtime_core::thread_tls_install
-pith_runtime::cycle::traced_children_push
-pith_runtime::cycle::traced_children_take
+allowed='pith_runtime::runtime_core::pool::pool_slot_slow
+pith_runtime::runtime_core::tls::tls_globals_get
+pith_runtime::runtime_core::tls::tls_globals_set
+pith_runtime::runtime_core::tls::take_thread_tls
+pith_runtime::runtime_core::tls::thread_tls_install
+pith_runtime::cycle::tracers::traced_children_push
+pith_runtime::cycle::tracers::traced_children_take
 pith_runtime::share::thread_mark
-pith_runtime::cycle::mutator_slot
-pith_runtime::cycle::existing_mutator_slot
-pith_runtime::cycle::adopt_mutator_slot
-pith_runtime::cycle::collector_main
-pith_runtime::cycle::collector_visit
-pith_runtime::cycle::seed_node
-pith_runtime::cycle::children_of
-pith_runtime::cycle::collect
+pith_runtime::cycle::stw::mutator_slot
+pith_runtime::cycle::stw::existing_mutator_slot
+pith_runtime::cycle::stw::adopt_mutator_slot
+pith_runtime::cycle::stw::set_on_collector
+pith_runtime::cycle::thread::collector_main
+pith_runtime::cycle::collect::collector_visit
+pith_runtime::cycle::collect::seed_node
+pith_runtime::cycle::collect::children_of
+pith_runtime::cycle::collect::collect
 pith_runtime::stack_guard::enter_thread
 pith_runtime::failure::thread_frame
 pith_runtime::failure::set_thread_frame

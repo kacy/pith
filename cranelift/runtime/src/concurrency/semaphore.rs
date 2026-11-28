@@ -61,7 +61,7 @@ pub(crate) unsafe fn free_semaphore(p: *mut PithSemaphore) {
 }
 
 fn lock_state(lock: &Mutex<SemaphoreState>) -> MutexGuard<'_, SemaphoreState> {
-    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::sync::lock(lock)
 }
 
 fn wait_state<'a>(
@@ -131,12 +131,11 @@ pub extern "C" fn pith_semaphore_new(initial: i64) -> *mut PithSemaphoreHandle {
         max: initial.max(0) as usize,
         green_waiters: VecDeque::new(),
     };
-    let ptr = Box::into_raw(Box::new(PithSemaphore {
+    Box::into_raw(Box::new(PithSemaphore {
         header: SyncHeader::new(SEMAPHORE_MAGIC),
         lock: Mutex::new(state),
         cvar: Condvar::new(),
-    }));
-    ptr
+    }))
 }
 
 #[inline(always)]

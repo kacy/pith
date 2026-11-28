@@ -170,9 +170,12 @@ pub extern "C" fn pith_term_read(fd: i64, max: i64, timeout_ms: i64) -> i64 {
     let size = std::cmp::min(max, 65536) as usize;
     let mut buf = vec![0u8; size];
     loop {
-        // SAFETY: reading up to `size` bytes into a buffer we own, on an fd
-        // poll just reported readable.
-        let n = unsafe { libc::read(fd as i32, buf.as_mut_ptr() as *mut libc::c_void, size) };
+        let n = {
+            let _native = crate::cycle::native_bracket();
+            // SAFETY: reading up to `size` bytes into a buffer we own, on an fd
+            // poll just reported readable.
+            unsafe { libc::read(fd as i32, buf.as_mut_ptr() as *mut libc::c_void, size) }
+        };
         if n > 0 {
             buf.truncate(n as usize);
             return pith_bytes_from_vec(buf);
@@ -193,8 +196,11 @@ fn write_all_fd(fd: i64, buf: &[u8]) -> i64 {
     let mut written = 0usize;
     while written < buf.len() {
         let rest = &buf[written..];
-        // SAFETY: writing from a slice we borrow for the duration of the call.
-        let n = unsafe { libc::write(fd as i32, rest.as_ptr() as *const libc::c_void, rest.len()) };
+        let n = {
+            let _native = crate::cycle::native_bracket();
+            // SAFETY: writing from a slice we borrow for the duration of the call.
+            unsafe { libc::write(fd as i32, rest.as_ptr() as *const libc::c_void, rest.len()) }
+        };
         if n > 0 {
             written += n as usize;
             continue;

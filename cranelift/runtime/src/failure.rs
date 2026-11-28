@@ -429,7 +429,7 @@ mod tests {
         };
         let ip: *mut Frame = &mut inner;
         set_head(ip);
-        unsafe { run(ip, fails as usize as i64, 0) };
+        unsafe { run(ip, fails as *const () as usize as i64, 0) };
         set_head(fp);
         assert_eq!(unsafe { (*ip).message.take() }.as_deref(), Some("boom"));
         fail(String::from("outer"))

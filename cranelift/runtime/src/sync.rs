@@ -16,6 +16,51 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// read-lock a std RwLock through poisoning.
+#[inline]
+pub(crate) fn read_lock<T>(rw: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    rw.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// write-lock a std RwLock through poisoning.
+#[inline]
+pub(crate) fn write_lock<T>(rw: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    rw.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// wait on a std condvar through poisoning.
+#[inline]
+pub(crate) fn wait<'a, T>(
+    cvar: &std::sync::Condvar,
+    guard: std::sync::MutexGuard<'a, T>,
+) -> std::sync::MutexGuard<'a, T> {
+    cvar.wait(guard)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// timed wait on a std condvar through poisoning.
+#[inline]
+pub(crate) fn wait_timeout<'a, T>(
+    cvar: &std::sync::Condvar,
+    guard: std::sync::MutexGuard<'a, T>,
+    dur: std::time::Duration,
+) -> (std::sync::MutexGuard<'a, T>, std::sync::WaitTimeoutResult) {
+    cvar.wait_timeout(guard, dur)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// wait on a std condvar inside a cycle-collector native window: an OS-thread
+/// waiter touches no heap handle while parked in the kernel, so a stop-the-world
+/// GC rendezvous must not wait for it to wake.
+#[inline]
+pub(crate) fn wait_native<'a, T>(
+    cvar: &std::sync::Condvar,
+    guard: std::sync::MutexGuard<'a, T>,
+) -> std::sync::MutexGuard<'a, T> {
+    let _native = crate::cycle::native_bracket();
+    wait(cvar, guard)
+}
+
 #[cfg(not(all(test, loom)))]
 pub(crate) use std::sync::{atomic::AtomicU8, Mutex};
 

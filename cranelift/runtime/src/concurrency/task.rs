@@ -60,7 +60,7 @@ fn lock_tasks() -> MutexGuard<'static, Slab> {
 }
 
 fn lock_shared(lock: &Mutex<TaskShared>) -> MutexGuard<'_, TaskShared> {
-    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::sync::lock(lock)
 }
 
 fn wait_shared<'a>(
@@ -248,16 +248,8 @@ pub unsafe extern "C" fn pith_spawn(closure_handle: i64) -> i64 {
 /// `closure_handle` must be a valid Pith closure handle whose ownership was
 /// transferred to the task.
 unsafe fn run_task_closure(closure_handle: i64) -> i64 {
-    // SAFETY: `closure_handle` is a valid closure handle; `pith_closure_get_fn` validates it.
-    let func_ptr = unsafe { crate::pith_closure_get_fn(closure_handle) };
-    let result = if func_ptr == 0 {
-        0
-    } else {
-        // SAFETY: `func_ptr` came from a valid Pith closure header matching `extern "C" fn(i64) -> i64`.
-        // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
-        let func: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(func_ptr as *const ()) };
-        func(closure_handle)
-    };
+    // SAFETY: `closure_handle` is a valid closure handle kept alive until released below.
+    let result = unsafe { super::scheduler::invoke_closure(closure_handle) };
     // the body has run, so release the one closure reference the task owned.
     // otherwise every spawned task leaks its closure environment (the emitter
     // moves the closure into `spawn` and never releases it). mirrors the green

@@ -54,11 +54,11 @@ static WRITTEN: AtomicBool = AtomicBool::new(false);
 /// leave it torn (every mutation is a single `insert`), so refusing to read
 /// afterwards would turn a survivable panic into a dead environment.
 fn read_table() -> std::sync::RwLockReadGuard<'static, BTreeMap<String, Entry>> {
-    table().read().unwrap_or_else(|err| err.into_inner())
+    crate::sync::read_lock(table())
 }
 
 fn write_table() -> std::sync::RwLockWriteGuard<'static, BTreeMap<String, Entry>> {
-    table().write().unwrap_or_else(|err| err.into_inner())
+    crate::sync::write_lock(table())
 }
 
 /// the value of `name` as the program sees it: the overlay when the program has

@@ -26,19 +26,16 @@
 //! another task updates a local count, which is how a missing mark shows up.
 //! `PITH_LOCAL_COUNTS=0` keeps every count atomic, for comparison.
 
+use crate::child_kind::{
+    CLOSURE as CHILD_CLOSURE, LIST as CHILD_LIST, MAP as CHILD_MAP, STRUCT as CHILD_STRUCT,
+    WEAK as CHILD_WEAK,
+};
 use crate::collections::list::ListTypeTag;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// The mark a list, map or closure carries in its flag byte once shared.
 pub(crate) const CONTAINER_SHARED_FLAG: u8 = 0x80;
-
-// the child kinds a tracer reports and a closure tags its captures with
-const CHILD_LIST: u8 = 2;
-const CHILD_MAP: u8 = 3;
-const CHILD_STRUCT: u8 = 6;
-const CHILD_CLOSURE: u8 = 7;
-const CHILD_WEAK: u8 = 8;
 
 /// Mark `value`, a heap value of the kind `tag` (an element tag code), and
 /// everything it reaches as shared.
@@ -166,7 +163,7 @@ fn thread_mark() -> u64 {
 }
 
 fn lock_owners() -> std::sync::MutexGuard<'static, Option<HashMap<usize, u64>>> {
-    OWNERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::sync::lock(&OWNERS)
 }
 
 /// A struct was just built: it belongs to the running task.

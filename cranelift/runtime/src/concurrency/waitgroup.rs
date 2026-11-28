@@ -52,7 +52,7 @@ pub(crate) unsafe fn free_waitgroup(p: *mut PithWaitGroup) {
 }
 
 fn lock_state(lock: &Mutex<WaitGroupState>) -> MutexGuard<'_, WaitGroupState> {
-    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::sync::lock(lock)
 }
 
 fn wait_state<'a>(
@@ -117,12 +117,11 @@ pub extern "C" fn pith_waitgroup_new() -> *mut PithWaitGroupHandle {
         count: 0,
         green_waiters: Vec::new(),
     };
-    let ptr = Box::into_raw(Box::new(PithWaitGroup {
+    Box::into_raw(Box::new(PithWaitGroup {
         header: SyncHeader::new(WAITGROUP_MAGIC),
         lock: Mutex::new(state),
         cvar: Condvar::new(),
-    }));
-    ptr
+    }))
 }
 
 #[inline(always)]

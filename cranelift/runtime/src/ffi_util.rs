@@ -84,6 +84,22 @@ pub unsafe fn with_cstr_str_or_empty<R>(ptr: *const i8, f: impl FnOnce(&str) -> 
     f(std::str::from_utf8(bytes).unwrap_or(""))
 }
 
+/// Borrow raw bytes from a C string for the duration of `f`, passing `b""` on null.
+///
+/// # Safety
+/// Same requirements as [`with_cstr_bytes`].
+#[inline(always)]
+pub unsafe fn with_cstr_bytes_or_empty<R>(ptr: *const i8, f: impl FnOnce(&[u8]) -> R) -> R {
+    if ptr.is_null() {
+        return f(&[]);
+    }
+    let len = crate::string::pith_cstring_len(ptr) as usize;
+    // SAFETY: Caller guarantees `ptr` points to a readable, null-terminated C string
+    // of length `len` that stays immutable for the duration of `f`.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    f(bytes)
+}
+
 /// Copy UTF-8 text from a C string into an owned Rust string.
 ///
 /// # Safety
@@ -151,6 +167,40 @@ pub fn write_result(builtin: &str, outcome: Result<usize, String>) -> ResultPair
         Ok(count) => result_ok(count as i64),
         Err(reason) => result_err(format!("{builtin} failed: {reason}").as_bytes()),
     }
+}
+
+/// Borrow a C string's raw bytes, run a write operation `f`, and pack the
+/// outcome as a [`ResultPair`].
+///
+/// # Safety
+/// `data` must be null or a valid null-terminated C string for the duration of `f`.
+#[inline]
+pub unsafe fn write_cstr_result(
+    builtin: &str,
+    data: *const i8,
+    f: impl FnOnce(&[u8]) -> Result<usize, String>,
+) -> ResultPair {
+    // SAFETY: Preconditions forwarded from caller.
+    let outcome = unsafe { with_cstr_bytes(data, f) }
+        .unwrap_or_else(|| Err("invalid string".to_string()));
+    write_result(builtin, outcome)
+}
+
+/// Borrow a `Bytes` handle's slice, run a write operation `f`, and pack the
+/// outcome as a [`ResultPair`].
+///
+/// # Safety
+/// `data` is validated by [`crate::bytes::with_bytes`] before borrowing its slice.
+#[inline]
+pub unsafe fn write_bytes_result(
+    builtin: &str,
+    data: i64,
+    f: impl FnOnce(&[u8]) -> Result<usize, String>,
+) -> ResultPair {
+    // SAFETY: `with_bytes` validates `data` before borrowing its slice.
+    let outcome = unsafe { crate::bytes::with_bytes(data, f) }
+        .unwrap_or_else(|| Err("invalid bytes value".to_string()));
+    write_result(builtin, outcome)
 }
 
 /// Read a result back for a test: the ok payload, or the error text. The

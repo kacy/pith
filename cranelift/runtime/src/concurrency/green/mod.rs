@@ -390,26 +390,6 @@ fn ensure_workers_started() {
     });
 }
 
-/// Invoke a compiler-emitted Pith closure body on a green task stack.
-///
-/// # Safety
-/// `closure_handle` must be a valid Pith closure handle kept alive for the task's lifetime.
-unsafe fn invoke_closure(closure_handle: i64) -> i64 {
-    // SAFETY: `closure_handle` was non-zero at spawn and pith owns the
-    // closure's lifetime for the duration of the task; `get_fn` validates
-    // the handle and returns 0 for anything bogus.
-    let func_ptr = unsafe { crate::pith_closure_get_fn(closure_handle) };
-    if func_ptr == 0 {
-        return 0;
-    }
-    // SAFETY: the transmute matches the pith closure calling convention
-    // `extern "C" fn(i64) -> i64`, the same transmute the os-thread backend performs.
-    let func: extern "C" fn(i64) -> i64 =
-        // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
-        unsafe { std::mem::transmute(func_ptr as *const ()) };
-    func(closure_handle)
-}
-
 fn green_spawn_with(closure_handle: i64, body: impl FnOnce() -> i64 + 'static) -> i64 {
     ensure_workers_started();
 
@@ -450,7 +430,9 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
     }
     // SAFETY: Caller guarantees `closure_handle` is a valid pith closure handle
     // whose lifetime is owned by the task until `finish_task` releases it.
-    green_spawn_with(closure_handle, move || unsafe { invoke_closure(closure_handle) })
+    green_spawn_with(closure_handle, move || unsafe {
+        super::scheduler::invoke_closure(closure_handle)
+    })
 }
 
 /// green await: return the target task's result, blocking until it completes.
@@ -492,10 +474,7 @@ pub(crate) fn green_await(task_handle: i64) -> i64 {
                 // the wait is a native window for the cycle collector: an
                 // os-thread awaiter reads no heap handle until the condvar
                 // hands the join lock back.
-                join = {
-                    let _native = crate::cycle::native_bracket();
-                    block.joined.wait(join).unwrap_or_else(|p| p.into_inner())
-                };
+                join = crate::sync::wait_native(&block.joined, join);
                 join.blocked -= 1;
             }
             Some(me) => {
@@ -503,6 +482,11 @@ pub(crate) fn green_await(task_handle: i64) -> i64 {
                 drop(join);
                 park_current(me);
                 join = lock_join(&block.join);
+                if !join.done {
+                    if let Some(pos) = join.awaiters.iter().rposition(|&w| w == me) {
+                        join.awaiters.swap_remove(pos);
+                    }
+                }
             }
         }
     }
